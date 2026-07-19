@@ -1,0 +1,6 @@
+data/
+terminal/
+
+*backup_*
+*.env
+mcpo/config.json
