@@ -1,0 +1,31 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "/usr/bin/npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/stacks"
+      ]
+    },
+    "fetch": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-fetch"
+      ]
+    },
+    "trilium": {
+      "command": "uvx",
+      "args": [
+        "--with",
+        "mcp>=1.0.0",
+        "python",
+        "/stacks/webui/mcpo/trilium/trilium_mcp_server.py"
+      ],
+      "env": {
+        "TRILIUM_URL": "${TRILIUM_URL}",
+        "TRILIUM_API_KEY": "${TRILIUM_API_KEY}"
+      }
+    }
+  }
+}

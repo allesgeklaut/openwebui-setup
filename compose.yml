@@ -6,8 +6,8 @@ services:
     ports:
       - "3001:8080"
     environment:
-      - OLLAMA_BASE_URL=http://192.168.0.46:11434
-      - OPENAI_API_BASE_URL=http://192.168.0.46:11434/v1
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
+      - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL}
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
       - WEBUI_NAME=Johannes AI
       - WEBUI_AUTH=true
@@ -22,8 +22,8 @@ services:
       - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}
       - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
       - OAUTH_PROVIDER_NAME=Cloudflare
-      - OPENID_PROVIDER_URL=https://allesgeklaut.cloudflareaccess.com/cdn-cgi/access/sso/oidc/4bfa0d5d3723ee1d62200fe58246b216aabe096f31c9431bef704618c08dbea5/.well-known/openid-configuration
-      - OPENID_REDIRECT_URI=https://ai.johannesnetwork.org/oauth/oidc/callback
+      - OPENID_PROVIDER_URL=${OPENID_PROVIDER_URL}
+      - OPENID_REDIRECT_URI=${OPENID_REDIRECT_URI}
       - ENABLE_OAUTH_SIGNUP=true
       - OAUTH_MERGE_ACCOUNTS_BY_EMAIL=true
     volumes:
