@@ -1,0 +1,78 @@
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "3001:8080"
+    environment:
+      - OLLAMA_BASE_URL=http://192.168.0.46:11434
+      - OPENAI_API_BASE_URL=http://192.168.0.46:11434/v1
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
+      - WEBUI_NAME=Johannes AI
+      - WEBUI_AUTH=true
+      - ENABLE_SIGNUP=false
+      - TZ=Europe/Vienna
+      # Open Terminal auto-connect
+      - TERMINAL_SERVER_CONNECTIONS=[{"name":"Home Server","url":"http://open-terminal:8000","api_key":"<OPEN_TERMINAL_API_KEY>"}]
+      # Tika for document extraction
+      - CONTENT_EXTRACTION_ENGINE=tika
+      - TIKA_SERVER_URL=http://tika:9998
+      # SSO
+      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}
+      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
+      - OAUTH_PROVIDER_NAME=Cloudflare
+      - OPENID_PROVIDER_URL=https://allesgeklaut.cloudflareaccess.com/cdn-cgi/access/sso/oidc/4bfa0d5d3723ee1d62200fe58246b216aabe096f31c9431bef704618c08dbea5/.well-known/openid-configuration
+      - OPENID_REDIRECT_URI=https://ai.johannesnetwork.org/oauth/oidc/callback
+      - ENABLE_OAUTH_SIGNUP=true
+      - OAUTH_MERGE_ACCOUNTS_BY_EMAIL=true
+    volumes:
+      - /opt/stacks/webui/data:/app/backend/data
+    depends_on:
+      - open-terminal
+      - tika
+      - mcpo
+      - searxng
+
+  open-terminal:
+    image: ghcr.io/open-webui/open-terminal:latest
+    container_name: open-terminal
+    restart: unless-stopped
+    environment:
+      - OPEN_TERMINAL_API_KEY=${OPEN_TERMINAL_API_KEY}
+    volumes:
+      - /opt/stacks/webui/terminal:/home/user
+      # Expose your stacks dir so the AI can inspect configs
+      - /opt/stacks:/home/user/stacks
+
+  tika:
+    image: apache/tika:latest
+    container_name: open-webui-tika
+    restart: unless-stopped
+    # internal only, no port exposed
+
+  mcpo:
+    image: ghcr.io/open-webui/mcpo:latest
+    container_name: mcpo
+    restart: unless-stopped
+    volumes:
+      - /opt/stacks/webui/mcpo/config.json:/app/config.json:ro
+      - /opt/stacks:/stacks
+    command: [ "--config", "/app/config.json", "--port", "8000" ]
+    environment:
+      - TRILIUM_API_KEY=${TRILIUM_API_KEY}
+      - TRILIUM_URL=${TRILIUM_URL}
+    # internal only — no port exposure needed
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    environment:
+      - SEARXNG_BASE_URL=http://192.168.0.46:8081/
+      - UWSGI_WORKERS=2
+      - UWSGI_THREADS=4
+    volumes:
+      - /opt/stacks/webui/searxng/config:/etc/searxng
