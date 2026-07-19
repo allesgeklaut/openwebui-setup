@@ -14,7 +14,7 @@ services:
       - ENABLE_SIGNUP=false
       - TZ=Europe/Vienna
       # Open Terminal auto-connect
-      - TERMINAL_SERVER_CONNECTIONS=[{"name":"Home Server","url":"http://open-terminal:8000","api_key":"<OPEN_TERMINAL_API_KEY>"}]
+      - TERMINAL_SERVER_CONNECTIONS=[{"name":"Home Server","url":"http://open-terminal:8000","api_key":"${OPEN_TERMINAL_API_KEY}"}]
       # Tika for document extraction
       - CONTENT_EXTRACTION_ENGINE=tika
       - TIKA_SERVER_URL=http://tika:9998
