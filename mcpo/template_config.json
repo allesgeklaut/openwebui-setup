@@ -26,6 +26,20 @@
         "TRILIUM_URL": "${TRILIUM_URL}",
         "TRILIUM_API_KEY": "${TRILIUM_API_KEY}"
       }
+    },
+    "portainer": {
+      "command": "uvx",
+      "args": [
+        "--with", "fastmcp",
+        "--with", "httpx",
+        "python",
+        "/stacks/webui/mcpo/portainer/portainer_mcp_server.py"
+      ],
+      "env": {
+        "PORTAINER_URL": "https://192.168.0.46:9443",
+        "PORTAINER_API_KEY": "${PORTAINER_API_KEY}",
+        "PORTAINER_ENV_ID": "1"
+      }
     }
   }
 }
