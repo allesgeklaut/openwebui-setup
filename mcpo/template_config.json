@@ -38,7 +38,7 @@
       "env": {
         "PORTAINER_URL": "https://192.168.0.46:9443",
         "PORTAINER_API_KEY": "${PORTAINER_API_KEY}",
-        "PORTAINER_ENV_ID": "1"
+        "PORTAINER_ENV_ID": "${PORTAINER_ENV_ID}"
       }
     }
   }
