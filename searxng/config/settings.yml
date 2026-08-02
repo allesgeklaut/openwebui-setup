@@ -107,7 +107,7 @@ server:
   # Proxy image results through SearXNG. Is overwritten by ${SEARXNG_IMAGE_PROXY}
   image_proxy: false
   # 1.0 and 1.1 are supported
-  http_protocol_version: "1.0"
+  http_protocol_version: "1.1"
   # POST queries are "more secure!" but are also the source of hard-to-locate
   # annoyances, which is why GET may be better for end users and their browsers.
   # see https://github.com/searxng/searxng/pull/3619
@@ -123,7 +123,8 @@ valkey:
   # URL to connect valkey database. Is overwritten by ${SEARXNG_VALKEY_URL}.
   # https://docs.searxng.org/admin/settings/settings_valkey.html#settings-valkey
   # url: valkey://localhost:6379/0
-  url: false
+  url: valkey://searxng-valkey:6379/0
+
 
 ui:
   # Custom static path - leave it blank if you didn't change

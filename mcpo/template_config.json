@@ -8,12 +8,6 @@
         "/stacks"
       ]
     },
-    "fetch": {
-      "command": "uvx",
-      "args": [
-        "mcp-server-fetch"
-      ]
-    },
     "trilium": {
       "command": "uvx",
       "args": [
