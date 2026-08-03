@@ -9,16 +9,11 @@
       ]
     },
     "trilium": {
-      "command": "uvx",
-      "args": [
-        "--with",
-        "mcp>=1.0.0",
-        "python",
-        "/stacks/webui/mcpo/trilium/trilium_mcp_server.py"
-      ],
+      "command": "npx",
+      "args": ["-y", "triliumnext-mcp"],
       "env": {
-        "TRILIUM_URL": "${TRILIUM_URL}",
-        "TRILIUM_API_KEY": "${TRILIUM_API_KEY}"
+        "TRILIUM_API_URL": "${TRILIUM_URL}",
+        "TRILIUM_API_TOKEN": "${TRILIUM_API_KEY}"
       }
     },
     "portainer": {
@@ -33,6 +28,13 @@
         "PORTAINER_URL": "https://<your-LAN-IP>:9443",
         "PORTAINER_API_KEY": "${PORTAINER_API_KEY}",
         "PORTAINER_ENV_ID": "${PORTAINER_ENV_ID}"
+      }
+    },
+    "searxng": {
+      "command": "npx",
+      "args": ["-y", "mcp-searxng"],
+      "env": {
+        "SEARXNG_URL": "http://searxng:8080"
       }
     }
   }
