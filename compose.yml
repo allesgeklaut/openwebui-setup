@@ -5,22 +5,20 @@ services:
     restart: unless-stopped
     ports:
       - "3001:8080"
+    env_file:
+      - /opt/secrets/webui.env
     environment:
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL}
-      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
       - WEBUI_NAME=Johannes AI
       - WEBUI_AUTH=true
       - ENABLE_SIGNUP=false
       - TZ=Europe/Vienna
-      # Open Terminal auto-connect
-      - TERMINAL_SERVER_CONNECTIONS=[{"name":"Home Server","url":"http://open-terminal:8000","api_key":"${OPEN_TERMINAL_API_KEY}"}]
+      # Open Terminal auto-connect (full value incl. api_key loaded from env_file)
       # Tika for document extraction
       - CONTENT_EXTRACTION_ENGINE=tika
       - TIKA_SERVER_URL=http://tika:9998
       # SSO
-      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}
-      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
       - OAUTH_PROVIDER_NAME=Cloudflare
       - OPENID_PROVIDER_URL=${OPENID_PROVIDER_URL}
       - OPENID_REDIRECT_URI=${OPENID_REDIRECT_URI}
@@ -42,8 +40,8 @@ services:
     image: ghcr.io/open-webui/open-terminal:latest
     container_name: open-terminal
     restart: unless-stopped
-    environment:
-      - OPEN_TERMINAL_API_KEY=${OPEN_TERMINAL_API_KEY}
+    env_file:
+      - /opt/secrets/webui.env
     volumes:
       - /opt/stacks/webui/terminal:/home/user
       # Expose your stacks dir so the AI can inspect configs
@@ -60,11 +58,13 @@ services:
     container_name: mcpo
     restart: unless-stopped
     volumes:
-      - /opt/stacks/webui/mcpo/config.json:/app/config.json:ro
+      - /opt/secrets/mcpo-config.json:/app/config.json:ro
       - /opt/stacks:/stacks
     command: [ "--config", "/app/config.json", "--port", "8000" ]
+    env_file:
+      - /opt/secrets/webui.env
+      - /opt/secrets/portainer.env
     environment:
-      - TRILIUM_API_KEY=${TRILIUM_API_KEY}
       - TRILIUM_URL=${TRILIUM_URL}
     # internal only — no port exposure needed
 
