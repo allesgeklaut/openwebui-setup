@@ -44,8 +44,6 @@ services:
       - /opt/secrets/webui.env
     volumes:
       - /opt/stacks/webui/terminal:/home/user
-      # Expose your stacks dir so the AI can inspect configs
-      - /opt/stacks:/home/user/stacks
 
   tika:
     image: apache/tika:latest
