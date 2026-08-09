@@ -56,8 +56,6 @@ services:
     container_name: mcpo
     restart: unless-stopped
     user: "1000:1000"
-    ports:
-      - "127.0.0.1:8082:8000"
     volumes:
       - /opt/secrets/mcpo-config.json:/app/config.json:ro
       - /opt/stacks:/stacks
