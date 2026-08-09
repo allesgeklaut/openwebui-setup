@@ -55,6 +55,7 @@ services:
     image: ghcr.io/open-webui/mcpo:latest
     container_name: mcpo
     restart: unless-stopped
+    user: "1000:1000"
     volumes:
       - /opt/secrets/mcpo-config.json:/app/config.json:ro
       - /opt/stacks:/stacks
@@ -64,6 +65,7 @@ services:
       - /opt/secrets/portainer.env
     environment:
       - TRILIUM_URL=${TRILIUM_URL}
+      - HOME=/tmp
     # internal only — no port exposure needed
 
   searxng:
