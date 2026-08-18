@@ -22,6 +22,8 @@ for SECRETS_FILE in "$SECRETS_DIR/webui.env" "$SECRETS_DIR/portainer.env"; do
   fi
 done
 
+export TRILIUM_API_KEY="$(cat /opt/secrets/trilium.token)"
+
 ENV_FILE="$SCRIPT_DIR/.env"
 if [ -f "$ENV_FILE" ]; then
   set -a
