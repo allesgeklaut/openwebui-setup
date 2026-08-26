@@ -36,6 +36,20 @@
       "env": {
         "SEARXNG_URL": "http://searxng:8080"
       }
+    },
+    "trainlocks": {
+      "command": "uvx",
+      "args": [
+        "--with", "fastmcp",
+        "--with", "httpx",
+        "python",
+        "/stacks/webui/mcpo/trainlocks/trainlocks_mcp_server.py"
+      ],
+      "env": {
+        "TRAINLOGS_URL": "http://training-log:8000",
+        "TRAINLOGS_USERNAME": "${TRAINLOGS_USERNAME}",
+        "TRAINLOGS_PASSWORD": "${TRAINLOGS_PASSWORD}"
+      }
     }
   }
 }

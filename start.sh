@@ -14,7 +14,7 @@ fi
 # Load secrets from /opt/secrets (outside the MCP filesystem server's reach),
 # then non-secret config from the local .env. envsubst sees both.
 SECRETS_DIR="/opt/secrets"
-for SECRETS_FILE in "$SECRETS_DIR/webui.env" "$SECRETS_DIR/portainer.env"; do
+for SECRETS_FILE in "$SECRETS_DIR/webui.env" "$SECRETS_DIR/portainer.env" "$SECRETS_DIR/trainlocks.env"; do
   if [ -f "$SECRETS_FILE" ]; then
     set -a
     . "$SECRETS_FILE"
