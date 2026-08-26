@@ -3,4 +3,5 @@ terminal/
 
 *backup_*
 *.env
+__pycache__/
 mcpo/config.json
