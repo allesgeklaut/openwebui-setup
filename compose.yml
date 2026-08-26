@@ -63,9 +63,15 @@ services:
     env_file:
       - /opt/secrets/webui.env
       - /opt/secrets/portainer.env
+      - /opt/secrets/trainlocks.env
     environment:
       - TRILIUM_URL=${TRILIUM_URL}
       - HOME=/tmp
+      - TRAINLOGS_USERNAME=${TRAINLOGS_USERNAME}
+      - TRAINLOGS_PASSWORD=${TRAINLOGS_PASSWORD}
+    networks:
+      - default
+      - stacks-shared
 
   searxng:
     image: searxng/searxng:latest
@@ -91,6 +97,11 @@ services:
     volumes:
       - searxng-valkey-data:/data
     # internal only — no port exposure needed
+
+networks:
+  default:
+  stacks-shared:
+    external: true
 
 volumes:
   searxng-valkey-data:
