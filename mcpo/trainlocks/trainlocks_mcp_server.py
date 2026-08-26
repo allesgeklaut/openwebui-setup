@@ -36,13 +36,18 @@ async def _login() -> None:
 async def _authed(method: str, path: str, **kwargs) -> httpx.Response:
     """Make a request, re-logging in if the session has expired.
 
-    The app answers unauthenticated requests with a 303 redirect to /login,
-    while successful writes redirect elsewhere — so only a 303 to /login
+    The app answers unauthenticated API requests with a JSON 401 and
+    unauthenticated page requests with a 303 redirect to /login; either
     triggers a re-login + retry.
     """
     c = _get_client()
     r = await c.request(method, path, **kwargs)
-    if r.status_code == 303 and r.headers.get("location", "").startswith("/login"):
+    expired = (
+        r.status_code == 401
+        or r.status_code == 303
+        and r.headers.get("location", "").startswith("/login")
+    )
+    if expired:
         await _login()
         r = await c.request(method, path, **kwargs)
     return r
@@ -164,7 +169,7 @@ async def create_exercise(name: str, is_bodyweight: bool = False) -> str:
         "POST", "/exercises",
         data={"name": name.strip(), "is_bodyweight": "1" if is_bodyweight else "0"},
     )
-    if r.status_code == 400:
+    if r.status_code != 303:
         raise ValueError(_fail(r, "could not create exercise"))
     return f"Created exercise {name.strip()!r}"
 
@@ -177,7 +182,7 @@ async def create_template(name: str) -> str:
         name: template name.
     """
     r = await _authed("POST", "/templates", data={"name": name.strip()})
-    if r.status_code == 400:
+    if r.status_code != 303:
         raise ValueError(_fail(r, "could not create template"))
     return f"Created template {name.strip()!r}"
 
@@ -199,8 +204,8 @@ async def add_exercise_to_template(template: str, exercise: str, sets: int) -> s
     )
     if r.status_code == 404:
         raise ValueError(f"template not found: {template!r}")
-    if r.status_code == 303 and r.headers.get("location", "").startswith("/login"):
-        raise RuntimeError("trainlocks login failed")
+    if r.status_code != 303:
+        raise ValueError(_fail(r, "could not add exercise to template"))
     return f"Added {exercise!r} ({sets} sets) to template {template!r}"
 
 
@@ -302,6 +307,11 @@ async def edit_session_set(
         if s["weight"] is not None:
             form[f"weight-{eid}-{num}"] = str(s["weight"])
 
+    if reps <= 0 and weight is None:
+        # The app only deletes a set row when its reps-EX-N key is submitted
+        # with an empty value; omitting it leaves the row untouched.
+        form[f"reps-{ex_id}-{set_number}"] = ""
+
     r = await _authed("POST", f"/sessions/edit/{session_id}", data=form)
     if r.status_code in (400, 404):
         raise ValueError(_fail(r, "could not edit session"))
@@ -318,6 +328,8 @@ async def delete_session(session_id: int) -> str:
     r = await _authed("POST", f"/sessions/{session_id}/delete")
     if r.status_code == 404:
         raise ValueError("session not found")
+    if r.status_code != 303:
+        raise ValueError(_fail(r, "could not delete session"))
     return f"Deleted session {session_id}"
 
 
