@@ -278,7 +278,8 @@ async def edit_session_set(
         exercise: exercise name or id.
         set_number: set number to update.
         reps: new rep count. Set to 0 together with weight=None to delete the set.
-        weight: new weight in kg (omit for bodyweight).
+        weight: new weight in kg. Omit to keep the set's existing weight (or
+            leave it unset for a new bodyweight set).
     """
     r = await _authed("GET", f"/api/sessions/{session_id}")
     if r.status_code == 404:
@@ -293,6 +294,9 @@ async def edit_session_set(
     if reps <= 0 and weight is None:
         sets.pop(key, None)
     else:
+        existing = sets.get(key)
+        if weight is None and existing is not None:
+            weight = existing["weight"]
         sets[key] = {
             "exercise_id": ex_id,
             "exercise": exercise.strip(),
@@ -313,7 +317,9 @@ async def edit_session_set(
         form[f"reps-{ex_id}-{set_number}"] = ""
 
     r = await _authed("POST", f"/sessions/edit/{session_id}", data=form)
-    if r.status_code in (400, 404):
+    if r.status_code == 404:
+        raise ValueError("session not found")
+    if r.status_code != 303:
         raise ValueError(_fail(r, "could not edit session"))
     return f"Updated set {set_number} of {exercise!r} in session {session_id}"
 

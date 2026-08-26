@@ -47,7 +47,8 @@ requires the `feature/mcp-json-api` branch of the trainlocks app to be running.
 The server logs in against the app's own session-based auth
 (`POST /login`, cookie `tl_session`) using the credentials above, keeps the
 session in memory, and re-logs in automatically when the session expires
-(the app answers unauthenticated API calls with a 303 to `/login`).
+(the app answers unauthenticated API calls with a JSON 401 and unauthenticated
+page requests with a 303 redirect to `/login`).
 The cookie expires after 7 days (`SESSION_MAX_AGE`), so the server re-authenticates
 on its own.
 
