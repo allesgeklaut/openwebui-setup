@@ -28,6 +28,12 @@ services:
       - ENABLE_IMAGE_GENERATION=${ENABLE_IMAGE_GENERATION}
       - IMAGE_GENERATION_ENGINE=${IMAGE_GENERATION_ENGINE}
       - COMFYUI_BASE_URL=${COMFYUI_BASE_URL}
+      # Voice chat TTS (Kokoro-FastAPI, OpenAI-compatible)
+      - AUDIO_TTS_ENGINE=openai
+      - AUDIO_TTS_OPENAI_API_BASE_URL=http://kokoro:8880/v1
+      - AUDIO_TTS_OPENAI_API_KEY=not-needed
+      - AUDIO_TTS_MODEL=kokoro
+      - AUDIO_TTS_VOICE=af_heart
     volumes:
       - /opt/stacks/webui/data:/app/backend/data
     depends_on:
@@ -35,6 +41,15 @@ services:
       - tika
       - mcpo
       - searxng
+      - kokoro
+
+  kokoro:
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    container_name: kokoro
+    restart: unless-stopped
+    environment:
+      - API_LOG_LEVEL=WARNING
+      - DEFAULT_VOICE=af_heart
 
   open-terminal:
     image: ghcr.io/open-webui/open-terminal:latest

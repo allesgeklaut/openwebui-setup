@@ -10,6 +10,7 @@ A self-hosted AI chat interface with extended capabilities, powered by [Open Web
 | **mcpo** | MCP server gateway (Trilium, filesystem, fetch) | internal |
 | **searxng** | Privacy-respecting search engine | 8081 |
 | **tika** | Document extraction & preprocessing | internal |
+| **kokoro** | TTS engine (Kokoro-FastAPI, OpenAI-compatible) | internal |
 
 ## Prerequisites
 
