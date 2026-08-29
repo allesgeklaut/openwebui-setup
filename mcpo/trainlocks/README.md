@@ -17,6 +17,10 @@ both for reading and for logging workouts.
 - **`log_session`** — log a completed workout (reps and weight per set)
 - **`edit_session_set`** — change one set in an existing session
 - **`delete_session`** — delete a session
+- **`log_cardio`** — log a cardio/endurance activity (running, swimming, …)
+- **`list_cardio`** — recent cardio activities, newest first
+- **`get_cardio`** — one cardio activity by id
+- **`delete_cardio`** — delete a cardio activity
 
 ## Requirements
 
@@ -60,10 +64,15 @@ Example prompts:
 - *"How is my bench press progressing?"*
 - *"Log today's workout: bench press 5 sets of 5 reps at 80 kg, rows 4 sets of 8 reps at 60 kg"*
 - *"Fix the first set of yesterday's session to 4 reps"*
+- *"Log a 5 km run today, took 30 minutes"*
+- *"How much did I swim last week?"*
+- *"Add a 1000 m swim of 20 minutes to yesterday"*
 
 ## Notes
 
 - Exercise and template references accept names (case-insensitive) or numeric ids.
+- `get_session` / `list_sessions` also return a `cardio` array for any cardio
+  activities logged on that date.
 - The server is stateless between requests apart from the login cookie; it opens
   a fresh HTTP client process per MCPo spawn.
 - No tool touches data outside the training log app.

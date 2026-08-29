@@ -339,5 +339,97 @@ async def delete_session(session_id: int) -> str:
     return f"Deleted session {session_id}"
 
 
+# ---------- Cardio ----------
+
+def _cardio_summary(d: dict) -> str:
+    dist = f"{d['distance_km']} km" if d.get("distance_km") is not None else ""
+    dur = f"{d['duration_min']} min" if d.get("duration_min") is not None else ""
+    bits = [b for b in (dist, dur) if b]
+    p = d.get("pace")
+    unit = d.get("pace_unit", "km")
+    pace = f" ({p} min/{unit})" if p else ""
+    return f"{d['activity_type'].capitalize()} {d.get('date', '')} {' '.join(bits)}{pace}".strip()
+
+
+@mcp.tool()
+async def log_cardio(
+    activity_type: str,
+    distance_km: Optional[float] = None,
+    duration_min: Optional[float] = None,
+    date: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> str:
+    """Log a cardio / endurance activity (running, swimming, cycling, ...).
+
+    At least one of distance_km or duration_min is required. The activity is
+    attached to the session for the given date (created if needed).
+
+    Args:
+        activity_type: e.g. "running", "swimming", "cycling", "walking".
+        distance_km: distance in kilometres (optional).
+        duration_min: duration in minutes (optional).
+        date: activity date as YYYY-MM-DD (defaults to today).
+        notes: optional notes.
+    """
+    payload: dict = {"activity_type": activity_type.strip()}
+    if distance_km is not None:
+        payload["distance_km"] = distance_km
+    if duration_min is not None:
+        payload["duration_min"] = duration_min
+    if date:
+        payload["date"] = date
+    if notes:
+        payload["notes"] = notes
+    r = await _authed(
+        "POST", "/api/cardio",
+        json=payload, headers={"Accept": "application/json"},
+    )
+    if r.status_code != 201:
+        raise ValueError(_fail(r, "could not log cardio activity"))
+    d = r.json()
+    return f"Logged cardio activity {d['id']}: {_cardio_summary(d)}"
+
+
+@mcp.tool()
+async def list_cardio(limit: int = 10) -> list:
+    """List recent cardio activities, newest first.
+
+    Args:
+        limit: max number of activities to return (default 10).
+    """
+    r = await _authed("GET", "/api/cardio", params={"limit": limit})
+    r.raise_for_status()
+    return r.json()
+
+
+@mcp.tool()
+async def get_cardio(cardio_id: int) -> dict:
+    """Get one cardio activity by id.
+
+    Args:
+        cardio_id: id of the activity (see list_cardio).
+    """
+    r = await _authed("GET", f"/api/cardio/{cardio_id}")
+    if r.status_code == 404:
+        raise ValueError("cardio activity not found")
+    r.raise_for_status()
+    return r.json()
+
+
+@mcp.tool()
+async def delete_cardio(cardio_id: int) -> str:
+    """Delete a cardio activity.
+
+    Args:
+        cardio_id: id of the activity to delete.
+    """
+    r = await _authed("DELETE", f"/api/cardio/{cardio_id}")
+    if r.status_code == 404:
+        raise ValueError("cardio activity not found")
+    if r.status_code != 200:
+        raise ValueError(_fail(r, "could not delete cardio activity"))
+    return f"Deleted cardio activity {cardio_id}"
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
