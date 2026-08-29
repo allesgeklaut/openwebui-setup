@@ -1,6 +1,6 @@
 import datetime
 import os
-from typing import Optional
+from typing import Optional, Union
 
 import httpx
 from fastmcp import FastMCP
@@ -341,9 +341,17 @@ async def delete_session(session_id: int) -> str:
 
 # ---------- Cardio ----------
 
+def _fmt_duration(mins) -> str:
+    if mins is None:
+        return ""
+    total = int(round(mins * 60))
+    m, s = divmod(total, 60)
+    return f"{m} min" if s == 0 else f"{m}:{s:02d}"
+
+
 def _cardio_summary(d: dict) -> str:
     dist = f"{d['distance_km']} km" if d.get("distance_km") is not None else ""
-    dur = f"{d['duration_min']} min" if d.get("duration_min") is not None else ""
+    dur = _fmt_duration(d.get("duration_min"))
     bits = [b for b in (dist, dur) if b]
     p = d.get("pace")
     unit = d.get("pace_unit", "km")
@@ -355,7 +363,7 @@ def _cardio_summary(d: dict) -> str:
 async def log_cardio(
     activity_type: str,
     distance_km: Optional[float] = None,
-    duration_min: Optional[float] = None,
+    duration_min: Optional[Union[float, str]] = None,
     date: Optional[str] = None,
     notes: Optional[str] = None,
 ) -> str:
@@ -367,7 +375,7 @@ async def log_cardio(
     Args:
         activity_type: e.g. "running", "swimming", "cycling", "walking".
         distance_km: distance in kilometres (optional).
-        duration_min: duration in minutes (optional).
+        duration_min: duration in minutes, e.g. 45 or "44:51" (optional).
         date: activity date as YYYY-MM-DD (defaults to today).
         notes: optional notes.
     """
