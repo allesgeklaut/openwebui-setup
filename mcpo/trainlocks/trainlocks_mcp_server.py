@@ -344,6 +344,7 @@ async def delete_session(session_id: int) -> str:
 def _fmt_duration(mins) -> str:
     if mins is None:
         return ""
+    mins = float(mins)
     total = int(round(mins * 60))
     m, s = divmod(total, 60)
     return f"{m} min" if s == 0 else f"{m}:{s:02d}"
