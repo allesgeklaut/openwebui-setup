@@ -34,8 +34,25 @@ services:
       - AUDIO_TTS_OPENAI_API_KEY=not-needed
       - AUDIO_TTS_MODEL=kokoro
       - AUDIO_TTS_VOICE=af_heart
+      # Shared entrypoint wrapper: reads the LiteLLM key file and exports it
+      # as OPENAI_API_KEY (open-webui has no _FILE support). Mounted below.
+      - APP_KEY_FILE=/run/secrets/litellm.key
+      - APP_KEY_ENV=OPENAI_API_KEY
     volumes:
       - /opt/stacks/webui/data:/app/backend/data
+      # Single source of truth for the LiteLLM API key — /opt/secrets/litellm.key.
+      # Injected as OPENAI_API_KEY by the shared entrypoint wrapper, so the key
+      # is not duplicated into any env file.
+      - /opt/secrets/litellm.key:/run/secrets/litellm.key:ro
+      - /opt/stacks/entrypoint.sh:/run/entrypoint.sh:ro
+    # Wrap start.sh with the shared key wrapper. Compose sets Cmd to null
+    # when entrypoint is overridden, so the wrapper's args must be explicit
+    # in command: instead of relying on the image's CMD.
+    command:
+      - /bin/sh
+      - /run/entrypoint.sh
+      - bash
+      - start.sh
     depends_on:
       - open-terminal
       - tika
