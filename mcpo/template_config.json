@@ -16,20 +16,6 @@
         "TRILIUM_API_TOKEN": "${TRILIUM_API_KEY}"
       }
     },
-    "portainer": {
-      "command": "uvx",
-      "args": [
-        "--with", "fastmcp",
-        "--with", "httpx",
-        "python",
-        "/stacks/webui/mcpo/portainer/portainer_mcp_server.py"
-      ],
-      "env": {
-        "PORTAINER_URL": "https://<your-LAN-IP>:9443",
-        "PORTAINER_API_KEY": "${PORTAINER_API_KEY}",
-        "PORTAINER_ENV_ID": "${PORTAINER_ENV_ID}"
-      }
-    },
     "searxng": {
       "command": "npx",
       "args": ["-y", "mcp-searxng"],

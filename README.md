@@ -7,7 +7,7 @@ A self-hosted AI chat interface with extended capabilities, powered by [Open Web
 | Service | Description | Port |
 |---------|-------------|------|
 | **open-webui** | Main UI for AI conversations | 3001 |
-| **mcpo** | MCP server gateway (Trilium, filesystem, fetch) | internal |
+| **mcpo** | MCP server gateway (Trilium, filesystem, search) | internal |
 | **searxng** | Privacy-respecting search engine | 8081 |
 | **tika** | Document extraction & preprocessing | internal |
 | **kokoro** | TTS engine (Kokoro-FastAPI, OpenAI-compatible) | internal |
@@ -58,9 +58,10 @@ docker compose up -d
 The `mcpo` service connects to various Model Context Protocol servers. The configuration is generated from [`mcpo/template_config.json`](mcpo/template_config.json ) using your environment variables.
 
 **Available MCP servers:**
-- **filesystem**: Access to `/stacks` directory (read-only)
+- **filesystem**: Access to `/stacks` directory (mounted read-only)
 - **trilium**: Integration with Trilium note-taking app (requires `TRILIUM_API_KEY`)
-- **fetch**: Web content fetching
+- **searxng**: Web search via the SearXNG service
+- **trainlocks**: Training log integration
 
 ### SearXNG (`searxng/`)
 

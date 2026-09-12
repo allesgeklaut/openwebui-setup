@@ -115,11 +115,13 @@ services:
     user: "1000:1000"
     volumes:
       - /opt/secrets/mcpo-config.json:/app/config.json:ro
-      - /opt/stacks:/stacks
+      # Read-only: the filesystem MCP only reads; the container must not be
+      # able to modify the stacks tree. Write paths, if ever needed, should be
+      # added as explicit narrow mounts instead of widening this one.
+      - /opt/stacks:/stacks:ro
     command: [ "--config", "/app/config.json", "--port", "8000" ]
     env_file:
       - /opt/secrets/webui.env
-      - /opt/secrets/portainer.env
       - /opt/secrets/trainlocks.env
     environment:
       - TRILIUM_URL=${TRILIUM_URL}
