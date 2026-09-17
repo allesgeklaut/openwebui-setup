@@ -68,7 +68,7 @@ def fake_object_info() -> dict:
 
 async def runpod_submit(
     session: aiohttp.ClientSession, workflow: dict, input_images: list[dict] | None = None
-) -> str:
+) -> tuple[str, str]:
     input_payload: dict = {"workflow": workflow}
     if input_images:
         input_payload["images"] = input_images
@@ -82,15 +82,15 @@ async def runpod_submit(
     jid = res.get("id")
     if not jid:
         raise RuntimeError(f"RunPod /run returned no id: {json.dumps(res)[:300]}")
-    return jid
+    return jid, base
 
 
-async def runpod_wait(session: aiohttp.ClientSession, jid: str) -> dict:
+async def runpod_wait(session: aiohttp.ClientSession, jid: str, base: str) -> dict:
     deadline = time.monotonic() + POLL_TIMEOUT
     while time.monotonic() < deadline:
         await asyncio.sleep(POLL_INTERVAL)
         try:
-            async with session.get(f"{BASE}/status/{jid}", headers=API_HEADERS) as r:
+            async with session.get(f"{base}/status/{jid}", headers=API_HEADERS) as r:
                 r.raise_for_status()
                 res = await r.json()
         except aiohttp.ClientError as e:
@@ -118,6 +118,19 @@ def extract_base64(status_payload: dict) -> list[str]:
 # ---------------------------------------------------------------- job execution
 
 
+def save_node_id(workflow: dict) -> str:
+    """First SaveImage/PreviewImage node id.
+
+    Open WebUI only reads /history outputs whose node id exists in the
+    submitted workflow AND is a SaveImage/PreviewImage node, so the result must
+    be reported under the workflow's own node id rather than a fixed one.
+    """
+    for nid, node in workflow.items():
+        if node.get("class_type") in ("SaveImage", "PreviewImage"):
+            return nid
+    return "9"
+
+
 def _collect_input_images(app: web.Application, workflow: dict) -> list[dict]:
     """Find LoadImage nodes referencing uploaded files; return RunPod input.images."""
     out = []
@@ -136,32 +149,35 @@ async def execute_job(app: web.Application, prompt_id: str, workflow: dict, clie
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             input_images = _collect_input_images(app, workflow)
-            jid = await runpod_submit(session, workflow, input_images)
+            jid, base = await runpod_submit(session, workflow, input_images)
             log.info(
                 "prompt %s -> runpod job %s (%d input image(s))",
                 prompt_id,
                 jid,
                 len(input_images),
             )
-            status = await runpod_wait(session, jid)
+            status = await runpod_wait(session, jid, base)
         if status.get("status") != "COMPLETED":
             raise RuntimeError(f"RunPod job {status.get('status')}: {json.dumps(status)[:500]}")
         raw = extract_base64(status)
         # Distinct filenames per image (Open WebUI resolves /view by filename)
         images = [(f"ComfyUI_{i + 1:05d}_.png", b64) for i, b64 in enumerate(raw)]
-        app["images"][prompt_id] = images
+        app["images"][prompt_id] = {"node": save_node_id(workflow), "images": images}
         app["last_prompt_id"] = prompt_id
         log.info("prompt %s completed with %d image(s)", prompt_id, len(images))
     except Exception as e:
         log.exception("prompt %s failed: %s", prompt_id, e)
         app["errors"][prompt_id] = str(e)
 
-    # prune old entries
+    # prune old entries (insertion order: keys() preserves it)
     if len(app["images"]) > MAX_STORED_PROMPTS:
-        for k in sorted(app["images"].keys())[: len(app["images"]) - MAX_STORED_PROMPTS]:
+        for k in list(app["images"].keys())[: len(app["images"]) - MAX_STORED_PROMPTS]:
             app["images"].pop(k, None)
         if app["last_prompt_id"] not in app["images"]:
             app["last_prompt_id"] = max(app["images"].keys(), default=None)
+    if len(app["errors"]) > MAX_STORED_PROMPTS:
+        for k in list(app["errors"].keys())[: len(app["errors"]) - MAX_STORED_PROMPTS]:
+            app["errors"].pop(k, None)
 
     # notify the ws client that queued this prompt (ComfyUI-style events)
     for c in list(app["ws_clients"]):
@@ -205,17 +221,17 @@ async def handle_prompt(request: web.Request) -> web.Response:
 
 async def handle_history(request: web.Request) -> web.Response:
     prompt_id = request.match_info["prompt_id"]
-    images = request.app["images"].get(prompt_id)
-    if images:
+    entry = request.app["images"].get(prompt_id)
+    if entry:
         return web.json_response(
             {
                 prompt_id: {
                     "prompt": [],
                     "outputs": {
-                        "9": {
+                        entry["node"]: {
                             "images": [
                                 {"filename": fn, "subfolder": "", "type": "output"}
-                                for fn, _ in images
+                                for fn, _ in entry["images"]
                             ]
                         }
                     },
@@ -230,15 +246,16 @@ async def handle_view(request: web.Request) -> web.Response:
     q = request.rel_url.query
     prompt_id = q.get("prompt_id", "")
     filename = q.get("filename", "")
-    images = request.app["images"].get(prompt_id, [])
-    if not images and not prompt_id:
+    entry = request.app["images"].get(prompt_id)
+    if not entry and not prompt_id:
         # Open WebUI fetches /view by filename only; fall back to the most
         # recent prompt (real ComfyUI also serves by path without prompt_id).
         last = request.app.get("last_prompt_id")
         if last:
-            images = request.app["images"].get(last, [])
-    if not images:
+            entry = request.app["images"].get(last)
+    if not entry:
         return web.Response(status=404, text="not found")
+    images = entry["images"]
     idx = 0
     if filename:
         for i, (fn, _) in enumerate(images):
@@ -295,8 +312,9 @@ async def handle_upload_image(request: web.Request) -> web.Response:
     async for part in reader:
         if part.name == "image":
             filename = part.filename or "upload.png"
+            mime = part.headers.get("Content-Type", "image/png")
             raw = await part.read(decode=False)
-            data_uri = "data:image/png;base64," + base64.b64encode(raw).decode()
+            data_uri = f"data:{mime};base64," + base64.b64encode(raw).decode()
             break
         elif part.name == "type":
             await part.read(decode=False)  # 'input' — ignored, always 'input'
