@@ -59,6 +59,31 @@ services:
       - mcpo
       - searxng
       - kokoro
+      - runpod-bridge
+
+  # Translates Open WebUI's native ComfyUI protocol (ws + /prompt + /history +
+  # /view) into RunPod serverless calls so the flux1-dev endpoint can serve
+  # image *generation*. Local ComfyUI on 8188 stays in charge of image *edit*.
+  runpod-bridge:
+    build: ./runpod-bridge
+    image: runpod-bridge:local
+    container_name: runpod-bridge
+    restart: unless-stopped
+    environment:
+      - RUNPOD_ENDPOINT_ID=${RUNPOD_ENDPOINT_ID}
+      # Optional: dedicated endpoint for edit jobs (falls back to the above)
+      - RUNPOD_ENDPOINT_ID_EDIT=${RUNPOD_ENDPOINT_ID_EDIT:-}
+      - BRIDGE_MODELS=flux1-dev-fp8.safetensors
+      - RUNPOD_POLL_INTERVAL=3
+      - RUNPOD_POLL_TIMEOUT=900
+    volumes:
+      - /opt/secrets/runpod.key:/run/secrets/runpod.key:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        export RUNPOD_API_KEY="$$(cat /run/secrets/runpod.key)"
+        exec python app.py
 
   kokoro:
     image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
@@ -90,11 +115,13 @@ services:
     user: "1000:1000"
     volumes:
       - /opt/secrets/mcpo-config.json:/app/config.json:ro
-      - /opt/stacks:/stacks
+      # Read-only: the filesystem MCP only reads; the container must not be
+      # able to modify the stacks tree. Write paths, if ever needed, should be
+      # added as explicit narrow mounts instead of widening this one.
+      - /opt/stacks:/stacks:ro
     command: [ "--config", "/app/config.json", "--port", "8000" ]
     env_file:
       - /opt/secrets/webui.env
-      - /opt/secrets/portainer.env
       - /opt/secrets/trainlocks.env
     environment:
       - TRILIUM_URL=${TRILIUM_URL}
@@ -112,7 +139,7 @@ services:
     ports:
       - "8081:8080"
     environment:
-      - SEARXNG_BASE_URL=http://<your-LAN-IP>:8081/
+      - SEARXNG_BASE_URL=http://${LAN_IP}:8081/
       - SEARXNG_VALKEY_URL=valkey://searxng-valkey:6379/0
       - UWSGI_WORKERS=2
       - UWSGI_THREADS=4
