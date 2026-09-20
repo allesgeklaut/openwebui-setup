@@ -93,6 +93,11 @@ DB keys to restore (Admin → Settings → Images, or the `config` table directl
 | `*.comfyui.base_url` | `http://${LAN_IP}:8188` |
 | `*.comfyui.api_key` | empty |
 
+Storage note when writing the `config` table directly: `*.comfyui.workflow` is
+a JSON **string** whose content is the workflow file above, whereas
+`*.comfyui.nodes` is a raw JSON **array**. Double-encoding `nodes` (or leaving
+`workflow` unquoted) still loads but fails at generation time.
+
 Node maps (`*.comfyui.nodes`); ids refer to the workflows above:
 
 - generation: `prompt`→4, `negative_prompt`→4, `model`/`unet_name`→1, `width`/`height`/`n`→5, `steps`/`seed`→6
