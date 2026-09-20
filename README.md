@@ -67,6 +67,45 @@ The `mcpo` service connects to various Model Context Protocol servers. The confi
 
 Privacy-respecting metasearch engine. Configuration is in [`searxng/config/settings.yml`](searxng/config/settings.yml ).
 
+### Image generation & editing (`workflows/`)
+
+Open WebUI's native ComfyUI engine drives the local ComfyUI stack
+(`/opt/stacks/comfyui`) running **Qwen-Image-2.1** for both generation and
+editing. The active config lives in Open WebUI's config DB
+(`data/webui.db`, key/value `config` table), which is gitignored — so the
+workflows are mirrored here for reproducibility:
+
+- [`workflows/qwen_image_2_1_t2i_api.json`](workflows/qwen_image_2_1_t2i_api.json) — text-to-image
+- [`workflows/qwen_image_2_1_edit_api.json`](workflows/qwen_image_2_1_edit_api.json) — image edit
+
+Both `image_generation.comfyui.base_url` and `images.edit.comfyui.base_url`
+point at `http://${LAN_IP}:8188` (the `COMFYUI_BASE_URL` env default is
+overridden by the DB value). The `runpod-bridge` service is retained but is no
+longer used for image work.
+
+DB keys to restore (Admin → Settings → Images, or the `config` table directly):
+
+| Key | Value |
+|---|---|
+| `image_generation.comfyui.workflow` | `workflows/qwen_image_2_1_t2i_api.json` |
+| `images.edit.comfyui.workflow` | `workflows/qwen_image_2_1_edit_api.json` |
+| `image_generation.model` / `images.edit.model` | `qwen_image_2.1_int8_convrot.safetensors` |
+| `*.comfyui.base_url` | `http://${LAN_IP}:8188` |
+| `*.comfyui.api_key` | empty |
+
+Node maps (`*.comfyui.nodes`); ids refer to the workflows above:
+
+- generation: `prompt`→4, `negative_prompt`→4, `model`/`unet_name`→1, `width`/`height`/`n`→5, `steps`/`seed`→6
+- edit: `image`→4, `prompt`→5, `model`/`unet_name`→1, `width`/`height`→7, `seed`→6
+
+Two gotchas, both of which fail with a generic 400 if violated:
+
+- The **edit** node map must **not** include `negative_prompt`: `ComfyUIEditImageForm` has no such field and the node-map applier dereferences it unconditionally.
+- The **edit** node map must **not** include `steps`: the edit request path does not send it, so mapping it writes `None` and ComfyUI rejects the prompt. The workflow's own default (25) applies.
+
+Changing the DB directly requires an Open WebUI restart — image config is read
+into memory at startup.
+
 ## Ports
 
 | Port | Service | Access |
@@ -89,6 +128,9 @@ Other services run internally and are not exposed.
 ├── searxng/
 │   └── config/
 │       └── settings.yml      # SearXNG configuration
+├── workflows/               # ComfyUI API workflows for Open WebUI (Qwen-Image-2.1)
+│   ├── qwen_image_2_1_t2i_api.json
+│   └── qwen_image_2_1_edit_api.json
 └── data/                    # Open WebUI data & cache (gitignored)
 ```
 
