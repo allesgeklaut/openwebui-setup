@@ -78,6 +78,9 @@ workflows are mirrored here for reproducibility:
 - [`workflows/qwen_image_2_1_t2i_api.json`](workflows/qwen_image_2_1_t2i_api.json) — text-to-image
 - [`workflows/qwen_image_2_1_edit_api.json`](workflows/qwen_image_2_1_edit_api.json) — image edit
 
+Both use the int8 UNet and the int8 text encoder (`qwen3vl_8b_int8_convrot`),
+matching the live config.
+
 Both `image_generation.comfyui.base_url` and `images.edit.comfyui.base_url`
 point at `http://${LAN_IP}:8188` (the `COMFYUI_BASE_URL` env default is
 overridden by the DB value). The `runpod-bridge` service is retained but is no
