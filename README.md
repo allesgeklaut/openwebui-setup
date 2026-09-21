@@ -97,6 +97,7 @@ DB keys to restore (Admin → Settings → Images, or the `config` table directl
 | `image_generation.comfyui.workflow` | `workflows/qwen_image_2_1_t2i_api.json` |
 | `images.edit.comfyui.workflow` | `workflows/qwen_image_2_1_edit_api.json` |
 | `image_generation.model` / `images.edit.model` | `qwen_image_2.1_int8_convrot.safetensors` |
+| `image_generation.steps` | `40` (generation; the edit workflow's node 6 carries it) |
 | `*.comfyui.base_url` | `http://${LAN_IP}:8189` (lifecycle proxy) |
 | `*.comfyui.api_key` | empty |
 
@@ -118,7 +119,7 @@ Node maps (`*.comfyui.nodes`); ids refer to the workflows above:
 Two gotchas, both of which fail with a generic 400 if violated:
 
 - The **edit** node map must **not** include `negative_prompt`: `ComfyUIEditImageForm` has no such field and the node-map applier dereferences it unconditionally.
-- The **edit** node map must **not** include `steps`: the edit request path does not send it, so mapping it writes `None` and ComfyUI rejects the prompt. The workflow's own default (25) applies.
+- The **edit** node map must **not** include `steps`: the edit request path does not send it, so mapping it writes `None` and ComfyUI rejects the prompt. The workflow's own default (40) applies.
 
 Changing the DB directly requires an Open WebUI restart — image config is read
 into memory at startup.

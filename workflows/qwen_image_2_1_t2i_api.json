@@ -74,7 +74,7 @@
         0
       ],
       "seed": 0,
-      "steps": 25,
+      "steps": 40,
       "cfg": 1,
       "sampler_name": "euler",
       "scheduler": "simple",
