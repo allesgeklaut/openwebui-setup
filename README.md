@@ -84,9 +84,9 @@ matching the live config.
 Both `image_generation.comfyui.base_url` and `images.edit.comfyui.base_url`
 point at `http://${LAN_IP}:8189` — the ComfyUI lifecycle proxy in the litellm
 stack, **not** ComfyUI's own `:8188`. The proxy starts the `comfyui` container
-on demand (generating the first image after idle costs a ~15 s cold start plus
-model load) and stops it after 15 minutes idle, so the GPU is not held when
-nobody is making images. The `COMFYUI_BASE_URL` env default is overridden by
+on demand (the first image after idle costs ~8 s to start the container plus
+~40–60 s for the first model load) and stops it after 15 minutes idle, so the
+GPU is not held when nobody is making images. The `COMFYUI_BASE_URL` env default is overridden by
 the DB value. See `../litellm/README.md`. The `runpod-bridge` service is
 retained but is no longer used for image work.
 
