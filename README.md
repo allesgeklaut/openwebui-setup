@@ -101,6 +101,11 @@ a JSON **string** whose content is the workflow file above, whereas
 `*.comfyui.nodes` is a raw JSON **array**. Double-encoding `nodes` (or leaving
 `workflow` unquoted) still loads but fails at generation time.
 
+Precedence note: Open WebUI **overrides** the workflow's UNet node with
+`image_generation.model` / `images.edit.model`, so the `unet_name` inside the
+workflow file is effectively decorative — changing it alone does nothing.
+Update the `model` key as well.
+
 Node maps (`*.comfyui.nodes`); ids refer to the workflows above:
 
 - generation: `prompt`→4, `negative_prompt`→4, `model`/`unet_name`→1, `width`/`height`/`n`→5, `steps`/`seed`→6
