@@ -82,9 +82,13 @@ Both use the int8 UNet and the int8 text encoder (`qwen3vl_8b_int8_convrot`),
 matching the live config.
 
 Both `image_generation.comfyui.base_url` and `images.edit.comfyui.base_url`
-point at `http://${LAN_IP}:8188` (the `COMFYUI_BASE_URL` env default is
-overridden by the DB value). The `runpod-bridge` service is retained but is no
-longer used for image work.
+point at `http://${LAN_IP}:8189` — the ComfyUI lifecycle proxy in the litellm
+stack, **not** ComfyUI's own `:8188`. The proxy starts the `comfyui` container
+on demand (generating the first image after idle costs a ~15 s cold start plus
+model load) and stops it after 15 minutes idle, so the GPU is not held when
+nobody is making images. The `COMFYUI_BASE_URL` env default is overridden by
+the DB value. See `../litellm/README.md`. The `runpod-bridge` service is
+retained but is no longer used for image work.
 
 DB keys to restore (Admin → Settings → Images, or the `config` table directly):
 
@@ -93,7 +97,7 @@ DB keys to restore (Admin → Settings → Images, or the `config` table directl
 | `image_generation.comfyui.workflow` | `workflows/qwen_image_2_1_t2i_api.json` |
 | `images.edit.comfyui.workflow` | `workflows/qwen_image_2_1_edit_api.json` |
 | `image_generation.model` / `images.edit.model` | `qwen_image_2.1_int8_convrot.safetensors` |
-| `*.comfyui.base_url` | `http://${LAN_IP}:8188` |
+| `*.comfyui.base_url` | `http://${LAN_IP}:8189` (lifecycle proxy) |
 | `*.comfyui.api_key` | empty |
 
 Storage note when writing the `config` table directly: `*.comfyui.workflow` is
