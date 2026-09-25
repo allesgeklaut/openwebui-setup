@@ -18,6 +18,9 @@ services:
       # Tika for document extraction
       - CONTENT_EXTRACTION_ENGINE=tika
       - TIKA_SERVER_URL=http://tika:9998
+      # Send X-OpenWebUI-User-Id to OpenAI-compatible endpoints (litellm), so
+      # the OpenCode Go session-header callback can fingerprint per user
+      - ENABLE_FORWARD_USER_INFO_HEADERS=True
       # SSO
       - OAUTH_PROVIDER_NAME=Cloudflare
       - OPENID_PROVIDER_URL=${OPENID_PROVIDER_URL}
