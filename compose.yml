@@ -4,7 +4,7 @@ services:
     container_name: open-webui
     restart: unless-stopped
     ports:
-      - "3001:8080"
+      - "127.0.0.1:3001:8080"
     env_file:
       - /opt/secrets/webui.env
     environment:
@@ -62,7 +62,6 @@ services:
       - mcpo
       - searxng
       - kokoro
-      - runpod-bridge
 
   # Translates Open WebUI's native ComfyUI protocol (ws + /prompt + /history +
   # /view) into RunPod serverless calls so the flux1-dev endpoint can serve
@@ -72,6 +71,9 @@ services:
     image: runpod-bridge:local
     container_name: runpod-bridge
     restart: unless-stopped
+    # Opt-in service: only starts with `docker compose --profile runpod up -d`.
+    profiles:
+      - runpod
     environment:
       - RUNPOD_ENDPOINT_ID=${RUNPOD_ENDPOINT_ID}
       # Optional: dedicated endpoint for edit jobs (falls back to the above)
