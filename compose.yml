@@ -8,7 +8,6 @@ services:
     env_file:
       - /opt/secrets/webui.env
     environment:
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL}
       - WEBUI_NAME=Johannes AI
       - WEBUI_AUTH=true
