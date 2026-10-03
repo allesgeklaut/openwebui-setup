@@ -75,11 +75,22 @@ editing. The active config lives in Open WebUI's config DB
 (`data/webui.db`, key/value `config` table), which is gitignored — so the
 workflows are mirrored here for reproducibility:
 
-- [`workflows/qwen_image_2_1_t2i_api.json`](workflows/qwen_image_2_1_t2i_api.json) — text-to-image
-- [`workflows/qwen_image_2_1_edit_api.json`](workflows/qwen_image_2_1_edit_api.json) — image edit
+- [`workflows/qwen_image_2_1_t2i_api.json`](workflows/qwen_image_2_1_t2i_api.json) — text-to-image (plain)
+- [`workflows/qwen_image_2_1_edit_api.json`](workflows/qwen_image_2_1_edit_api.json) — image edit (plain)
+- [`workflows/qwen_image_2_1_pe_t2i_api.json`](workflows/qwen_image_2_1_pe_t2i_api.json) — text-to-image with the Prompt Enhancer
+- [`workflows/qwen_image_2_1_pe_edit_api.json`](workflows/qwen_image_2_1_pe_edit_api.json) — image edit with the Prompt Enhancer
 
-Both use the int8 UNet and the int8 text encoder (`qwen3vl_8b_int8_convrot`),
-matching the live config.
+All four use the int8 UNet and the int8 text encoder (`qwen3vl_8b_int8_convrot`).
+The two `_pe_` workflows prepend the official Qwen-Image-2.1 Prompt Enhancer
+(Qwen3.5-VL-9B; see `../comfyui/README.md`).
+
+**Open WebUI uses the plain workflows** (`qwen_image_2_1_{t2i,edit}_api.json`).
+It already has its own prompt-rewrite step (`image_generation.prompt.enable`), so
+adding the PE would double-enhance and cost an extra 60–200 s per image. The PE is
+the default only for the ComfyUI MCP server (`enhance=True`). To switch Open WebUI
+to the PE anyway, point the `*.comfyui.workflow` keys at the `_pe_` files, use the
+PE node maps below, and consider disabling Open WebUI's own rewrite so the PE is
+the single enhancer.
 
 Both `image_generation.comfyui.base_url` and `images.edit.comfyui.base_url`
 point at `http://${LAN_IP}:8189` — the ComfyUI lifecycle proxy in the litellm
@@ -111,10 +122,21 @@ Precedence note: Open WebUI **overrides** the workflow's UNet node with
 workflow file is effectively decorative — changing it alone does nothing.
 Update the `model` key as well.
 
-Node maps (`*.comfyui.nodes`); ids refer to the workflows above:
+Node maps (`*.comfyui.nodes`); ids refer to the workflows above.
+
+Plain workflows:
 
 - generation: `prompt`→4, `negative_prompt`→4, `model`/`unet_name`→1, `width`/`height`/`n`→5, `steps`/`seed`→6
 - edit: `image`→4, `prompt`→5, `model`/`unet_name`→1, `width`/`height`→7, `seed`→6
+
+PE workflows (`prompt` goes to the rewrite node, not `TextEncodeQwenImage21`):
+
+- PE generation: `prompt`→2, `negative_prompt`→6, `model`/`unet_name`→3, `width`/`height`/`n`→7, `steps`/`seed`→8
+- PE edit: `image`→3, `prompt`→2, `model`/`unet_name`→4, `width`/`height`→8, `seed`→9
+
+(PE node ids: CLIPLoader PE=1, rewrite=2, then UNET=3/4, generation
+CLIPLoader, VAE, `TextEncodeQwenImage21`, `EmptyLatentImage`, `KSampler`,
+`VAEDecode`, `SaveImage`, `PreviewAny`. See the JSON files.)
 
 Two gotchas, both of which fail with a generic 400 if violated:
 
@@ -148,7 +170,9 @@ Other services run internally and are not exposed.
 │       └── settings.yml      # SearXNG configuration
 ├── workflows/               # ComfyUI API workflows for Open WebUI (Qwen-Image-2.1)
 │   ├── qwen_image_2_1_t2i_api.json
-│   └── qwen_image_2_1_edit_api.json
+│   ├── qwen_image_2_1_edit_api.json
+│   ├── qwen_image_2_1_pe_t2i_api.json   # + Prompt Enhancer
+│   └── qwen_image_2_1_pe_edit_api.json  # + Prompt Enhancer
 └── data/                    # Open WebUI data & cache (gitignored)
 ```
 
