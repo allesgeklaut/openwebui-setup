@@ -39,8 +39,21 @@ def _env_int(name: str, default: int | None, *, minimum: int = 1) -> int | None:
     return value
 
 
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be a number (got {raw!r})")
+    if value < minimum:
+        raise SystemExit(f"{name} must be >= {minimum} (got {value})")
+    return value
+
+
 EXA_API_URL = os.environ.get("EXA_API_URL", "https://api.exa.ai/contents")
-EXA_TIMEOUT = float(os.environ.get("EXA_TIMEOUT", "90"))
+EXA_TIMEOUT = _env_float("EXA_TIMEOUT", 90.0, minimum=0.1)
 # Optional per-page character cap. Unset = let Exa return the full text.
 EXA_TEXT_MAX_CHARS = _env_int("EXA_TEXT_MAX_CHARS", None)
 PORT = _env_int("PORT", 8080) or 8080
@@ -61,6 +74,9 @@ def _read_secret(value: str | None, file_env: str | None) -> str:
 
 EXA_API_KEY = _read_secret(os.environ.get("EXA_API_KEY"), "EXA_API_KEY_FILE")
 LOADER_TOKEN = _read_secret(os.environ.get("LOADER_TOKEN"), "LOADER_TOKEN_FILE")
+# Bytes form: HTTP headers are decoded latin-1, so they may contain non-ASCII
+# characters, and hmac.compare_digest rejects str operands with non-ASCII chars.
+_EXPECTED_AUTHORIZATION = f"Bearer {LOADER_TOKEN}".encode("utf-8")
 
 
 def fetch_urls(urls: list[str]) -> list[dict]:
@@ -137,7 +153,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if LOADER_TOKEN:
             auth = self.headers.get("Authorization", "")
-            if not hmac.compare_digest(auth, f"Bearer {LOADER_TOKEN}"):
+            if not hmac.compare_digest(auth.encode("utf-8", "surrogateescape"), _EXPECTED_AUTHORIZATION):
                 log.warning("Rejected request with bad/missing token")
                 self._send(401, {"error": "unauthorized"})
                 return
