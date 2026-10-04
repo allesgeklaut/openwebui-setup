@@ -17,6 +17,10 @@ services:
       # Tika for document extraction
       - CONTENT_EXTRACTION_ENGINE=tika
       - TIKA_SERVER_URL=http://tika:9998
+      # The tika image is Apache Tika 4.x. Open WebUI's default is 3, which
+      # makes TikaLoader call /tika/text but parse the plain-text reply as JSON,
+      # so binary/PDF URL fetches fail. Version 4 uses /tika/json/md.
+      - TIKA_SERVER_VERSION=4
       # Send X-OpenWebUI-User-Id to OpenAI-compatible endpoints (litellm), so
       # the OpenCode Go session-header callback can fingerprint per user
       - ENABLE_FORWARD_USER_INFO_HEADERS=True
