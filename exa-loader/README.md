@@ -39,7 +39,12 @@ Environment:
 | `EXA_API_URL` | Exa contents endpoint | `https://api.exa.ai/contents` |
 | `EXA_TEXT_MAX_CHARS` | Optional per-page cap; empty = full text | *(empty)* |
 | `EXA_TIMEOUT` | Upstream request timeout (seconds) | `90` |
+| `MAX_URLS` | Max URLs accepted per request | `100` |
+| `MAX_BODY_BYTES` | Max accepted request body size | `2097152` |
 | `PORT` | Listen port | `8080` |
+
+Both the Exa key **and** the bearer token are required: the service refuses to
+start without them, so it cannot come up with auth silently disabled.
 
 Open WebUI settings (Admin → Web Search, or directly in the config DB):
 

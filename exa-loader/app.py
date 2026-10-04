@@ -13,6 +13,7 @@ Stdlib only -- no third-party dependencies.
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -24,20 +25,37 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 logging.basicConfig(stream=sys.stdout, level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("exa-loader")
 
+
+def _env_int(name: str, default: int | None, *, minimum: int = 1) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be an integer (got {raw!r})")
+    if value < minimum:
+        raise SystemExit(f"{name} must be >= {minimum} (got {value})")
+    return value
+
+
 EXA_API_URL = os.environ.get("EXA_API_URL", "https://api.exa.ai/contents")
 EXA_TIMEOUT = float(os.environ.get("EXA_TIMEOUT", "90"))
-# Optional per-page character cap. Unset/0 = let Exa return the full text.
-EXA_TEXT_MAX_CHARS = os.environ.get("EXA_TEXT_MAX_CHARS", "").strip()
-PORT = int(os.environ.get("PORT", "8080"))
-MAX_URLS = int(os.environ.get("MAX_URLS", "100"))
+# Optional per-page character cap. Unset = let Exa return the full text.
+EXA_TEXT_MAX_CHARS = _env_int("EXA_TEXT_MAX_CHARS", None)
+PORT = _env_int("PORT", 8080) or 8080
+MAX_URLS = _env_int("MAX_URLS", 100) or 100
+MAX_BODY_BYTES = _env_int("MAX_BODY_BYTES", 2 * 1024 * 1024) or 2 * 1024 * 1024
 
 
 def _read_secret(value: str | None, file_env: str | None) -> str:
     if file_env:
         path = os.environ.get(file_env)
-        if path and os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as fh:
-                return fh.read().strip()
+        if path:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as fh:
+                    return fh.read().strip()
+            log.error("%s points at %s, which does not exist", file_env, path)
     return (value or "").strip()
 
 
@@ -51,8 +69,8 @@ def fetch_urls(urls: list[str]) -> list[dict]:
         raise RuntimeError("EXA_API_KEY is not configured")
 
     payload: dict = {"urls": urls}
-    if EXA_TEXT_MAX_CHARS:
-        payload["text"] = {"maxCharacters": int(EXA_TEXT_MAX_CHARS)}
+    if EXA_TEXT_MAX_CHARS is not None:
+        payload["text"] = {"maxCharacters": EXA_TEXT_MAX_CHARS}
     else:
         payload["text"] = True
 
@@ -119,26 +137,41 @@ class Handler(BaseHTTPRequestHandler):
 
         if LOADER_TOKEN:
             auth = self.headers.get("Authorization", "")
-            if auth != f"Bearer {LOADER_TOKEN}":
+            if not hmac.compare_digest(auth, f"Bearer {LOADER_TOKEN}"):
                 log.warning("Rejected request with bad/missing token")
                 self._send(401, {"error": "unauthorized"})
                 return
 
         try:
             length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._send(400, {"error": "invalid Content-Length"})
+            return
+        if length > MAX_BODY_BYTES:
+            self._send(413, {"error": "request body too large"})
+            return
+
+        try:
             body = self.rfile.read(length) if length else b"{}"
             payload = json.loads(body or b"{}")
         except Exception as exc:
             self._send(400, {"error": f"invalid JSON: {exc}"})
             return
 
-        urls = payload.get("urls")
+        raw_urls = payload.get("urls")
         if isinstance(payload.get("url"), str):
-            urls = [payload["url"]]
-        if not isinstance(urls, list) or not urls:
+            raw_urls = [payload["url"]]
+        if not isinstance(raw_urls, list) or not raw_urls:
             self._send(400, {"error": "missing 'urls' list"})
             return
-        urls = [u for u in urls if isinstance(u, str) and u][:MAX_URLS]
+
+        seen: set[str] = set()
+        urls = []
+        for url in raw_urls:
+            if isinstance(url, str) and url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+        urls = urls[:MAX_URLS]
 
         try:
             docs = fetch_urls(urls)
@@ -152,6 +185,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(502, {"error": str(exc)})
             return
 
+        if not docs:
+            # Every requested URL failed or yielded no text. Surface it rather
+            # than returning 200 [], which Open WebUI would silently turn into
+            # empty content.
+            self._send(502, {"error": "no content extracted", "urls": urls})
+            return
+
         # Open WebUI iterates the top-level JSON value as the document list.
         self._send(200, docs)
 
@@ -160,8 +200,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    missing = []
     if not EXA_API_KEY:
-        log.error("EXA_API_KEY / EXA_API_KEY_FILE is required; refusing to start")
+        missing.append("EXA_API_KEY / EXA_API_KEY_FILE")
+    if not LOADER_TOKEN:
+        missing.append("LOADER_TOKEN / LOADER_TOKEN_FILE")
+    if missing:
+        log.error("Refusing to start: %s required", ", ".join(missing))
         sys.exit(1)
+
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server.daemon_threads = True
     log.info("exa-loader listening on 0.0.0.0:%s (Exa: %s)", PORT, EXA_API_URL)
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    server.serve_forever()
