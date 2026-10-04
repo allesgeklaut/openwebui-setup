@@ -1,0 +1,167 @@
+"""Exa-backed external web loader for Open WebUI.
+
+Open WebUI's `external` web loader POSTs {"urls": [...]} with an
+`Authorization: Bearer <token>` header and expects a JSON list of
+{"page_content", "metadata"} back.  This tiny adapter forwards those URLs to
+Exa's /contents endpoint (clean, article-style text extraction) and reshapes
+the response.  It lets Open WebUI reuse the same Exa key that already powers
+web search, giving URL fetch the same quality instead of the built-in
+BeautifulSoup get_text() boilerplate dump.
+
+Stdlib only -- no third-party dependencies.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+logging.basicConfig(stream=sys.stdout, level=os.environ.get("LOG_LEVEL", "INFO"))
+log = logging.getLogger("exa-loader")
+
+EXA_API_URL = os.environ.get("EXA_API_URL", "https://api.exa.ai/contents")
+EXA_TIMEOUT = float(os.environ.get("EXA_TIMEOUT", "90"))
+# Optional per-page character cap. Unset/0 = let Exa return the full text.
+EXA_TEXT_MAX_CHARS = os.environ.get("EXA_TEXT_MAX_CHARS", "").strip()
+PORT = int(os.environ.get("PORT", "8080"))
+MAX_URLS = int(os.environ.get("MAX_URLS", "100"))
+
+
+def _read_secret(value: str | None, file_env: str | None) -> str:
+    if file_env:
+        path = os.environ.get(file_env)
+        if path and os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                return fh.read().strip()
+    return (value or "").strip()
+
+
+EXA_API_KEY = _read_secret(os.environ.get("EXA_API_KEY"), "EXA_API_KEY_FILE")
+LOADER_TOKEN = _read_secret(os.environ.get("LOADER_TOKEN"), "LOADER_TOKEN_FILE")
+
+
+def fetch_urls(urls: list[str]) -> list[dict]:
+    """Call Exa /contents and reshape results into Open WebUI Documents."""
+    if not EXA_API_KEY:
+        raise RuntimeError("EXA_API_KEY is not configured")
+
+    payload: dict = {"urls": urls}
+    if EXA_TEXT_MAX_CHARS:
+        payload["text"] = {"maxCharacters": int(EXA_TEXT_MAX_CHARS)}
+    else:
+        payload["text"] = True
+
+    req = urllib.request.Request(
+        EXA_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {EXA_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=EXA_TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    by_url = {r.get("url"): r for r in (data.get("results") or []) if isinstance(r, dict)}
+
+    docs = []
+    for url in urls:
+        result = by_url.get(url)
+        if not result:
+            log.warning("Exa returned no result for %s", url)
+            continue
+        text = result.get("text") or ""
+        if not text.strip():
+            log.warning("Exa returned empty text for %s", url)
+            continue
+        docs.append(
+            {
+                "page_content": text,
+                "metadata": {
+                    "source": result.get("url") or url,
+                    "url": result.get("url") or url,
+                    "title": result.get("title") or url,
+                    "author": result.get("author"),
+                    "publishedDate": result.get("publishedDate"),
+                },
+            }
+        )
+    return docs
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "exa-loader/1.0"
+
+    def _send(self, status: int, body) -> None:
+        data = json.dumps(body).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):  # noqa: N802
+        if self.path in ("/", "/health", "/healthz"):
+            self._send(200, {"status": "ok"})
+        else:
+            self._send(404, {"error": "not found"})
+
+    def do_POST(self):  # noqa: N802
+        if self.path not in ("/", "/contents"):
+            self._send(404, {"error": "not found"})
+            return
+
+        if LOADER_TOKEN:
+            auth = self.headers.get("Authorization", "")
+            if auth != f"Bearer {LOADER_TOKEN}":
+                log.warning("Rejected request with bad/missing token")
+                self._send(401, {"error": "unauthorized"})
+                return
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length else b"{}"
+            payload = json.loads(body or b"{}")
+        except Exception as exc:
+            self._send(400, {"error": f"invalid JSON: {exc}"})
+            return
+
+        urls = payload.get("urls")
+        if isinstance(payload.get("url"), str):
+            urls = [payload["url"]]
+        if not isinstance(urls, list) or not urls:
+            self._send(400, {"error": "missing 'urls' list"})
+            return
+        urls = [u for u in urls if isinstance(u, str) and u][:MAX_URLS]
+
+        try:
+            docs = fetch_urls(urls)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:500]
+            log.error("Exa HTTP %s: %s", exc.code, detail)
+            self._send(502, {"error": f"Exa HTTP {exc.code}", "detail": detail})
+            return
+        except Exception as exc:
+            log.exception("Failed to fetch via Exa")
+            self._send(502, {"error": str(exc)})
+            return
+
+        # Open WebUI iterates the top-level JSON value as the document list.
+        self._send(200, docs)
+
+    def log_message(self, fmt, *args):  # quieter, structured-ish logging
+        log.info("%s - %s", self.address_string(), fmt % args)
+
+
+if __name__ == "__main__":
+    if not EXA_API_KEY:
+        log.error("EXA_API_KEY / EXA_API_KEY_FILE is required; refusing to start")
+        sys.exit(1)
+    log.info("exa-loader listening on 0.0.0.0:%s (Exa: %s)", PORT, EXA_API_URL)
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
