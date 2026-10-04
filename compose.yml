@@ -17,6 +17,10 @@ services:
       # Tika for document extraction
       - CONTENT_EXTRACTION_ENGINE=tika
       - TIKA_SERVER_URL=http://tika:9998
+      # The tika image is Apache Tika 4.x. Open WebUI's default is 3, which
+      # makes TikaLoader call /tika/text but parse the plain-text reply as JSON,
+      # so binary/PDF URL fetches fail. Version 4 uses /tika/json/md.
+      - TIKA_SERVER_VERSION=4
       # Send X-OpenWebUI-User-Id to OpenAI-compatible endpoints (litellm), so
       # the OpenCode Go session-header callback can fingerprint per user
       - ENABLE_FORWARD_USER_INFO_HEADERS=True
@@ -61,6 +65,34 @@ services:
       - mcpo
       - searxng
       - kokoro
+      - exa-loader
+
+  # External web loader backing web.loader.engine=external. Open WebUI POSTs
+  # {"urls":[...]} with a Bearer token; this adapter forwards to Exa /contents
+  # and returns clean article text, so URL fetch matches web-search quality.
+  # Internal only: no published ports.
+  exa-loader:
+    build: ./exa-loader
+    image: exa-loader:local
+    container_name: exa-loader
+    restart: unless-stopped
+    environment:
+      - EXA_API_KEY_FILE=/run/secrets/exa.key
+      - LOADER_TOKEN_FILE=/run/secrets/exa-loader.token
+      - PORT=8080
+      # - EXA_TEXT_MAX_CHARS=50000  # unset = let Exa return full page text
+    volumes:
+      - /opt/secrets/exa.key:/run/secrets/exa.key:ro
+      - /opt/secrets/exa-loader.token:/run/secrets/exa-loader.token:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).status == 200 else 1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   # Translates Open WebUI's native ComfyUI protocol (ws + /prompt + /history +
   # /view) into RunPod serverless calls so the flux1-dev endpoint can serve

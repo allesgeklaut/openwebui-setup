@@ -9,6 +9,7 @@ A self-hosted AI chat interface with extended capabilities, powered by [Open Web
 | **open-webui** | Main UI for AI conversations | 3001 |
 | **mcpo** | MCP server gateway (Trilium, filesystem, search) | internal |
 | **searxng** | Privacy-respecting search engine | 8081 |
+| **exa-loader** | External web loader: clean URL fetch via Exa `/contents` | internal |
 | **tika** | Document extraction & preprocessing | internal |
 | **kokoro** | TTS engine (Kokoro-FastAPI, OpenAI-compatible) | internal |
 
@@ -66,6 +67,32 @@ The `mcpo` service connects to various Model Context Protocol servers. The confi
 ### SearXNG (`searxng/`)
 
 Privacy-respecting metasearch engine. Configuration is in [`searxng/config/settings.yml`](searxng/config/settings.yml ).
+
+### Web search & page fetching (`exa-loader/`)
+
+Web search uses **Exa** (`web.search.engine=exa`, key in `/opt/secrets/exa.key`).
+Automatic search bypasses Open WebUI's own web loader and embedding stage
+(`web.search.bypass_web_loader=true`, `web.search.bypass_embedding_and_retrieval=true`,
+`exa_max_content_length=8000`, `result_count=8`): Exa's cleaned results go straight
+to the model — no second fetch and no lossy local embed/retrieve hop. Document
+RAG (`rag.*`) is unaffected.
+
+URL *fetches* would otherwise use Open WebUI's built-in `safe_web` loader, which
+is `BeautifulSoup(html).get_text()` over the whole DOM and therefore returns
+navigation/sidebar/footer boilerplate. `exa-loader` reuses the same Exa key to
+return clean article text instead, wired via these DB keys:
+
+| Key | Value |
+|---|---|
+| `web.loader.engine` | `external` |
+| `web.loader.external_web_loader_url` | `http://exa-loader:8080/contents` |
+| `web.loader.external_web_loader_api_key` | token in `/opt/secrets/exa-loader.token` |
+
+Secrets live outside the repo (gitignored): `/opt/secrets/exa.key`,
+`/opt/secrets/exa-loader.token`. The service is internal-only (no published
+ports). Set `EXA_TEXT_MAX_CHARS` in `compose.yml` to cap fetched page length
+(unset = full page). These retrieval/loader keys are read from the DB on every
+request, so changes apply **without** an Open WebUI restart.
 
 ### Image generation & editing (`workflows/`)
 
@@ -168,6 +195,10 @@ Other services run internally and are not exposed.
 ├── searxng/
 │   └── config/
 │       └── settings.yml      # SearXNG configuration
+├── exa-loader/              # External web loader (clean URL fetch via Exa /contents)
+│   ├── app.py               # stdlib HTTP adapter
+│   ├── Dockerfile
+│   └── README.md
 ├── workflows/               # ComfyUI API workflows for Open WebUI (Qwen-Image-2.1)
 │   ├── qwen_image_2_1_t2i_api.json
 │   ├── qwen_image_2_1_edit_api.json
