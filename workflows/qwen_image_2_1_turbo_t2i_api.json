@@ -1,0 +1,140 @@
+{
+  "1": {
+    "inputs": {
+      "unet_name": "qwen_image_2.1_turbo_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load UNet (Qwen-Image 2.1 Turbo)"
+    }
+  },
+  "2": {
+    "inputs": {
+      "clip_name": "qwen3vl_8b_int8_convrot.safetensors",
+      "type": "qwen_image",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP (Qwen3-VL 8B)"
+    }
+  },
+  "3": {
+    "inputs": {
+      "vae_name": "qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "4": {
+    "inputs": {
+      "clip": [
+        "2",
+        0
+      ],
+      "prompt": "",
+      "negative_prompt": "",
+      "resolution": 1024
+    },
+    "class_type": "TextEncodeQwenImage21",
+    "_meta": {
+      "title": "Text Encode Qwen Image 2.1"
+    }
+  },
+  "5": {
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "Empty Latent"
+    }
+  },
+  "6": {
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "add_noise": true,
+      "noise_seed": 0,
+      "cfg": 1,
+      "positive": [
+        "4",
+        0
+      ],
+      "negative": [
+        "4",
+        1
+      ],
+      "sampler": [
+        "8",
+        0
+      ],
+      "sigmas": [
+        "7",
+        0
+      ],
+      "latent_image": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "SamplerCustom",
+    "_meta": {
+      "title": "Sample (official Turbo 8-step sigmas)"
+    }
+  },
+  "7": {
+    "inputs": {
+      "sigmas": "1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0.0"
+    },
+    "class_type": "ManualSigmas",
+    "_meta": {
+      "title": "Turbo sigmas (from model_index.json)"
+    }
+  },
+  "8": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "Sampler Select (euler)"
+    }
+  },
+  "9": {
+    "inputs": {
+      "samples": [
+        "6",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "10": {
+    "inputs": {
+      "images": [
+        "9",
+        0
+      ],
+      "filename_prefix": "Qwen_image_2.1_turbo"
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  }
+}

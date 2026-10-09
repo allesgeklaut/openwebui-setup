@@ -107,9 +107,27 @@ workflows are mirrored here for reproducibility:
 - [`workflows/qwen_image_2_1_pe_t2i_api.json`](workflows/qwen_image_2_1_pe_t2i_api.json) — text-to-image with the Prompt Enhancer
 - [`workflows/qwen_image_2_1_pe_edit_api.json`](workflows/qwen_image_2_1_pe_edit_api.json) — image edit with the Prompt Enhancer
 
-All four use the int8 UNet and the int8 text encoder (`qwen3vl_8b_int8_convrot`).
+- [`workflows/qwen_image_2_1_turbo_t2i_api.json`](workflows/qwen_image_2_1_turbo_t2i_api.json) — text-to-image, Turbo UNet, 8 steps (**active in Open WebUI**)
+- [`workflows/qwen_image_2_1_turbo_edit_api.json`](workflows/qwen_image_2_1_turbo_edit_api.json) — image edit, Turbo UNet, 8 steps (**active in Open WebUI**)
+
+All use the int8 text encoder (`qwen3vl_8b_int8_convrot`). The Turbo UNet
+(`qwen_image_2.1_turbo_int8_convrot.safetensors`, from `Comfy-Org/Qwen-Image-2.1`)
+has no encoder of its own and shares the same Qwen3-VL encoder. The Turbo
+checkpoint documents **CFG 1** and an **8-step schedule baked into the model**;
+the Turbo workflows reproduce both (see below).
+A single warm A/B run (seed 7, one prompt) took ~24–28 s versus ~80 s for the base
+at 40 steps — one uncontrolled sample, not a benchmark.
 The two `_pe_` workflows prepend the official Qwen-Image-2.1 Prompt Enhancer
 (Qwen3.5-VL-9B; see `../comfyui/README.md`).
+
+**Turbo sampling schedule.** The official checkpoint stores its own 8-step sigma
+schedule (`Qwen-Image-2.1-Turbo/model_index.json`, shift 1.0), and its card says
+other schedules have not been evaluated. `KSampler` cannot load that schedule, so
+the Turbo workflows use a `ManualSigmas` node carrying the checkpoint's list
+(`1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0.0`)
+into `SamplerCustom` (euler). That is the documented schedule, not ComfyUI's own
+`simple` (which applies a ~1.15 `shift`). Resolution is 1024×1024 (the Comfy-Org
+template default); the Turbo card documents 2048-scale presets.
 
 **Open WebUI uses the plain workflows** (`qwen_image_2_1_{t2i,edit}_api.json`).
 It already has its own prompt-rewrite step (`image_generation.prompt.enable`), so
@@ -132,12 +150,17 @@ DB keys to restore (Admin → Settings → Images, or the `config` table directl
 
 | Key | Value |
 |---|---|
-| `image_generation.comfyui.workflow` | `workflows/qwen_image_2_1_t2i_api.json` |
-| `images.edit.comfyui.workflow` | `workflows/qwen_image_2_1_edit_api.json` |
-| `image_generation.model` / `images.edit.model` | `qwen_image_2.1_int8_convrot.safetensors` |
-| `image_generation.steps` | `40` (generation; the edit workflow's node 6 carries it) |
+| `image_generation.comfyui.workflow` | `workflows/qwen_image_2_1_turbo_t2i_api.json` |
+| `images.edit.comfyui.workflow` | `workflows/qwen_image_2_1_turbo_edit_api.json` |
+| `image_generation.model` / `images.edit.model` | `qwen_image_2.1_turbo_int8_convrot.safetensors` |
+| `image_generation.steps` | unused for Turbo — the schedule is fixed by `ManualSigmas`; left at `8` for the UI. Restore to `40` when rolling back to the base. |
 | `*.comfyui.base_url` | `http://${LAN_IP}:8189` (lifecycle proxy) |
 | `*.comfyui.api_key` | empty |
+
+Rollback to the base model: point the two `*.comfyui.workflow` keys at
+`qwen_image_2_1_{t2i,edit}_api.json`, set both `model` keys to
+`qwen_image_2.1_int8_convrot.safetensors`, and set `image_generation.steps` to `40`.
+Then restart Open WebUI.
 
 Storage note when writing the `config` table directly: `*.comfyui.workflow` is
 a JSON **string** whose content is the workflow file above, whereas
@@ -149,12 +172,15 @@ Precedence note: Open WebUI **overrides** the workflow's UNet node with
 workflow file is effectively decorative — changing it alone does nothing.
 Update the `model` key as well.
 
-Node maps (`*.comfyui.nodes`); ids refer to the workflows above.
+Node maps (`*.comfyui.nodes`); ids refer to the active **Turbo** workflows above.
 
-Plain workflows:
+- generation (Turbo): `prompt`→4, `negative_prompt`→4, `model`/`unet_name`→1, `width`/`height`/`n`→5, `seed`→6 (`noise_seed`)
+- edit (Turbo): `image`→4, `prompt`→5, `model`/`unet_name`→1, `width`/`height`→7, `seed`→6 (`noise_seed`)
 
-- generation: `prompt`→4, `negative_prompt`→4, `model`/`unet_name`→1, `width`/`height`/`n`→5, `steps`/`seed`→6
-- edit: `image`→4, `prompt`→5, `model`/`unet_name`→1, `width`/`height`→7, `seed`→6
+Neither maps `steps`: the Turbo schedule is fixed by `ManualSigmas`, and
+`SamplerCustom` has no `steps` input. The base workflows
+(`qwen_image_2_1_{t2i,edit}_api.json`, rollback) still use `KSampler`, where
+generation maps `steps`/`seed`→6 and edit maps `seed`→6.
 
 PE workflows (`prompt` goes to the rewrite node, not `TextEncodeQwenImage21`):
 
@@ -168,7 +194,8 @@ CLIPLoader, VAE, `TextEncodeQwenImage21`, `EmptyLatentImage`, `KSampler`,
 Two gotchas, both of which fail with a generic 400 if violated:
 
 - The **edit** node map must **not** include `negative_prompt`: `ComfyUIEditImageForm` has no such field and the node-map applier dereferences it unconditionally.
-- The **edit** node map must **not** include `steps`: the edit request path does not send it, so mapping it writes `None` and ComfyUI rejects the prompt. The workflow's own default (40) applies.
+- The **edit** node map must **not** include `steps`: the edit request path does not send it, so mapping it writes `None` and ComfyUI rejects the prompt. (The Turbo edit workflow takes its schedule from `ManualSigmas`; the base edit workflow's own default, 40, applies.)
+- The Turbo workflows seed through `SamplerCustom`, whose input is named `noise_seed` — so the `seed` map entry must use `"key": "noise_seed"` (the base `KSampler` uses `"key": "seed"`).
 
 Changing the DB directly requires an Open WebUI restart — image config is read
 into memory at startup.
@@ -203,7 +230,9 @@ Other services run internally and are not exposed.
 │   ├── qwen_image_2_1_t2i_api.json
 │   ├── qwen_image_2_1_edit_api.json
 │   ├── qwen_image_2_1_pe_t2i_api.json   # + Prompt Enhancer
-│   └── qwen_image_2_1_pe_edit_api.json  # + Prompt Enhancer
+│   ├── qwen_image_2_1_pe_edit_api.json  # + Prompt Enhancer
+│   ├── qwen_image_2_1_turbo_t2i_api.json   # Turbo UNet, 8 steps (active)
+│   └── qwen_image_2_1_turbo_edit_api.json  # Turbo UNet, 8 steps (active)
 └── data/                    # Open WebUI data & cache (gitignored)
 ```
 
