@@ -109,6 +109,8 @@ workflows are mirrored here for reproducibility:
 
 - [`workflows/qwen_image_2_1_turbo_t2i_api.json`](workflows/qwen_image_2_1_turbo_t2i_api.json) — text-to-image, Turbo UNet, 8 steps (**active in Open WebUI**)
 - [`workflows/qwen_image_2_1_turbo_edit_api.json`](workflows/qwen_image_2_1_turbo_edit_api.json) — image edit, Turbo UNet, 8 steps (**active in Open WebUI**)
+- [`workflows/qwen_image_2_1_turbo_pe_t2i_api.json`](workflows/qwen_image_2_1_turbo_pe_t2i_api.json) — text-to-image, Turbo UNet + Prompt Enhancer
+- [`workflows/qwen_image_2_1_turbo_pe_edit_api.json`](workflows/qwen_image_2_1_turbo_pe_edit_api.json) — image edit, Turbo UNet + Prompt Enhancer
 
 All use the int8 text encoder (`qwen3vl_8b_int8_convrot`). The Turbo UNet
 (`qwen_image_2.1_turbo_int8_convrot.safetensors`, from `Comfy-Org/Qwen-Image-2.1`)
@@ -117,8 +119,8 @@ checkpoint documents **CFG 1** and an **8-step schedule baked into the model**;
 the Turbo workflows reproduce both (see below).
 A single warm A/B run (seed 7, one prompt) took ~24–28 s versus ~80 s for the base
 at 40 steps — one uncontrolled sample, not a benchmark.
-The two `_pe_` workflows prepend the official Qwen-Image-2.1 Prompt Enhancer
-(Qwen3.5-VL-9B; see `../comfyui/README.md`).
+The `_pe_` workflows (base and Turbo) prepend the official Qwen-Image-2.1 Prompt
+Enhancer (Qwen3.5-VL-9B; see `../comfyui/README.md`).
 
 **Turbo sampling schedule.** The official checkpoint stores its own 8-step sigma
 schedule (`Qwen-Image-2.1-Turbo/model_index.json`, shift 1.0), and its card says
@@ -129,13 +131,14 @@ into `SamplerCustom` (euler). That is the documented schedule, not ComfyUI's own
 `simple` (which applies a ~1.15 `shift`). Resolution is 1024×1024 (the Comfy-Org
 template default); the Turbo card documents 2048-scale presets.
 
-**Open WebUI uses the plain workflows** (`qwen_image_2_1_{t2i,edit}_api.json`).
-It already has its own prompt-rewrite step (`image_generation.prompt.enable`), so
-adding the PE would double-enhance and cost an extra 60–200 s per image. The PE is
-the default only for the ComfyUI MCP server (`enhance=True`). To switch Open WebUI
-to the PE anyway, point the `*.comfyui.workflow` keys at the `_pe_` files, use the
-PE node maps below, and consider disabling Open WebUI's own rewrite so the PE is
-the single enhancer.
+**Open WebUI uses the plain Turbo workflows**
+(`qwen_image_2_1_turbo_{t2i,edit}_api.json`). It already has its own
+prompt-rewrite step (`image_generation.prompt.enable`), so adding the PE would
+double-enhance and cost an extra 70–340 s per image. The PE is opt-in
+(`enhance=True`) in the ComfyUI MCP server, which otherwise also runs Turbo. To
+switch Open WebUI to the PE anyway, point the `*.comfyui.workflow` keys at the
+`turbo_pe` files, use the PE node maps below, and consider disabling Open
+WebUI's own rewrite so the PE is the single enhancer.
 
 Both `image_generation.comfyui.base_url` and `images.edit.comfyui.base_url`
 point at `http://${LAN_IP}:8189` — the ComfyUI lifecycle proxy in the litellm
@@ -232,7 +235,9 @@ Other services run internally and are not exposed.
 │   ├── qwen_image_2_1_pe_t2i_api.json   # + Prompt Enhancer
 │   ├── qwen_image_2_1_pe_edit_api.json  # + Prompt Enhancer
 │   ├── qwen_image_2_1_turbo_t2i_api.json   # Turbo UNet, 8 steps (active)
-│   └── qwen_image_2_1_turbo_edit_api.json  # Turbo UNet, 8 steps (active)
+│   ├── qwen_image_2_1_turbo_edit_api.json  # Turbo UNet, 8 steps (active)
+│   ├── qwen_image_2_1_turbo_pe_t2i_api.json   # Turbo + Prompt Enhancer
+│   └── qwen_image_2_1_turbo_pe_edit_api.json  # Turbo + Prompt Enhancer
 └── data/                    # Open WebUI data & cache (gitignored)
 ```
 
