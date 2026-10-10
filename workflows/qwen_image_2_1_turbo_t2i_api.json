@@ -37,7 +37,7 @@
       ],
       "prompt": "",
       "negative_prompt": "",
-      "resolution": 1024
+      "resolution": 2048
     },
     "class_type": "TextEncodeQwenImage21",
     "_meta": {
@@ -46,8 +46,8 @@
   },
   "5": {
     "inputs": {
-      "width": 1024,
-      "height": 1024,
+      "width": 2048,
+      "height": 2048,
       "batch_size": 1
     },
     "class_type": "EmptyLatentImage",

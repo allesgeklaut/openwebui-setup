@@ -128,8 +128,9 @@ other schedules have not been evaluated. `KSampler` cannot load that schedule, s
 the Turbo workflows use a `ManualSigmas` node carrying the checkpoint's list
 (`1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0.0`)
 into `SamplerCustom` (euler). That is the documented schedule, not ComfyUI's own
-`simple` (which applies a ~1.15 `shift`). Resolution is 1024×1024 (the Comfy-Org
-template default); the Turbo card documents 2048-scale presets.
+`simple` (which applies a ~1.15 `shift`). Resolution defaults to 2048×2048 for
+generation and 1024×1024 for editing (in both the workflow and the Open WebUI
+`*.size` keys); the Turbo card documents 2048-scale presets.
 
 **Open WebUI uses the plain Turbo workflows**
 (`qwen_image_2_1_turbo_{t2i,edit}_api.json`). It already has its own
@@ -156,14 +157,16 @@ DB keys to restore (Admin → Settings → Images, or the `config` table directl
 | `image_generation.comfyui.workflow` | `workflows/qwen_image_2_1_turbo_t2i_api.json` |
 | `images.edit.comfyui.workflow` | `workflows/qwen_image_2_1_turbo_edit_api.json` |
 | `image_generation.model` / `images.edit.model` | `qwen_image_2.1_turbo_int8_convrot.safetensors` |
+| `image_generation.size` | `2048x2048` |
+| `images.edit.size` | `1024x1024` |
 | `image_generation.steps` | unused for Turbo — the schedule is fixed by `ManualSigmas`; left at `8` for the UI. Restore to `40` when rolling back to the base. |
 | `*.comfyui.base_url` | `http://${LAN_IP}:8189` (lifecycle proxy) |
 | `*.comfyui.api_key` | empty |
 
 Rollback to the base model: point the two `*.comfyui.workflow` keys at
 `qwen_image_2_1_{t2i,edit}_api.json`, set both `model` keys to
-`qwen_image_2.1_int8_convrot.safetensors`, and set `image_generation.steps` to `40`.
-Then restart Open WebUI.
+`qwen_image_2.1_int8_convrot.safetensors`, set the two `*.size` keys back to
+`1024x1024`, and set `image_generation.steps` to `40`. Then restart Open WebUI.
 
 Storage note when writing the `config` table directly: `*.comfyui.workflow` is
 a JSON **string** whose content is the workflow file above, whereas
@@ -193,6 +196,12 @@ PE workflows (`prompt` goes to the rewrite node, not `TextEncodeQwenImage21`):
 (PE node ids: CLIPLoader PE=1, rewrite=2, then UNET=3/4, generation
 CLIPLoader, VAE, `TextEncodeQwenImage21`, `EmptyLatentImage`, `KSampler`,
 `VAEDecode`, `SaveImage`, `PreviewAny`. See the JSON files.)
+
+Neither node map sets `TextEncodeQwenImage21.resolution`, so it stays at the
+workflow's baked value (2048 for generation, 1024 for editing). Changing the
+size in the UI only rewrites `EmptyLatentImage` (`width`/`height`, nodes 5/7),
+so a different size desyncs the latent from `resolution` — use the baked size,
+or change `resolution` in the workflow (and the DB workflow) to match.
 
 Two gotchas, both of which fail with a generic 400 if violated:
 
