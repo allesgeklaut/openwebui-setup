@@ -95,7 +95,7 @@ Environment:
 | `DEFAULT_COUNT` / `MAX_COUNT` | Result count fallback / hard cap | `8` / `20` |
 | `SNIPPET_MAX` | Max total snippet length (chars) | `8000` |
 | `MAX_URLS` | Max URLs accepted per fetch request | `20` |
-| `FETCH_WORKERS` | Parallel fetch workers per request | `4` |
+| `FETCH_WORKERS` | Parallel fetch workers per request | `4` (compose sets `8`) |
 | `PORT` | Listen port | `8080` |
 
 The Mistral key **and** bearer token are required: the service refuses to
@@ -119,16 +119,18 @@ Full RAG search flow (chat models get real page content, not just snippets):
 |---|---|
 | `web.search.bypass_web_loader` | `false` — result pages are fetched via the loader (Mistral agent opens) |
 | `web.search.bypass_embedding_and_retrieval` | `false` — fetched pages are chunked + embedded, relevant chunks retrieved |
+| `web.search.result_count` | `5` — one loader batch of 5 scout page-opens (FETCH_WORKERS=8 covers it in a single parallel round) |
 | `rag.embedding_engine` / `rag.embedding_model` | `openai` (LiteLLM `http://…:4000/v1`) / `mistral-embed` |
-| `rag.embedding_batch_size` | `32` — ~250 chunks from 8 fetched pages embed in a few calls, not 250 |
+| `rag.embedding_batch_size` | `32` — ~200 chunks from 5 fetched pages embed in a few calls, not hundreds |
 | `rag.chunk_size` / `rag.top_k` | `1000` / `3` |
 
-Net effect per search-enabled turn: SERP search → top-8 pages opened by the
+Net effect per search-enabled turn: SERP search → top-5 pages opened by the
 scout agent (truncation-flagged) → chunked/embedded via LiteLLM
 `mistral-embed` → the ~3 query-relevant chunks reach the chat context with
-citations. Cost ≈ $0.30–0.60 and ≈ 15–25 s per turn (vs ≈ $0.03–0.09 and a
-few seconds for snippets-only); the privacy property is unchanged — every
-hop is Mistral.
+citations. Cost ≈ $0.20–0.40 and ≈ 10–15 s of pipeline overhead per turn
+(vs ≈ $0.03–0.09 and a few seconds for snippets-only); the privacy property
+is unchanged — every hop is Mistral. The chat model's own generation time
+comes on top.
 
 Secrets live outside the repo: `/opt/secrets/mistral.env` (shared with the
 litellm stack) and `/opt/secrets/research-search.token`. The service is
