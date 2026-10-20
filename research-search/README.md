@@ -16,9 +16,13 @@ and URL fetching (`exa-loader`). For privacy, all of that moved to Mistral:
   question; synthesis stays with whatever chat model Open WebUI is using, so
   research quality composes with every model.
 - **Fetch**: URLs are fetched directly over HTTPS by this service (full page
-  text, no third party involved), with the agent's URL-search as a fallback
-  for pages the direct fetch cannot parse (JS-only pages get the page's own
-  SERP description/snippets instead of nothing).
+  text, no third party involved). If that fails (JS-only pages, non-HTML),
+  the scout agent fetches instead: it searches for the URL and then *opens*
+  the page (two-step agentic flow — the small model only performs the page
+  open as a second call after the search presents `can_open`), which yields
+  the actual page text (capped at 32768 chars by Mistral's tool channel).
+  Only if the open never happens does the page's SERP description/snippets
+  serve as text.
 
 ## How it works
 
@@ -49,11 +53,14 @@ the URL and returns the page's own SERP entry as text.
 - **Quality**: a small A/B against Exa (3 queries) showed comparable results
   with Exa slightly ahead on precision; snippets with page excerpts close
   much of the gap. The multi-query agent loop beats a single-shot search.
-- **Agent fetch**: the Mistral tool channel caps a fetched page at 32768
-  chars and the small model always passes the URL as a `query` (not the
-  tool's `url` parameter) — hence direct fetch first, agent fallback.
+- **Agent fetch**: Mistral's tool channel caps a fetched page at 32768
+  chars (the result JSON can be cut mid-string — salvaged leniently). The
+  agent's page-open is a *second* tool call after the URL search (the small
+  model never opens directly), so the scout instructions must allow two
+  calls for FETCH PAGE.
 - **Cost**: every search turn costs $0.03–0.09 (1–3 `web_search` calls);
-  fetches are free unless the agent fallback triggers.
+  fetches are free unless the direct fetch fails and the agent fallback
+  triggers (then one search + one open ≈ $0.06).
 
 ## Configuration
 

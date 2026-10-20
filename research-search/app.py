@@ -326,13 +326,14 @@ def extract_page(data) -> dict | None:
 
 
 def fetch_page_via_agent(url: str) -> dict | None:
-    """Agent-assisted fetch fallback: search for the URL, return the page's
-    own SERP entry (description + snippets straight from the page) as text.
+    """Agent-assisted fetch: the scout searches for the URL, then opens the
+    page (two tool calls — search first, which presents can_open, then the
+    actual page-open with {"url": ...}; the small model only does the open
+    as a second step, never as the first call).
 
-    (The small model always passes the URL as a search query rather than the
-    tool's url parameter — three instruction variants could not change that.
-    Searching for the exact URL reliably puts the page itself at rank 0, so
-    we use that.)
+    Returns the full page text from the open result; falls back to the
+    page's own SERP entry (description + snippets) if the open never
+    happens.
     """
     conv = call_scout(f"FETCH PAGE: {url}")
     # A real page-open (model passes {"url": ...})? Future-proof: harvest the

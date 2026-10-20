@@ -98,8 +98,10 @@ contracts from one process, backed by the "Web Scout" Mistral agent
   6/10) is addressed by the agent's multi-query loop — a 3-query A/B showed
   comparable results, Exa slightly ahead on precision.
 - **Fetch** (`web.loader.engine=external`): direct HTTPS fetch + HTML→text
-  per URL (full page, title in metadata); agent URL-search fallback for
-  pages the direct fetch cannot parse.
+  per URL (full page, title in metadata); if that fails, the scout agent
+  searches for the URL and opens the page (real page text, capped at 32K
+  by Mistral's tool channel) — only if the open never happens do SERP
+  snippets serve as text.
 
 Wired via these DB keys:
 
