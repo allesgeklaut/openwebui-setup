@@ -113,6 +113,23 @@ win over env on existing installs):
 | `web.loader.external_web_loader_url` | `http://research-search:8080/fetch` |
 | `web.loader.external_web_loader_api_key` | token in `/opt/secrets/research-search.token` |
 
+Full RAG search flow (chat models get real page content, not just snippets):
+
+| Key | Value |
+|---|---|
+| `web.search.bypass_web_loader` | `false` — result pages are fetched via the loader (Mistral agent opens) |
+| `web.search.bypass_embedding_and_retrieval` | `false` — fetched pages are chunked + embedded, relevant chunks retrieved |
+| `rag.embedding_engine` / `rag.embedding_model` | `openai` (LiteLLM `http://…:4000/v1`) / `mistral-embed` |
+| `rag.embedding_batch_size` | `32` — ~250 chunks from 8 fetched pages embed in a few calls, not 250 |
+| `rag.chunk_size` / `rag.top_k` | `1000` / `3` |
+
+Net effect per search-enabled turn: SERP search → top-8 pages opened by the
+scout agent (truncation-flagged) → chunked/embedded via LiteLLM
+`mistral-embed` → the ~3 query-relevant chunks reach the chat context with
+citations. Cost ≈ $0.30–0.60 and ≈ 15–25 s per turn (vs ≈ $0.03–0.09 and a
+few seconds for snippets-only); the privacy property is unchanged — every
+hop is Mistral.
+
 Secrets live outside the repo: `/opt/secrets/mistral.env` (shared with the
 litellm stack) and `/opt/secrets/research-search.token`. The service is
 internal-only (no published ports).
