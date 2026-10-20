@@ -22,30 +22,45 @@ import httpx
 from fastmcp import FastMCP
 
 MISTRAL_API_URL = os.environ.get("MISTRAL_API_URL", "https://api.mistral.ai/v1/conversations")
-DEEP_RESEARCH_AGENT_ID = os.environ.get(
-    "DEEP_RESEARCH_AGENT_ID", "ag_01a157b250c376449287527d7d9fe5d0"
-)
+# Env-style file (KEY=VALUE lines) backing both the MISTRAL_API_KEY and the
+# DEEP_RESEARCH_AGENT_ID lookups; either value may also come from the env.
+CONFIG_FILE = os.environ.get("MISTRAL_API_KEY_FILE", "/opt/secrets/mistral.env")
 # Deep research can legitimately take minutes (5+ searches + page opens).
 TIMEOUT_SECONDS = float(os.environ.get("DEEP_RESEARCH_TIMEOUT", 300))
 
 
-def _load_mistral_key() -> str:
-    direct = (os.environ.get("MISTRAL_API_KEY") or "").strip()
+def _read_config_value(name: str) -> str:
+    direct = (os.environ.get(name) or "").strip()
     if direct:
         return direct
-    path = os.environ.get("MISTRAL_API_KEY_FILE", "/opt/secrets/mistral.env")
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as fh:
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if line.startswith("export "):
                     line = line[7:]
                 if "=" in line:
                     key, _, val = line.partition("=")
-                    if key.strip() == "MISTRAL_API_KEY":
+                    if key.strip() == name:
                         return val.strip().strip("'\"")
+    return ""
+
+
+def _load_mistral_key() -> str:
+    key = _read_config_value("MISTRAL_API_KEY")
+    if not key:
+        raise RuntimeError(
+            f"MISTRAL_API_KEY not set and no MISTRAL_API_KEY line found in {CONFIG_FILE}"
+        )
+    return key
+
+
+MISTRAL_API_KEY = _load_mistral_key()
+DEEP_RESEARCH_AGENT_ID = _read_config_value("DEEP_RESEARCH_AGENT_ID")
+if not DEEP_RESEARCH_AGENT_ID:
     raise RuntimeError(
-        f"MISTRAL_API_KEY not set and no MISTRAL_API_KEY line found in {path}"
+        "DEEP_RESEARCH_AGENT_ID not set and no DEEP_RESEARCH_AGENT_ID line "
+        f"found in {CONFIG_FILE}"
     )
 
 

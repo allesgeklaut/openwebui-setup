@@ -69,13 +69,13 @@ The `mcpo` service connects to various Model Context Protocol servers. The confi
 - **searxng**: Web search via the SearXNG service
 - **trainlocks**: Training log integration
 - **deep-research**: Deep web research tool fronting the "Deep Researcher"
-  Mistral agent (`mistral-large-latest` + `web_search_premium`). One tool,
-  `deep_research(question)`: runs 3–6 refined searches with page opens and
+  Mistral Studio agent (`web_search_premium`). One tool,
+  `deep_research(question)`: runs several refined searches with page opens and
   returns a structured, cited report (30–120 s, ~$0.10–0.30 per call).
   The same server is also registered in `opencode.json`, so coding agents
-  can call it — the key comes from `MISTRAL_API_KEY` via start.sh's envsubst
-  (mistral.env is now sourced there); opencode reads
-  `/opt/secrets/mistral.env` directly via the script's file fallback.
+  can call it. Both `MISTRAL_API_KEY` and the agent id come from
+  `/opt/secrets/mistral.env` (start.sh's envsubst for mcpo; the script's
+  file fallback for opencode).
 
 ### SearXNG (`searxng/`)
 
@@ -83,25 +83,24 @@ Privacy-respecting metasearch engine. Configuration is in [`searxng/config/setti
 
 ### Web search & page fetching (`research-search/`)
 
-All web access goes through **Mistral** (EU) — Exa was dropped for privacy.
-The `research-search` service serves both of Open WebUI's `external` web
-contracts from one process, backed by the "Web Scout" Mistral agent
-(`mistral-small-latest` + `web_search`):
+All web access goes through **Mistral** (EU) — Exa was dropped for privacy,
+and there is no direct HTTPS fetching anywhere in this stack. The
+`research-search` service serves both of Open WebUI's `external` web
+contracts from one process, backed by the "Web Scout" Mistral Studio agent
+(`web_search`):
 
 - **Search** (`web.search.engine=external`): the scout runs the query (up to
   3 refined searches), this service harvests the raw results —
-  `[{link, title, snippet}]`. The top results get a direct-HTTPS page excerpt
-  appended to their snippet (free, no third party) so the model sees real
-  page text. The agent never answers the question: synthesis stays with
-  whichever chat model is in use, so the research quality composes with
-  every model. The old single-shot comparison worry (Exa 8/8 vs Mistral
-  6/10) is addressed by the agent's multi-query loop — a 3-query A/B showed
-  comparable results, Exa slightly ahead on precision.
-- **Fetch** (`web.loader.engine=external`): direct HTTPS fetch + HTML→text
-  per URL (full page, title in metadata); if that fails, the scout agent
-  searches for the URL and opens the page (real page text, capped at 32K
-  by Mistral's tool channel) — only if the open never happens do SERP
-  snippets serve as text.
+  `[{link, title, snippet}]`, SERP-style only. The agent never answers the
+  question: synthesis stays with whichever chat model is in use, so the
+  research quality composes with every model. When a result matters, the
+  chat model requests the full page via the fetch loader.
+- **Fetch** (`web.loader.engine=external`): every URL goes through the scout
+  agent, which opens the page — target sites see Mistral's fetchers, never
+  this stack, and there is no outbound-fetch/SSRF surface here. Pages capped
+  at 32K chars by Mistral's tool channel are flagged
+  (`metadata.truncated` + note in `page_content`). Only if the open never
+  happens do the page's own SERP snippets serve as text.
 
 Wired via these DB keys:
 
@@ -114,11 +113,9 @@ Wired via these DB keys:
 | `web.loader.external_web_loader_url` | `http://research-search:8080/fetch` |
 | `web.loader.external_web_loader_api_key` | token in `/opt/secrets/research-search.token` |
 
-Cost per search-enabled chat turn: $0.03–0.09 (1–3 `web_search` calls);
-fetches are free unless the agent fallback triggers. These keys are read
-from the DB on every request, so changes apply **without** an Open WebUI
-restart. Details, config and limits:
-[`research-search/README.md`](research-search/README.md).
+Cost per search-enabled chat turn: ~$0.03–0.09 for the search plus ~$0.06
+per fetched page (each fetch is a scout conversation). Details, config and
+limits: [`research-search/README.md`](research-search/README.md).
 
 Pre-change backup of all `web.search.*` / `web.loader.*` rows (incl. the
 Exa key): `data/backups/config-web-backup-2026-10-20.json`. Rollback: stop
@@ -311,7 +308,7 @@ Other services run internally and are not exposed.
 ├── mcpo/
 │   ├── template_config.json  # MCP config template with ${VAR} placeholders
 │   ├── config.json           # Generated from template (gitignored, contains secrets)
-│   ├── deep-research/        # Deep Research MCP server (mistral-large + premium search)
+│   ├── deep-research/        # Deep Research MCP server (Mistral Studio agent + premium search)
 │   ├── trainlocks/           # Training log MCP server
 │   └── trilium/              # Trilium MCP integration
 ├── searxng/

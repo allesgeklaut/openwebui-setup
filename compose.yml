@@ -104,7 +104,7 @@ services:
       # file is parsed for MISTRAL_API_KEY= at startup.
       - MISTRAL_API_KEY_FILE=/run/secrets/mistral.env
       - RESEARCH_TOKEN_FILE=/run/secrets/research-search.token
-      - SCOUT_AGENT_ID=ag_01a157da4a6877f687796a921a4c356e
+      - SCOUT_AGENT_ID=${SCOUT_AGENT_ID}
       - PORT=8080
       # All result pages fetch in one parallel round (each is a scout
       # conversation); matches web.search.result_count=5 in OpenWebUI.

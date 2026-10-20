@@ -10,7 +10,10 @@
     },
     "trilium": {
       "command": "npx",
-      "args": ["-y", "triliumnext-mcp"],
+      "args": [
+        "-y",
+        "triliumnext-mcp"
+      ],
       "env": {
         "TRILIUM_API_URL": "${TRILIUM_URL}",
         "TRILIUM_API_TOKEN": "${TRILIUM_API_KEY}"
@@ -18,7 +21,10 @@
     },
     "searxng": {
       "command": "npx",
-      "args": ["-y", "mcp-searxng"],
+      "args": [
+        "-y",
+        "mcp-searxng"
+      ],
       "env": {
         "SEARXNG_URL": "http://searxng:8080"
       }
@@ -26,8 +32,10 @@
     "trainlocks": {
       "command": "uvx",
       "args": [
-        "--with", "fastmcp",
-        "--with", "httpx",
+        "--with",
+        "fastmcp",
+        "--with",
+        "httpx",
         "python",
         "/stacks/webui/mcpo/trainlocks/trainlocks_mcp_server.py"
       ],
@@ -40,13 +48,16 @@
     "deep-research": {
       "command": "uvx",
       "args": [
-        "--with", "fastmcp",
-        "--with", "httpx",
+        "--with",
+        "fastmcp",
+        "--with",
+        "httpx",
         "python",
         "/stacks/webui/mcpo/deep-research/deep_research_mcp_server.py"
       ],
       "env": {
-        "MISTRAL_API_KEY": "${MISTRAL_API_KEY}"
+        "MISTRAL_API_KEY": "${MISTRAL_API_KEY}",
+        "DEEP_RESEARCH_AGENT_ID": "${DEEP_RESEARCH_AGENT_ID}"
       }
     }
   }
