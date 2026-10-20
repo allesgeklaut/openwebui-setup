@@ -1,7 +1,7 @@
 """Deep Research MCP server: fronts the "Deep Researcher" Mistral agent.
 
 Exposes one tool, deep_research(question), which runs a full agentic web
-research turn (mistral-large-latest + web_search_premium, multiple refined
+research turn (the configured Studio agent model + web_search_premium, multiple refined
 searches, page opens) and returns the structured report with numbered
 markdown citations.
 
@@ -96,7 +96,7 @@ def _render_report(conv: dict) -> str:
     footer = f"\n\n---\n*{searches} web searches"
     if usage.get("completion_tokens"):
         footer += f", {usage['completion_tokens']} tokens"
-    footer += " | agent: mistral-large-latest + web_search_premium*"
+    footer += " | agent: Deep Researcher (Studio) + web_search_premium*"
     return report + footer
 
 
