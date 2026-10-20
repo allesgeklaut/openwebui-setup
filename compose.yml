@@ -86,8 +86,8 @@ services:
   # Mistral-agent-backed web search + URL fetch. Serves BOTH of Open WebUI's
   # `external` contracts from one process: POST /search {query,count} ->
   # [{link,title,snippet}] and POST /fetch {urls} -> [{page_content,
-  # metadata}]. Both run the "Web Scout" Mistral agent (mistral-small-latest,
-  # web_search), which only runs the searches / opens the URL and replies
+  # metadata}]. Both run the "Web Scout" Mistral Studio agent (web_search),
+  # which only runs the searches / opens the URL and replies
   # "DONE"; this adapter harvests the raw tool results. Replaces the Exa
   # search engine + exa-loader so all web access goes through Mistral (EU).
   # Mistral-only by design: no direct HTTP fetching, so target sites never

@@ -6,7 +6,7 @@ Serves both of Open WebUI's `external` web contracts from one process:
   * Web loader:      POST /fetch   {"urls": [...]}     -> [{"page_content", "metadata"}]
 
 All web access — searching AND page fetching — goes through the "Web Scout"
-Mistral agent (mistral-small-latest + web_search): a fast agent whose
+Mistral Studio agent (a small, fast agent with the web_search tool): its
 instructions make it run the search / open the URL and then reply only
 "DONE".  This service harvests the RAW tool results (the search hits, the
 opened page text) and reshapes them into the contracts above — the agent
@@ -363,15 +363,15 @@ def fetch_page_via_agent(url: str) -> dict | None:
             page["truncated"] = _is_truncated_payload(result)
             page["fetch_mode"] = "agent_page"
             return page
-    # SERP fallback: the page's own entry (description + snippets).
+    # SERP fallback: the page's own entry (description + snippets). Only an
+    # exact URL match — never some other result's entry, which would label
+    # one page's text with a different page's URL.
     best = None
     for e in tool_executions(conv):
         for entry in parse_search_entries((e.get("info") or {}).get("result")):
             if entry.get("url") == url:
                 best = entry
                 break
-            if best is None and entry.get("rank") == 0:
-                best = entry
         if best:
             break
     if not best:
@@ -418,6 +418,15 @@ def fetch_url(url: str) -> dict | None:
 # Search / fetch flows
 # --------------------------------------------------------------------------
 
+def _result_item(entry: dict) -> dict:
+    """One Open WebUI search-contract item from a normalized SERP entry."""
+    return {
+        "link": entry["url"],
+        "title": (entry.get("title") or entry["url"]).strip(),
+        "snippet": _serp_snippet(entry),
+    }
+
+
 def search_results(query: str, count: int) -> list[dict]:
     """Full /search flow: scout conversation -> SERP entries -> contract.
 
@@ -430,10 +439,7 @@ def search_results(query: str, count: int) -> list[dict]:
     if not entries:
         raise RuntimeError("agent returned no search results")
     count = max(1, min(count, MAX_COUNT))
-    results = [
-        {"link": e["url"], "title": (e.get("title") or e["url"]).strip(), "snippet": _serp_snippet(e)}
-        for e in entries[:count]
-    ]
+    results = [_result_item(e) for e in entries[:count]]
     for item in results:
         if len(item["snippet"]) > SNIPPET_MAX:
             item["snippet"] = item["snippet"][:SNIPPET_MAX]

@@ -10,8 +10,8 @@ US search provider.
 The stack previously used Exa for both web search (`web.search.engine=exa`)
 and URL fetching (`exa-loader`). For privacy, all of that moved to Mistral:
 
-- **Search**: the "Web Scout" Mistral agent (`mistral-small-latest` +
-  `web_search`) runs the query — refining it up to 3 times if needed — and
+- **Search**: the "Web Scout" Mistral Studio agent runs the query — refining it
+  up to 3 times if needed — and
   this service harvests the *raw* search results. The agent never answers the
   question; synthesis stays with whatever chat model Open WebUI is using, so
   research quality composes with every model. Results are **SERP-style only**
@@ -113,24 +113,28 @@ win over env on existing installs):
 | `web.loader.external_web_loader_url` | `http://research-search:8080/fetch` |
 | `web.loader.external_web_loader_api_key` | token in `/opt/secrets/research-search.token` |
 
-Full RAG search flow (chat models get real page content, not just snippets):
+Full RAG search flow — **applies only when Open WebUI runs the forced
+pipeline** (models without native function calling, or
+`function_calling=legacy`; in the default native-FC mode the chat model
+instead orchestrates `search_web` + `fetch_url` itself, and these
+`web.search.*` rows are dormant):
 
 | Key | Value |
 |---|---|
 | `web.search.bypass_web_loader` | `false` — result pages are fetched via the loader (Mistral agent opens) |
 | `web.search.bypass_embedding_and_retrieval` | `false` — fetched pages are chunked + embedded, relevant chunks retrieved |
-| `web.search.result_count` | `5` — one loader batch of 5 scout page-opens (FETCH_WORKERS=8 covers it in a single parallel round) |
+| `web.search.result_count` | `5` |
 | `rag.embedding_engine` / `rag.embedding_model` | `openai` (LiteLLM `http://…:4000/v1`) / `mistral-embed` |
-| `rag.embedding_batch_size` | `32` — ~200 chunks from 5 fetched pages embed in a few calls, not hundreds |
-| `rag.chunk_size` / `rag.top_k` | `1000` / `6` |
 
-Net effect per search-enabled turn: SERP search → top-5 pages opened by the
-scout agent (truncation-flagged) → chunked/embedded via LiteLLM
-`mistral-embed` → the ~3 query-relevant chunks reach the chat context with
-citations. Cost ≈ $0.20–0.40 and ≈ 10–15 s of pipeline overhead per turn
-(vs ≈ $0.03–0.09 and a few seconds for snippets-only); the privacy property
-is unchanged — every hop is Mistral. The chat model's own generation time
-comes on top.
+`rag.top_k`, `rag.chunk_size` and `rag.embedding_batch_size` are general RAG
+settings (they also govern knowledge/document retrieval); they apply to web
+pages only in the forced pipeline.
+
+Net effect per search-enabled turn: every hop is Mistral — SERP search →
+result pages opened by the scout agent (truncation-flagged) → chunked and
+embedded via LiteLLM `mistral-embed` → the top query-relevant chunks reach
+the chat context with citations. In native-FC mode the same invariants hold
+with the model picking which pages to fetch, at roughly half the cost.
 
 Secrets live outside the repo: `/opt/secrets/mistral.env` (shared with the
 litellm stack) and `/opt/secrets/research-search.token`. The service is

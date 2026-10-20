@@ -110,13 +110,38 @@ class TruncationDetection(unittest.TestCase):
         self.assertIn("truncated this page at 32768 characters", app.TRUNCATION_NOTE)
 
 
+class SerpFallback(unittest.TestCase):
+    """fetch_page_via_agent fallback: only the page's OWN SERP entry."""
+
+    def _conv_with(self, entries):
+        return {"outputs": [
+            {"type": "tool.execution",
+             "info": {"result": json.dumps({"x": e for x, e in zip("abcdefghij", entries)})}},
+        ]}
+
+    def test_falls_back_to_own_serp_entry(self):
+        target = _serp_entry("https://example.com/want", desc="Wanted snippet")
+        other = _serp_entry("https://example.com/other", rank=0, desc="Unrelated")
+        app.call_scout = lambda content: self._conv_with([other, target])
+        page = app.fetch_page_via_agent("https://example.com/want")
+        self.assertEqual(page["url"], "https://example.com/want")
+        self.assertEqual(page["content"], "Wanted snippet\nfirst snippet\nsecond snippet")
+        self.assertEqual(page["fetch_mode"], "serp")
+
+    def test_no_unrelated_entry_when_url_absent(self):
+        # A rank-0 entry for a DIFFERENT url must never stand in.
+        other = _serp_entry("https://example.com/other", rank=0)
+        app.call_scout = lambda content: self._conv_with([other])
+        self.assertIsNone(app.fetch_page_via_agent("https://example.com/want"))
+
+
 class ResultShape(unittest.TestCase):
     def test_result_item_shape(self):
-        entries = [_serp_entry()]
-        results = [{"link": e["url"], "title": e["title"], "snippet": app._serp_snippet(e)} for e in entries]
-        self.assertEqual(results[0]["link"], "https://example.com/a")
-        self.assertIn("snippet", results[0])
-        self.assertNotIn("--- page excerpt ---", results[0]["snippet"])
+        item = app._result_item(_serp_entry())
+        self.assertEqual(item["link"], "https://example.com/a")
+        self.assertEqual(item["title"], "Example A")
+        self.assertIn("snippet", item)
+        self.assertNotIn("--- page excerpt ---", item["snippet"])
 
 
 if __name__ == "__main__":
