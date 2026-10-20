@@ -23,6 +23,12 @@ and URL fetching (`exa-loader`). For privacy, all of that moved to Mistral:
   the actual page text (capped at 32768 chars by Mistral's tool channel).
   Only if the open never happens does the page's SERP description/snippets
   serve as text.
+- **PDFs and other binaries never reach this service**: Open WebUI probes
+  the URL's Content-Type itself and routes binary types (PDF, DOCX, …)
+  through its own Tika extraction (`CONTENT_EXTRACTION_ENGINE=tika`);
+  the external loader only sees text/HTML. (Verified anyway: Mistral's
+  agent fallback also extracts PDF text — an arxiv PDF returned 32K chars
+  of real paper text through /fetch.)
 
 ## How it works
 
@@ -55,9 +61,14 @@ the URL and returns the page's own SERP entry as text.
   much of the gap. The multi-query agent loop beats a single-shot search.
 - **Agent fetch**: Mistral's tool channel caps a fetched page at 32768
   chars (the result JSON can be cut mid-string — salvaged leniently). The
-  agent's page-open is a *second* tool call after the URL search (the small
-  model never opens directly), so the scout instructions must allow two
-  calls for FETCH PAGE.
+  cap is server-side with no knob, the open takes only `{"url": ...}` (no
+  offset/section parameter), and re-opening is byte-deterministic — so
+  "fetching the whole page in multiple goes" cannot walk past the first
+  32K. Full-page text comes from the direct HTTPS path instead; for
+  pages that only the agent can read, first-32K is the best effort.
+  The agent's page-open is a *second* tool call after the URL search (the
+  small model never opens directly), so the scout instructions must allow
+  two calls for FETCH PAGE.
 - **Cost**: every search turn costs $0.03–0.09 (1–3 `web_search` calls);
   fetches are free unless the direct fetch fails and the agent fallback
   triggers (then one search + one open ≈ $0.06).
