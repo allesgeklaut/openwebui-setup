@@ -122,7 +122,7 @@ Full RAG search flow (chat models get real page content, not just snippets):
 | `web.search.result_count` | `5` — one loader batch of 5 scout page-opens (FETCH_WORKERS=8 covers it in a single parallel round) |
 | `rag.embedding_engine` / `rag.embedding_model` | `openai` (LiteLLM `http://…:4000/v1`) / `mistral-embed` |
 | `rag.embedding_batch_size` | `32` — ~200 chunks from 5 fetched pages embed in a few calls, not hundreds |
-| `rag.chunk_size` / `rag.top_k` | `1000` / `3` |
+| `rag.chunk_size` / `rag.top_k` | `1000` / `6` |
 
 Net effect per search-enabled turn: SERP search → top-5 pages opened by the
 scout agent (truncation-flagged) → chunked/embedded via LiteLLM
