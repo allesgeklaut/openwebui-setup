@@ -11,7 +11,10 @@ A self-hosted AI chat interface with extended capabilities, powered by [Open Web
 | **searxng** | Privacy-respecting search engine | 8081 |
 | **exa-loader** | External web loader: clean URL fetch via Exa `/contents` | internal |
 | **tika** | Document extraction & preprocessing | internal |
-| **kokoro** | TTS engine (Kokoro-FastAPI, OpenAI-compatible) | internal |
+
+Voice chat (TTS/STT) and RAG embeddings are **not** separate services: they
+route through litellm to Mistral (Voxtral TTS + transcription, Mistral Embed).
+See [Audio & RAG embeddings](#audio--rag-embeddings).
 
 ## Prerequisites
 
@@ -93,6 +96,55 @@ Secrets live outside the repo (gitignored): `/opt/secrets/exa.key`,
 ports). Set `EXA_TEXT_MAX_CHARS` in `compose.yml` to cap fetched page length
 (unset = full page). These retrieval/loader keys are read from the DB on every
 request, so changes apply **without** an Open WebUI restart.
+
+## Audio & RAG embeddings
+
+Voice chat and document embeddings route through litellm (same gateway and
+key as chat) to Mistral's audio/embedding APIs — no local Kokoro/Whisper/
+sentence-transformers anymore:
+
+- **TTS**: Voxtral TTS (`voxtral-tts` on litellm, ~$0.016/1k chars). The
+  TTS Voice field in OpenWebUI accepts readable names, thanks to the
+  `VoxtralVoiceAlias` callback in the litellm stack (`custom_callbacks.py`),
+  which rewrites them to the UUIDs Mistral actually accepts:
+  - `auto` (current default): language routing — German text is spoken by
+    **Jo** (the only native German preset), anything else by **Jane** (en-GB).
+    OpenWebUI splits replies on punctuation, so detection runs per chunk and
+    mixed-language answers use the right voice per sentence; ambiguous
+    chunks default to Jo.
+  - `jo` / `de`, `jane` / `en`, and mood variants: `jane-sarcasm`,
+    `paul-cheerful`, `oliver-curious`, `marie-happy`, … (full map in
+    `custom_callbacks.py`).
+  - Mistral Studio display names ("Jane") do **not** work — only UUIDs,
+    readable aliases (above), or OpenAI names (`alloy`, `nova`, …, which
+    litellm maps to English presets; `nova`/`shimmer` are both Jane-Sarcasm).
+- **STT**: Voxtral batch transcription (`voxtral-stt`, $0.003/min) — better
+  German accuracy than the previous local Whisper `base`.
+- **Embeddings**: Mistral Embed (`mistral-embed`, $0.10/M tokens, 1024-dim),
+  a large quality jump over the previous local all-MiniLM (384-dim).
+
+These are Open WebUI ConfigVars: the `webui.db` `config` rows win over the
+compose env on an existing install (the env matches for fresh deploys). The
+rows changed in place (backup: `data/backups/config-audio-rag-backup-20261019.json`):
+
+| Key | Value |
+|---|---|
+| `audio.tts.openai.api_base_url` / `audio.stt.openai.api_base_url` / `rag.openai.api_base_url` | `http://192.168.0.46:4000/v1` |
+| `audio.tts.model` / `audio.stt.model` | `voxtral-tts` / `voxtral-stt` |
+| `audio.stt.engine` / `rag.embedding_engine` | `openai` |
+| `audio.tts.voice` | `auto` (readable names/UUIDs also work — see above) |
+| `rag.embedding_model` | `mistral-embed` |
+| `*.api_key` | the litellm master key |
+
+**Important**: the embedding model changed (384→1024 dims), so existing
+documents/knowledge bases need re-embedding — Admin → Documents → **Reindex**
+(or "Re-sync" per knowledge base). Until then, retrieval over old uploads
+errors; new uploads work immediately.
+
+Rollback to the local setup: restore the backup JSON rows above (engine `""`
+for STT/RAG, `sentence-transformers/all-MiniLM-L6-v2` as embedding model,
+kokoro TTS values), `git revert` the kokoro service removal in `compose.yml`,
+and reindex again.
 
 ### Image generation & editing (`workflows/`)
 

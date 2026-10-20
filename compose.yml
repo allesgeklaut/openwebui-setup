@@ -34,12 +34,29 @@ services:
       - ENABLE_IMAGE_GENERATION=${ENABLE_IMAGE_GENERATION}
       - IMAGE_GENERATION_ENGINE=${IMAGE_GENERATION_ENGINE}
       - COMFYUI_BASE_URL=${COMFYUI_BASE_URL}
-      # Voice chat TTS (Kokoro-FastAPI, OpenAI-compatible)
+      # Voice chat TTS/STT and RAG embeddings: Mistral Voxtral TTS, Voxtral
+      # transcription, and Mistral Embed — all routed through litellm, the
+      # same gateway as chat. The *_API_KEY env vars are deliberately unset:
+      # Open WebUI falls back to OPENAI_API_KEY (the litellm master key,
+      # injected by the entrypoint wrapper below) for all three.
+      # NOTE: these are ConfigVars — on an existing install the webui.db
+      # values win over env on restart. The DB rows were updated in place
+      # alongside this change (see README "Audio & RAG embeddings").
       - AUDIO_TTS_ENGINE=openai
-      - AUDIO_TTS_OPENAI_API_BASE_URL=http://kokoro:8880/v1
-      - AUDIO_TTS_OPENAI_API_KEY=not-needed
-      - AUDIO_TTS_MODEL=kokoro
-      - AUDIO_TTS_VOICE=af_heart
+      - AUDIO_TTS_OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL}
+      - AUDIO_TTS_MODEL=voxtral-tts
+      # Voice for voxtral-tts: "auto" routes by language (German -> Jo,
+      # anything else -> Jane) via the VoxtralVoiceAlias callback in the
+      # litellm stack. Readable names also work there: jo, de, jane, en,
+      # paul/oliver/marie + moods (jane-sarcasm, paul-cheerful, ...), or
+      # any Mistral Studio voice UUID / OpenAI alias.
+      - AUDIO_TTS_VOICE=auto
+      - AUDIO_STT_ENGINE=openai
+      - AUDIO_STT_OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL}
+      - AUDIO_STT_MODEL=voxtral-stt
+      - RAG_EMBEDDING_ENGINE=openai
+      - RAG_EMBEDDING_MODEL=mistral-embed
+      - RAG_OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL}
       # Shared entrypoint wrapper: reads the LiteLLM key file and exports it
       # as OPENAI_API_KEY (open-webui has no _FILE support). Mounted below.
       - APP_KEY_FILE=/run/secrets/litellm.key
@@ -64,7 +81,6 @@ services:
       - tika
       - mcpo
       - searxng
-      - kokoro
       - exa-loader
 
   # External web loader backing web.loader.engine=external. Open WebUI POSTs
@@ -121,13 +137,9 @@ services:
         export RUNPOD_API_KEY="$$(cat /run/secrets/runpod.key)"
         exec python app.py
 
-  kokoro:
-    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
-    container_name: kokoro
-    restart: unless-stopped
-    environment:
-      - API_LOG_LEVEL=WARNING
-      - DEFAULT_VOICE=af_heart
+  # Kokoro-FastAPI TTS: removed when voice chat switched to Mistral Voxtral
+  # via litellm (see AUDIO_TTS_* above). Rollback = git revert of the commit
+  # that removed it, plus restoring the audio.tts.* config rows (README).
 
   open-terminal:
     image: ghcr.io/open-webui/open-terminal:latest
