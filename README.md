@@ -7,14 +7,16 @@ A self-hosted AI chat interface with extended capabilities, powered by [Open Web
 | Service | Description | Port |
 |---------|-------------|------|
 | **open-webui** | Main UI for AI conversations | 3001 |
-| **mcpo** | MCP server gateway (Trilium, filesystem, search) | internal |
+| **mcpo** | MCP server gateway (Trilium, filesystem, deep-research, …) | internal |
 | **searxng** | Privacy-respecting search engine | 8081 |
-| **exa-loader** | External web loader: clean URL fetch via Exa `/contents` | internal |
+| **research-search** | Web search + URL fetch via the Mistral "Web Scout" agent | internal |
 | **tika** | Document extraction & preprocessing | internal |
 
 Voice chat (TTS/STT) and RAG embeddings are **not** separate services: they
 route through litellm to Mistral (Voxtral TTS + transcription, Mistral Embed).
-See [Audio & RAG embeddings](#audio--rag-embeddings).
+Web search and URL fetch **are** a service (research-search), but the actual
+searching happens in a Mistral agent — see
+[Web search & page fetching](#web-search--page-fetching-research-search).
 
 ## Prerequisites
 
@@ -66,36 +68,60 @@ The `mcpo` service connects to various Model Context Protocol servers. The confi
 - **trilium**: Integration with Trilium note-taking app (requires `TRILIUM_API_KEY`)
 - **searxng**: Web search via the SearXNG service
 - **trainlocks**: Training log integration
+- **deep-research**: Deep web research tool fronting the "Deep Researcher"
+  Mistral agent (`mistral-large-latest` + `web_search_premium`). One tool,
+  `deep_research(question)`: runs 3–6 refined searches with page opens and
+  returns a structured, cited report (30–120 s, ~$0.10–0.30 per call).
+  The same server is also registered in `opencode.json`, so coding agents
+  can call it — the key comes from `MISTRAL_API_KEY` via start.sh's envsubst
+  (mistral.env is now sourced there); opencode reads
+  `/opt/secrets/mistral.env` directly via the script's file fallback.
 
 ### SearXNG (`searxng/`)
 
 Privacy-respecting metasearch engine. Configuration is in [`searxng/config/settings.yml`](searxng/config/settings.yml ).
 
-### Web search & page fetching (`exa-loader/`)
+### Web search & page fetching (`research-search/`)
 
-Web search uses **Exa** (`web.search.engine=exa`, key in `/opt/secrets/exa.key`).
-Automatic search bypasses Open WebUI's own web loader and embedding stage
-(`web.search.bypass_web_loader=true`, `web.search.bypass_embedding_and_retrieval=true`,
-`exa_max_content_length=8000`, `result_count=8`): Exa's cleaned results go straight
-to the model — no second fetch and no lossy local embed/retrieve hop. Document
-RAG (`rag.*`) is unaffected.
+All web access goes through **Mistral** (EU) — Exa was dropped for privacy.
+The `research-search` service serves both of Open WebUI's `external` web
+contracts from one process, backed by the "Web Scout" Mistral agent
+(`mistral-small-latest` + `web_search`):
 
-URL *fetches* would otherwise use Open WebUI's built-in `safe_web` loader, which
-is `BeautifulSoup(html).get_text()` over the whole DOM and therefore returns
-navigation/sidebar/footer boilerplate. `exa-loader` reuses the same Exa key to
-return clean article text instead, wired via these DB keys:
+- **Search** (`web.search.engine=external`): the scout runs the query (up to
+  3 refined searches), this service harvests the raw results —
+  `[{link, title, snippet}]`. The top results get a direct-HTTPS page excerpt
+  appended to their snippet (free, no third party) so the model sees real
+  page text. The agent never answers the question: synthesis stays with
+  whichever chat model is in use, so the research quality composes with
+  every model. The old single-shot comparison worry (Exa 8/8 vs Mistral
+  6/10) is addressed by the agent's multi-query loop — a 3-query A/B showed
+  comparable results, Exa slightly ahead on precision.
+- **Fetch** (`web.loader.engine=external`): direct HTTPS fetch + HTML→text
+  per URL (full page, title in metadata); agent URL-search fallback for
+  pages the direct fetch cannot parse.
+
+Wired via these DB keys:
 
 | Key | Value |
 |---|---|
+| `web.search.engine` | `external` |
+| `web.search.external_web_search_url` | `http://research-search:8080/search` |
+| `web.search.external_web_search_api_key` | token in `/opt/secrets/research-search.token` |
 | `web.loader.engine` | `external` |
-| `web.loader.external_web_loader_url` | `http://exa-loader:8080/contents` |
-| `web.loader.external_web_loader_api_key` | token in `/opt/secrets/exa-loader.token` |
+| `web.loader.external_web_loader_url` | `http://research-search:8080/fetch` |
+| `web.loader.external_web_loader_api_key` | token in `/opt/secrets/research-search.token` |
 
-Secrets live outside the repo (gitignored): `/opt/secrets/exa.key`,
-`/opt/secrets/exa-loader.token`. The service is internal-only (no published
-ports). Set `EXA_TEXT_MAX_CHARS` in `compose.yml` to cap fetched page length
-(unset = full page). These retrieval/loader keys are read from the DB on every
-request, so changes apply **without** an Open WebUI restart.
+Cost per search-enabled chat turn: $0.03–0.09 (1–3 `web_search` calls);
+fetches are free unless the agent fallback triggers. These keys are read
+from the DB on every request, so changes apply **without** an Open WebUI
+restart. Details, config and limits:
+[`research-search/README.md`](research-search/README.md).
+
+Pre-change backup of all `web.search.*` / `web.loader.*` rows (incl. the
+Exa key): `data/backups/config-web-backup-2026-10-20.json`. Rollback: stop
+open-webui, restore the rows, `git revert` the exa-loader removal commit,
+`docker compose up -d`.
 
 ## Audio & RAG embeddings
 
@@ -282,12 +308,16 @@ Other services run internally and are not exposed.
 ├── start.sh             # Helper script to generate config & start services
 ├── mcpo/
 │   ├── template_config.json  # MCP config template with ${VAR} placeholders
-│   └── config.json           # Generated from template (gitignored, contains secrets)
+│   ├── config.json           # Generated from template (gitignored, contains secrets)
+│   ├── deep-research/        # Deep Research MCP server (mistral-large + premium search)
+│   ├── trainlocks/           # Training log MCP server
+│   └── trilium/              # Trilium MCP integration
 ├── searxng/
 │   └── config/
 │       └── settings.yml      # SearXNG configuration
-├── exa-loader/              # External web loader (clean URL fetch via Exa /contents)
-│   ├── app.py               # stdlib HTTP adapter
+├── research-search/         # Web search + URL fetch via the Mistral "Web Scout" agent
+│   ├── app.py               # stdlib HTTP adapter (search + fetch contracts)
+│   ├── test_app.py          # unit tests for the parsing helpers
 │   ├── Dockerfile
 │   └── README.md
 ├── workflows/               # ComfyUI API workflows for Open WebUI (Qwen-Image-2.1)

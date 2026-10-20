@@ -36,6 +36,18 @@
         "TRAINLOGS_USERNAME": "${TRAINLOGS_USERNAME}",
         "TRAINLOGS_PASSWORD": "${TRAINLOGS_PASSWORD}"
       }
+    },
+    "deep-research": {
+      "command": "uvx",
+      "args": [
+        "--with", "fastmcp",
+        "--with", "httpx",
+        "python",
+        "/stacks/webui/mcpo/deep-research/deep_research_mcp_server.py"
+      ],
+      "env": {
+        "MISTRAL_API_KEY": "${MISTRAL_API_KEY}"
+      }
     }
   }
 }

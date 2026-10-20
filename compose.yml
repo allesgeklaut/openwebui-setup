@@ -81,25 +81,36 @@ services:
       - tika
       - mcpo
       - searxng
-      - exa-loader
+      - research-search
 
-  # External web loader backing web.loader.engine=external. Open WebUI POSTs
-  # {"urls":[...]} with a Bearer token; this adapter forwards to Exa /contents
-  # and returns clean article text, so URL fetch matches web-search quality.
+  # Mistral-agent-backed web search + URL fetch. Serves BOTH of Open WebUI's
+  # `external` contracts from one process: POST /search {query,count} ->
+  # [{link,title,snippet}] and POST /fetch {urls} -> [{page_content,
+  # metadata}]. Both run the "Web Scout" Mistral agent (mistral-small-latest,
+  # web_search), which only runs the searches / opens the URL and replies
+  # "DONE"; this adapter harvests the raw tool results. Replaces the Exa
+  # search engine + exa-loader so all web access goes through Mistral (EU).
   # Internal only: no published ports.
-  exa-loader:
-    build: ./exa-loader
-    image: exa-loader:local
-    container_name: exa-loader
+  research-search:
+    build: ./research-search
+    image: research-search:local
+    container_name: research-search
     restart: unless-stopped
     environment:
-      - EXA_API_KEY_FILE=/run/secrets/exa.key
-      - LOADER_TOKEN_FILE=/run/secrets/exa-loader.token
+      # Same single source of truth as the litellm stack: the env-style key
+      # file is parsed for MISTRAL_API_KEY= at startup.
+      - MISTRAL_API_KEY_FILE=/run/secrets/mistral.env
+      - RESEARCH_TOKEN_FILE=/run/secrets/research-search.token
+      - SCOUT_AGENT_ID=ag_01a157da4a6877f687796a921a4c356e
       - PORT=8080
-      # - EXA_TEXT_MAX_CHARS=50000  # unset = let Exa return full page text
+      # Search snippets are SERP-style; the top ENRICH_TOP results also get
+      # a direct-HTTPS page excerpt appended (free, no third party) so the
+      # chat model sees real page text, like Exa's content snippets did.
+      # Set to 0 for SERP-only (cheapest/fastest).
+      - ENRICH_TOP=3
     volumes:
-      - /opt/secrets/exa.key:/run/secrets/exa.key:ro
-      - /opt/secrets/exa-loader.token:/run/secrets/exa-loader.token:ro
+      - /opt/secrets/mistral.env:/run/secrets/mistral.env:ro
+      - /opt/secrets/research-search.token:/run/secrets/research-search.token:ro
     healthcheck:
       test:
         - CMD
@@ -109,6 +120,12 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
+  # External web loader exa-loader: REMOVED when web search + URL fetch
+  # moved to the Mistral-backed research-search service (all web access via
+  # Mistral, no US search provider in the loop). Rollback = git revert of the
+  # commit that removed it, plus restoring the web.search.*/web.loader.* config
+  # rows from data/backups/config-web-backup-2026-10-20.json (README).
 
   # Translates Open WebUI's native ComfyUI protocol (ws + /prompt + /history +
   # /view) into RunPod serverless calls so the flux1-dev endpoint can serve

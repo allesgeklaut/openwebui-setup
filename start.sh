@@ -16,7 +16,7 @@ fi
 # Note: mcpo has no secret-file support, so envsubst writes real values into
 # the generated config.json (mounted read-only into the container).
 SECRETS_DIR="/opt/secrets"
-for SECRETS_FILE in "$SECRETS_DIR/webui.env" "$SECRETS_DIR/trainlocks.env"; do
+for SECRETS_FILE in "$SECRETS_DIR/webui.env" "$SECRETS_DIR/trainlocks.env" "$SECRETS_DIR/mistral.env"; do
   if [ -f "$SECRETS_FILE" ]; then
     set -a
     . "$SECRETS_FILE"
