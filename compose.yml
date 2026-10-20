@@ -90,7 +90,10 @@ services:
   # web_search), which only runs the searches / opens the URL and replies
   # "DONE"; this adapter harvests the raw tool results. Replaces the Exa
   # search engine + exa-loader so all web access goes through Mistral (EU).
-  # Internal only: no published ports.
+  # Mistral-only by design: no direct HTTP fetching, so target sites never
+  # see this server's IP and there is no outbound-fetch/SSRF surface here.
+  # Pages truncated by Mistral's 32768-char tool cap are flagged
+  # (metadata.truncated + note in page_content). Internal only: no ports.
   research-search:
     build: ./research-search
     image: research-search:local
@@ -103,11 +106,6 @@ services:
       - RESEARCH_TOKEN_FILE=/run/secrets/research-search.token
       - SCOUT_AGENT_ID=ag_01a157da4a6877f687796a921a4c356e
       - PORT=8080
-      # Search snippets are SERP-style; the top ENRICH_TOP results also get
-      # a direct-HTTPS page excerpt appended (free, no third party) so the
-      # chat model sees real page text, like Exa's content snippets did.
-      # Set to 0 for SERP-only (cheapest/fastest).
-      - ENRICH_TOP=3
     volumes:
       - /opt/secrets/mistral.env:/run/secrets/mistral.env:ro
       - /opt/secrets/research-search.token:/run/secrets/research-search.token:ro

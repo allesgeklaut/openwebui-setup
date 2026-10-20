@@ -86,25 +86,37 @@ class PageExtraction(unittest.TestCase):
         self.assertIsNone(app.extract_page("not json at all"))
 
 
-class HtmlText(unittest.TestCase):
-    def test_extraction(self):
-        html = ("<html><head><title>My Title</title><style>.x{}</style></head>"
-                "<body><script>bad()</script><h1>Hello</h1><p>World &amp; more</p>"
-                "<div>Second line</div></body></html>")
-        ex = app._TextExtractor()
-        ex.feed(html)
-        text = ex.text()
-        self.assertEqual(ex.title.strip(), "My Title")
-        self.assertIn("Hello", text)
-        self.assertIn("World & more", text)
-        self.assertNotIn("bad()", text)
-        self.assertNotIn(".x", text)
+class TruncationDetection(unittest.TestCase):
+    def test_truncated_wrapper_dict(self):
+        payload = {"truncated_response": '{"url": "https://x.de", "content": "text"',
+                   "info": "the tool response has been truncated to 32768 characters"}
+        self.assertTrue(app._is_truncated_payload(payload))
 
+    def test_untruncated_response_wrapper(self):
+        payload = {"response": json.dumps({"url": "https://x.de", "content": "text"})}
+        self.assertFalse(app._is_truncated_payload(payload))
+
+    def test_nested_content_block(self):
+        inner = json.dumps({"truncated_response": '{"url": "https://x.de", "content": "te'})
+        block = json.dumps({"type": "text", "text": inner})
+        self.assertTrue(app._is_truncated_payload(block))
+
+    def test_plain_page_text_is_not_truncated(self):
+        # A page legitimately mentioning the key name must not false-positive.
+        page = json.dumps({"url": "https://x.de", "content": 'talks about "truncated_response" keys'})
+        self.assertFalse(app._is_truncated_payload(page))
+
+    def test_truncation_note_text(self):
+        self.assertIn("truncated this page at 32768 characters", app.TRUNCATION_NOTE)
+
+
+class ResultShape(unittest.TestCase):
     def test_result_item_shape(self):
         entries = [_serp_entry()]
         results = [{"link": e["url"], "title": e["title"], "snippet": app._serp_snippet(e)} for e in entries]
         self.assertEqual(results[0]["link"], "https://example.com/a")
         self.assertIn("snippet", results[0])
+        self.assertNotIn("--- page excerpt ---", results[0]["snippet"])
 
 
 if __name__ == "__main__":

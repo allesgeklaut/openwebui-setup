@@ -5,26 +5,26 @@ Serves both of Open WebUI's `external` web contracts from one process:
   * Search engine:  POST /search  {"query", "count"}  -> [{"link", "title", "snippet"}]
   * Web loader:      POST /fetch   {"urls": [...]}     -> [{"page_content", "metadata"}]
 
-Both are powered by the "Web Scout" Mistral agent (mistral-small-latest +
-web_search): a fast agent whose instructions make it run the search / open the
-URL and then reply only "DONE".  This service harvests the RAW tool results
-(the search hits, the opened page text) and reshapes them into the contracts
-above — the agent never synthesizes anything, that stays with whatever chat
-model Open WebUI is using.
+All web access — searching AND page fetching — goes through the "Web Scout"
+Mistral agent (mistral-small-latest + web_search): a fast agent whose
+instructions make it run the search / open the URL and then reply only
+"DONE".  This service harvests the RAW tool results (the search hits, the
+opened page text) and reshapes them into the contracts above — the agent
+never synthesizes anything, that stays with whatever chat model Open WebUI
+is using.  This replaces the previous Exa-based search engine + exa-loader
+so that all web access goes through Mistral (EU) instead of a US provider.
 
-This replaces the previous Exa-based search engine + exa-loader so that all
-web access goes through Mistral (EU) instead of a US search provider.
+Privacy by design: this service performs NO direct HTTP fetching.  Target
+sites see Mistral's fetchers, never this server's IP, and there is no
+outbound-fetch attack surface (SSRF) here at all.
 
-Snippet enrichment: search results are SERP-style (description + snippets).
-To keep roughly the content richness Exa gave (up to 8000 chars of page text
-per result), the top ENRICH_TOP results are additionally fetched directly
-over HTTPS by this service (no third party involved — the target site just
-sees a normal page request) and their text is appended to the snippet.
-Set ENRICH_TOP=0 to disable.
+Search results are SERP-style only (description + snippets per hit).
 
-Known limit: the Mistral tool channel caps a fetched page at 32768 chars
+Known limit: Mistral's tool channel caps a fetched page at 32768 chars
 (the tool result carries "truncated_response" with the inner JSON possibly
-cut mid-string — parsed leniently below).
+cut mid-string — parsed leniently below).  Truncated pages are flagged so
+downstream models are never misled: metadata["truncated"]=true plus a
+note appended to page_content stating the text is incomplete.
 
 Stdlib only -- no third-party dependencies.
 """
@@ -40,7 +40,6 @@ import sys
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 logging.basicConfig(stream=sys.stdout, level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -82,23 +81,17 @@ MAX_BODY_BYTES = _env_int("MAX_BODY_BYTES", 2 * 1024 * 1024) or 2 * 1024 * 1024
 # search contract
 DEFAULT_COUNT = _env_int("DEFAULT_COUNT", 8, minimum=1) or 8
 MAX_COUNT = _env_int("MAX_COUNT", 20, minimum=1) or 20
-
-# snippet enrichment (direct HTTP, no Mistral cost)
-ENRICH_TOP = _env_int("ENRICH_TOP", 3) or 0
-ENRICH_TIMEOUT = _env_float("ENRICH_TIMEOUT", 10.0, minimum=0.1)
-ENRICH_MAX_BYTES = _env_int("ENRICH_MAX_BYTES", 2 * 1024 * 1024) or 2 * 1024 * 1024
-SNIPPET_PAGE_MAX = _env_int("SNIPPET_PAGE_MAX", 6000) or 6000
 SNIPPET_MAX = _env_int("SNIPPET_MAX", 8000) or 8000
 
 # fetch contract
 MAX_URLS = _env_int("MAX_URLS", 20, minimum=1) or 20
 FETCH_WORKERS = _env_int("FETCH_WORKERS", 4, minimum=1) or 4
 
-# A browser-like UA: many sites reject unknown agents outright, and this
-# fetch is indistinguishable from a normal reader hitting the page.
-ENRICH_USER_AGENT = os.environ.get(
-    "ENRICH_USER_AGENT",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+# Appended to truncated page text so the consuming model knows the content
+# is incomplete (the agent's tool channel caps pages at 32768 chars).
+TRUNCATION_NOTE = (
+    "\n\n[Note: the fetch tool truncated this page at 32768 characters; "
+    "content beyond this point was not retrieved and may be missing.]"
 )
 
 
@@ -325,25 +318,50 @@ def extract_page(data) -> dict | None:
     return None
 
 
-def fetch_page_via_agent(url: str) -> dict | None:
-    """Agent-assisted fetch: the scout searches for the URL, then opens the
-    page (two tool calls — search first, which presents can_open, then the
-    actual page-open with {"url": ...}; the small model only does the open
-    as a second step, never as the first call).
+def _is_truncated_payload(data) -> bool:
+    """True if a tool-result payload was cut by the 32768-char tool cap.
 
-    Returns the full page text from the open result; falls back to the
-    page's own SERP entry (description + snippets) if the open never
-    happens.
+    The page-open result arrives wrapped as {"truncated_response": ...,
+    "info": "the tool response has been truncated to 32768 characters"}.
+    Detect the wrapper key in dicts and the info phrase in strings (a page
+    legitimately containing the literal key name must not false-positive,
+    so strings only match the phrase).
+    """
+    if isinstance(data, str):
+        if "has been truncated to 32768" in data:
+            return True
+        try:
+            return _is_truncated_payload(json.loads(data))
+        except Exception:
+            return False
+    if isinstance(data, dict):
+        if "truncated_response" in data:
+            return True
+        return any(_is_truncated_payload(v) for v in data.values())
+    if isinstance(data, list):
+        return any(_is_truncated_payload(v) for v in data)
+    return False
+
+
+def fetch_page_via_agent(url: str) -> dict | None:
+    """Fetch a page through the scout agent: it opens the URL (one
+    direct {"url": ...} tool call with the current Studio instructions)
+    and this service harvests the opened page text.
+
+    Returns {"url", "content", "title", "truncated", "fetch_mode"} from the
+    open result; falls back to the page's own SERP entry (description +
+    snippets, fetch_mode="serp") if the open never happens.
     """
     conv = call_scout(f"FETCH PAGE: {url}")
-    # A real page-open (model passes {"url": ...})? Future-proof: harvest the
-    # full page text if the tool ever returns one.
     for e in tool_executions(conv):
-        page = extract_page((e.get("info") or {}).get("result"))
+        result = (e.get("info") or {}).get("result")
+        page = extract_page(result)
         if page and page.get("content"):
             if not page.get("url"):
                 page["url"] = url
             page.setdefault("title", "")
+            page["truncated"] = _is_truncated_payload(result)
+            page["fetch_mode"] = "agent_page"
             return page
     # SERP fallback: the page's own entry (description + snippets).
     best = None
@@ -361,101 +379,52 @@ def fetch_page_via_agent(url: str) -> dict | None:
     text = _serp_snippet(best)
     if not text:
         return None
-    return {"url": url, "content": text, "title": (best.get("title") or "").strip()}
+    return {
+        "url": url,
+        "content": text,
+        "title": (best.get("title") or "").strip(),
+        "truncated": False,
+        "fetch_mode": "serp",
+    }
 
 
 def fetch_url(url: str) -> dict | None:
-    """Fetch one URL: direct HTTPS first (free, full page), agent fallback
-    (JS-only pages the direct fetch cannot parse; returns page snippets)."""
-    try:
-        text, title = fetch_page_text(url)
-        return {
-            "page_content": text,
-            "metadata": {"source": url, "url": url, "title": title},
-        }
-    except Exception as exc:
-        log.info("direct fetch failed for %s (%s), trying agent", url, exc)
+    """Fetch one URL via the Mistral agent page-open (no direct fetches).
+
+    Truncated pages (Mistral's tool channel caps at 32768 chars) are
+    flagged in metadata and annotated in page_content so the chat model
+    knows the text is incomplete.
+    """
     page = fetch_page_via_agent(url)
     if not page:
         return None
+    content = page["content"]
+    truncated = bool(page.get("truncated"))
+    if truncated:
+        content += TRUNCATION_NOTE
     return {
-        "page_content": page["content"],
-        "metadata": {"source": page.get("url") or url, "url": page.get("url") or url, "title": page.get("title") or ""},
+        "page_content": content,
+        "metadata": {
+            "source": page.get("url") or url,
+            "url": page.get("url") or url,
+            "title": page.get("title") or "",
+            "truncated": truncated,
+            "fetch_mode": page.get("fetch_mode") or "agent_page",
+        },
     }
 
 
 # --------------------------------------------------------------------------
-# Snippet enrichment: direct HTTPS fetch of top results (no third party)
+# Search / fetch flows
 # --------------------------------------------------------------------------
-
-class _TextExtractor(HTMLParser):
-    # note: <head> is NOT skipped — <title> lives there. script/style are
-    # skipped individually wherever they appear.
-    SKIP = {"script", "style", "noscript", "template", "svg"}
-    BLOCK = {
-        "p", "div", "br", "li", "tr", "section", "article", "table",
-        "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "ul", "ol",
-    }
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self._skip_depth = 0
-        self._in_title = 0
-        self._chunks: list[str] = []
-        self.title = ""
-
-    def handle_starttag(self, tag, attrs):
-        if tag in self.SKIP:
-            self._skip_depth += 1
-        elif tag == "title":
-            self._in_title += 1
-        elif tag in self.BLOCK and self._skip_depth == 0:
-            self._chunks.append("\n")
-
-    def handle_endtag(self, tag):
-        if tag in self.SKIP and self._skip_depth:
-            self._skip_depth -= 1
-        elif tag == "title" and self._in_title:
-            self._in_title -= 1
-        elif tag in self.BLOCK:
-            self._chunks.append("\n")
-
-    def handle_data(self, data):
-        if self._skip_depth:
-            return
-        if self._in_title:
-            self.title += data.strip() + " "
-        else:
-            self._chunks.append(data)
-
-    def text(self) -> str:
-        out = "".join(self._chunks)
-        out = re.sub(r"[ \t]+", " ", out)
-        out = re.sub(r"\s*\n\s*", "\n", out)
-        return out.strip()
-
-
-def fetch_page_text(url: str) -> tuple[str, str]:
-    """Direct HTTPS fetch + HTML->text. Returns (text, title).
-
-    Raises on any failure (non-HTML, JS-only shell, timeout, HTTP error).
-    """
-    req = urllib.request.Request(url, headers={"User-Agent": ENRICH_USER_AGENT}, method="GET")
-    with urllib.request.urlopen(req, timeout=ENRICH_TIMEOUT) as resp:
-        ctype = (resp.headers.get("Content-Type") or "").lower()
-        if "html" not in ctype and "xml" not in ctype:
-            raise ValueError(f"not HTML ({ctype})")
-        body = resp.read(ENRICH_MAX_BYTES)
-    extractor = _TextExtractor()
-    extractor.feed(body.decode("utf-8", "replace"))
-    text = extractor.text()
-    if len(text) < 200:  # likely a JS shell page
-        raise ValueError("page text too short (JS-only page?)")
-    return text, extractor.title.strip()
-
 
 def search_results(query: str, count: int) -> list[dict]:
-    """Full /search flow: scout conversation -> SERP -> enrichment -> contract."""
+    """Full /search flow: scout conversation -> SERP entries -> contract.
+
+    Results are SERP-style only (description + snippets); no direct page
+    fetching. The chat model can request full pages via the /fetch loader
+    when a result matters.
+    """
     conv = call_scout(query)
     entries = harvest_search_entries(conv)
     if not entries:
@@ -465,19 +434,6 @@ def search_results(query: str, count: int) -> list[dict]:
         {"link": e["url"], "title": (e.get("title") or e["url"]).strip(), "snippet": _serp_snippet(e)}
         for e in entries[:count]
     ]
-    if ENRICH_TOP > 0:
-        top = results[:ENRICH_TOP]
-
-        def _enrich(item):
-            try:
-                page_text, _title = fetch_page_text(item["link"])
-            except Exception as exc:
-                log.info("enrichment skipped for %s: %s", item["link"], exc)
-                return
-            item["snippet"] = (item["snippet"] + "\n\n--- page excerpt ---\n" + page_text[:SNIPPET_PAGE_MAX]).strip()
-
-        with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, len(top) or 1)) as pool:
-            list(pool.map(_enrich, top))
     for item in results:
         if len(item["snippet"]) > SNIPPET_MAX:
             item["snippet"] = item["snippet"][:SNIPPET_MAX]
@@ -638,7 +594,7 @@ if __name__ == "__main__":
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True
     log.info(
-        "research-search listening on 0.0.0.0:%s (agent %s, enrich_top=%d)",
-        PORT, SCOUT_AGENT_ID, ENRICH_TOP,
+        "research-search listening on 0.0.0.0:%s (agent %s, mistral-only fetch)",
+        PORT, SCOUT_AGENT_ID,
     )
     server.serve_forever()
