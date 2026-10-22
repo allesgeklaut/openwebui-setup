@@ -15,7 +15,6 @@ MISTRAL_API_KEY_FILE (an env-style KEY=VALUE file, default
 litellm stack). Nothing secret lives in this repo.
 """
 
-import json
 import os
 
 import httpx
@@ -64,8 +63,6 @@ if not DEEP_RESEARCH_AGENT_ID:
     )
 
 
-MISTRAL_API_KEY = _load_mistral_key()
-
 mcp = FastMCP("deep-research")
 
 
@@ -111,7 +108,7 @@ def _render_report(conv: dict) -> str:
     footer = f"\n\n---\n*{searches} web searches"
     if usage.get("completion_tokens"):
         footer += f", {usage['completion_tokens']} tokens"
-    footer += " | agent: Deep Researcher (Studio) + web_search_premium*"
+    footer += "*"
     return report + footer
 
 
@@ -140,9 +137,7 @@ async def deep_research(question: str) -> str:
             headers={"Authorization": f"Bearer {MISTRAL_API_KEY}"},
         )
         if resp.status_code != 200:
-            raise ValueError(
-                f"Mistral API HTTP {resp.status_code}: {resp.text[:300]}"
-            )
+            raise ValueError(f"Mistral API HTTP {resp.status_code}")
         conv = resp.json()
     return _render_report(conv)
 

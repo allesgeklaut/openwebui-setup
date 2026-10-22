@@ -77,6 +77,7 @@ MISTRAL_TIMEOUT = _env_float("MISTRAL_TIMEOUT", 120.0, minimum=0.1)
 SCOUT_AGENT_ID = (os.environ.get("SCOUT_AGENT_ID") or "").strip()
 PORT = _env_int("PORT", 8080) or 8080
 MAX_BODY_BYTES = _env_int("MAX_BODY_BYTES", 2 * 1024 * 1024) or 2 * 1024 * 1024
+MAX_UPSTREAM_BYTES = _env_int("MAX_UPSTREAM_BYTES", 8 * 1024 * 1024)
 
 # search contract
 DEFAULT_COUNT = _env_int("DEFAULT_COUNT", 8, minimum=1) or 8
@@ -164,7 +165,10 @@ def call_scout(content: str) -> dict:
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=MISTRAL_TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        body = resp.read(MAX_UPSTREAM_BYTES + 1)
+        if len(body) > MAX_UPSTREAM_BYTES:
+            raise ValueError("upstream response too large")
+        return json.loads(body.decode("utf-8"))
 
 
 def tool_executions(conv: dict) -> list[dict]:
@@ -455,7 +459,7 @@ def fetch_urls(urls: list[str]) -> list[dict]:
         try:
             return fetch_url(url)
         except Exception as exc:
-            log.warning("fetch failed for %s: %s", url, exc)
+            log.warning("fetch failed for %s: %s", url, type(exc).__name__)
             return None
 
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
@@ -476,6 +480,7 @@ def fetch_urls(urls: list[str]) -> list[dict]:
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "research-search/1.0"
+    timeout = 60
 
     def _send(self, status: int, body) -> None:
         data = json.dumps(body).encode("utf-8")
@@ -499,14 +504,21 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self._send(400, {"error": "invalid Content-Length"})
             return None
+        if length < 0:
+            self._send(400, {"error": "invalid Content-Length"})
+            return None
         if length > MAX_BODY_BYTES:
             self._send(413, {"error": "request body too large"})
             return None
         try:
             body = self.rfile.read(length) if length else b"{}"
-            return json.loads(body or b"{}")
-        except Exception as exc:
-            self._send(400, {"error": f"invalid JSON: {exc}"})
+            payload = json.loads(body or b"{}")
+            if not isinstance(payload, dict):
+                self._send(400, {"error": "invalid_json"})
+                return None
+            return payload
+        except Exception:
+            self._send(400, {"error": "invalid_json"})
             return None
 
     def do_GET(self):  # noqa: N802
@@ -544,13 +556,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             results = search_results(query.strip(), count)
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:500]
-            log.error("Mistral HTTP %s: %s", exc.code, detail)
-            self._send(502, {"error": f"Mistral HTTP {exc.code}", "detail": detail})
+            log.error("mistral upstream http %s", exc.code)
+            self._send(502, {"error": "upstream_error", "status": exc.code})
             return
         except Exception as exc:
-            log.exception("Search failed")
-            self._send(502, {"error": str(exc)})
+            log.error("search failed: %s", type(exc).__name__)
+            self._send(502, {"error": "internal_error"})
             return
         self._send(200, results)
 
@@ -571,8 +582,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             docs = fetch_urls(urls)
         except Exception as exc:
-            log.exception("Fetch failed")
-            self._send(502, {"error": str(exc)})
+            log.error("fetch failed: %s", type(exc).__name__)
+            self._send(502, {"error": "internal_error"})
             return
         if not docs:
             # Every requested URL failed. Surface it rather than returning
