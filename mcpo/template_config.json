@@ -1,17 +1,17 @@
 {
   "mcpServers": {
     "filesystem": {
-      "command": "/usr/bin/npx",
+      "command": "/bin/sh",
       "args": [
-        "-y",
+        "/stacks/webui/mcpo/run-npx.sh",
         "@modelcontextprotocol/server-filesystem",
         "/stacks"
       ]
     },
     "trilium": {
-      "command": "npx",
+      "command": "/bin/sh",
       "args": [
-        "-y",
+        "/stacks/webui/mcpo/run-npx.sh",
         "triliumnext-mcp"
       ],
       "env": {
@@ -20,9 +20,9 @@
       }
     },
     "searxng": {
-      "command": "npx",
+      "command": "/bin/sh",
       "args": [
-        "-y",
+        "/stacks/webui/mcpo/run-npx.sh",
         "mcp-searxng"
       ],
       "env": {
@@ -32,10 +32,8 @@
     "trainlocks": {
       "command": "uvx",
       "args": [
-        "--with",
-        "fastmcp",
-        "--with",
-        "httpx",
+        "--with-requirements",
+        "/stacks/webui/mcpo/requirements.txt",
         "python",
         "/stacks/webui/mcpo/trainlocks/trainlocks_mcp_server.py"
       ],
@@ -48,10 +46,8 @@
     "deep-research": {
       "command": "uvx",
       "args": [
-        "--with",
-        "fastmcp",
-        "--with",
-        "httpx",
+        "--with-requirements",
+        "/stacks/webui/mcpo/requirements.txt",
         "python",
         "/stacks/webui/mcpo/deep-research/deep_research_mcp_server.py"
       ],

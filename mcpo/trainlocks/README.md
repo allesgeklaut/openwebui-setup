@@ -42,7 +42,7 @@ requires the `feature/mcp-json-api` branch of the trainlocks app to be running.
    (`TRAINLOGS_URL=http://training-log:8000`).
 
 3. The server is registered in the MCPo config (`mcpServers.trainlocks`), run
-   via `uvx --with fastmcp --with httpx python /stacks/webui/mcpo/trainlocks/trainlocks_mcp_server.py`.
+   via `uvx --with-requirements /stacks/webui/mcpo/requirements.txt python /stacks/webui/mcpo/trainlocks/trainlocks_mcp_server.py`.
 
 4. Restart MCPo after changes: `docker compose -f /opt/stacks/webui/compose.yml restart mcpo`
 

@@ -1,0 +1,9 @@
+{
+  "name": "webui-mcp-tools",
+  "private": true,
+  "dependencies": {
+    "@modelcontextprotocol/server-filesystem": "1.0.0",
+    "mcp-searxng": "2.7.0",
+    "triliumnext-mcp": "0.3.17"
+  }
+}

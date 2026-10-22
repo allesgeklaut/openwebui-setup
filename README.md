@@ -63,6 +63,18 @@ docker compose up -d
 
 The `mcpo` service connects to various Model Context Protocol servers. The configuration is generated from [`mcpo/template_config.json`](mcpo/template_config.json ) using your environment variables.
 
+MCP runtime packages have exact direct versions in [`mcpo/npm/package.json`](mcpo/npm/package.json)
+and [`mcpo/requirements.txt`](mcpo/requirements.txt). The template uses `run-npx.sh`
+and `uvx --with-requirements` so these tracked manifests are the version source of
+truth. Dependabot checks both manifests and the three selected container images
+weekly. MCPO currently publishes commit tags rather than release-version tags;
+its image updates may require manual tag selection. Review the PRs rather than
+automatically merging them. Version tags can still be replaced by their publisher.
+These pins do not
+lock all transitive dependencies or remove existing dependency advisories.
+After changing the template, `./start.sh` regenerates the secret config and
+starts/recreates the stack. Do not edit the generated secret config directly.
+
 **Available MCP servers:**
 - **filesystem**: Access to `/stacks` directory (mounted read-only)
 - **trilium**: Integration with Trilium note-taking app (requires `TRILIUM_API_KEY`)
@@ -74,7 +86,7 @@ The `mcpo` service connects to various Model Context Protocol servers. The confi
   returns a structured, cited report (30–120 s, ~$0.10–0.30 per call).
   The same server is also registered in `opencode.json`, so coding agents
   can call it. Both `MISTRAL_API_KEY` and the agent id come from
-  `/opt/secrets/mistral.env` (start.sh's envsubst for mcpo; the script's
+  `/opt/secrets/mistral.env` (start.sh's config renderer for mcpo; the script's
   file fallback for opencode).
 
 ### SearXNG (`searxng/`)
