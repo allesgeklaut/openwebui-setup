@@ -93,7 +93,10 @@ services:
   # Mistral-only by design: no direct HTTP fetching, so target sites never
   # see this server's IP and there is no outbound-fetch/SSRF surface here.
   # Pages truncated by Mistral's 32768-char tool cap are flagged
-  # (metadata.truncated + note in page_content). Internal only: no ports.
+  # (metadata.truncated + note in page_content). Refused opens
+  # (can_open=false, e.g. robots.txt-banned instagram.com) are fetch
+  # failures — SERP fallback, then 502 — never returned as page text.
+  # Internal only: no ports.
   research-search:
     build: ./research-search
     image: research-search:local

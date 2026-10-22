@@ -20,8 +20,11 @@ and URL fetching (`exa-loader`). For privacy, all of that moved to Mistral:
 - **Fetch**: **Mistral-only by design** — this service performs no direct
   HTTP fetching. Every URL goes through the scout agent, which *opens* the
   page (one `{"url": ...}` tool call with the current Studio instructions),
-  yielding the actual page text. If the open never happens, the page's own
-  SERP description/snippets serve as text (last resort). Consequences:
+  yielding the actual page text. If the open never happens — including
+  refused opens, where Mistral's fetcher returns a canned "could not be
+  read" sentence with `can_open=false` (robots.txt-banned sites such as
+  instagram.com) — the page's own SERP description/snippets serve as text
+  (last resort). Consequences:
   - Target sites see Mistral's fetchers, never this server's IP.
   - There is no outbound-fetch attack surface (SSRF) in this service.
   - Mistral's tool channel caps a page at 32768 chars. Truncated pages are
@@ -59,7 +62,10 @@ Per URL: the scout agent opens the page and this service harvests the
 opened page text. Pages cut by Mistral's 32768-char tool cap come back with
 `metadata.truncated = true` and a truncation note inside `page_content`.
 If the open never happens, the page's own SERP entry (description +
-snippets) serves as text with `metadata.fetch_mode = "serp"`.
+snippets) serves as text with `metadata.fetch_mode = "serp"`. A refused
+open (`can_open=false` plus the fetcher's canned refusal sentence) counts
+as a failed open: the refusal is never returned as page content, and the
+URL 502s when no SERP entry exists either.
 
 ## Known limits
 
@@ -74,6 +80,11 @@ snippets) serves as text with `metadata.fetch_mode = "serp"`.
   the first 32K is the best effort, and it is **flagged** (`metadata.truncated`
   + note in `page_content`) so no model is misled into treating it as the
   whole page.
+- **Blocked sites**: Mistral's fetcher refuses robots.txt-banned domains
+  (instagram.com and most of Meta: `User-agent: * Disallow: /`) with
+  `can_open=false`. Refused opens are fetch failures — SERP fallback,
+  then a 502 — never page text, so such URLs cannot be fetched through
+  this stack at all, by design.
 - **Cost**: every search turn costs $0.03–0.09 (1–3 `web_search` calls);
   every fetch now costs one scout conversation (search + open ≈ $0.06) —
   there is no free direct-fetch path anymore, by design.

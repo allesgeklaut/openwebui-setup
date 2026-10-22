@@ -100,7 +100,10 @@ contracts from one process, backed by the "Web Scout" Mistral Studio agent
   this stack, and there is no outbound-fetch/SSRF surface here. Pages capped
   at 32K chars by Mistral's tool channel are flagged
   (`metadata.truncated` + note in `page_content`). Only if the open never
-  happens do the page's own SERP snippets serve as text.
+  happens — including refused opens, where the fetcher reports
+  `can_open=false` (robots.txt-banned sites like instagram.com) — do the
+  page's own SERP snippets serve as text; with no SERP entry either, the
+  fetch 502s rather than returning the refusal as page text.
 
 Wired via these DB keys:
 

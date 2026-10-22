@@ -90,6 +90,32 @@ class PageExtraction(unittest.TestCase):
         self.assertIsNone(app.extract_page(json.dumps({"url": "https://x.de"})))
         self.assertIsNone(app.extract_page("not json at all"))
 
+    def test_refused_open_is_not_a_page(self):
+        # Live-observed payload shape for robots.txt-banned sites
+        # (instagram.com): canned refusal sentence + can_open=false.
+        refusal = {
+            "url": "https://www.instagram.com/reel/x",
+            "content": "This page could not be read: the site blocked "
+                       "automated access or returned no readable content. "
+                       "Do not retry this URL; try a different source.",
+            "can_open": False,
+            "title": None,
+            "description": None,
+            "date": None,
+        }
+        block = json.dumps([{"type": "text", "text": json.dumps(refusal)}])
+        self.assertIsNone(app.extract_page(block))
+
+    def test_refusal_sentence_alone_is_not_a_page(self):
+        # Belt and braces: can_open missing, but the canned sentence present.
+        payload = {"url": "https://x.de",
+                   "content": "This page could not be read: the site blocked automated access."}
+        self.assertIsNone(app.extract_page(json.dumps(payload)))
+
+    def test_openable_page_with_can_open_true_is_a_page(self):
+        payload = {"url": "https://x.de", "content": "text", "can_open": True, "title": "X"}
+        self.assertEqual(app.extract_page(json.dumps(payload))["content"], "text")
+
 
 class TruncationDetection(unittest.TestCase):
     def test_truncated_wrapper_dict(self):
@@ -139,6 +165,44 @@ class SerpFallback(unittest.TestCase):
         other = _serp_entry("https://example.com/other", rank=0)
         self.addCleanup(setattr, app, "call_scout", app.call_scout)
         app.call_scout = lambda content: self._conv_with([other])
+        self.assertIsNone(app.fetch_page_via_agent("https://example.com/want"))
+
+    def _refusal(self, url):
+        return {
+            "url": url,
+            "content": "This page could not be read: the site blocked "
+                       "automated access or returned no readable content. "
+                       "Do not retry this URL; try a different source.",
+            "can_open": False,
+            "title": None,
+            "description": None,
+            "date": None,
+        }
+
+    def _conv_refused(self, url, entries=()):
+        outputs = [{
+            "type": "tool.execution",
+            "info": {"result": json.dumps([{"type": "text", "text": json.dumps(self._refusal(url))}])},
+        }]
+        if entries:
+            outputs.append({
+                "type": "tool.execution",
+                "info": {"result": json.dumps({x: e for x, e in zip("abcdefghij", entries)})},
+            })
+        return {"outputs": outputs}
+
+    def test_refused_open_falls_back_to_own_serp_entry(self):
+        target = _serp_entry("https://example.com/want", desc="Wanted snippet")
+        self.addCleanup(setattr, app, "call_scout", app.call_scout)
+        app.call_scout = lambda content: self._conv_refused("https://example.com/want", [target])
+        page = app.fetch_page_via_agent("https://example.com/want")
+        self.assertEqual(page["fetch_mode"], "serp")
+        self.assertEqual(page["content"], "Wanted snippet\nfirst snippet\nsecond snippet")
+
+    def test_refused_open_without_serp_entry_returns_none(self):
+        # Live-observed shape for instagram.com: refusal, no SERP entry.
+        self.addCleanup(setattr, app, "call_scout", app.call_scout)
+        app.call_scout = lambda content: self._conv_refused("https://example.com/want")
         self.assertIsNone(app.fetch_page_via_agent("https://example.com/want"))
 
 
@@ -252,6 +316,32 @@ class HTTPIntegration(unittest.TestCase):
         status, body = self._post(json.dumps({"query": "test"}).encode())
         self.assertEqual(status, 200)
         self.assertEqual(body[0]["link"], "https://example.com/a")
+
+    def test_fetch_with_all_urls_refused_yields_502(self):
+        # A refused open (blocked site) must surface as a fetch failure,
+        # never as a "document" containing the tool's refusal sentence.
+        refusal = {
+            "url": "https://instagram.invalid/x",
+            "content": "This page could not be read: the site blocked "
+                       "automated access or returned no readable content. "
+                       "Do not retry this URL; try a different source.",
+            "can_open": False,
+            "title": None,
+            "description": None,
+            "date": None,
+        }
+        conversation = {"outputs": [{
+            "type": "tool.execution",
+            "info": {"result": json.dumps([{"type": "text", "text": json.dumps(refusal)}])},
+        }]}
+        self.addCleanup(setattr, app, "call_scout", app.call_scout)
+        app.call_scout = lambda _content: conversation
+        status, body = self._post(
+            json.dumps({"urls": ["https://instagram.invalid/x"]}).encode(), path="/fetch"
+        )
+        self.assertEqual(status, 502)
+        self.assertEqual(body["error"], "no content extracted")
+        self.assertEqual(body["urls"], ["https://instagram.invalid/x"])
 
 
 class ResultShape(unittest.TestCase):

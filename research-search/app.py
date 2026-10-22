@@ -26,6 +26,13 @@ cut mid-string — parsed leniently below).  Truncated pages are flagged so
 downstream models are never misled: metadata["truncated"]=true plus a
 note appended to page_content stating the text is incomplete.
 
+Refused opens are failures, not pages: when the hosted fetcher cannot
+open a URL (robots.txt-banned or bot-blocked sites, e.g. instagram.com),
+the tool returns a canned refusal sentence in "content" with
+can_open=false. That payload is recognized and skipped, so the refusal
+never masquerades as page text; the SERP fallback — and failing that a
+502 — applies instead.
+
 Stdlib only -- no third-party dependencies.
 """
 
@@ -94,6 +101,13 @@ TRUNCATION_NOTE = (
     "\n\n[Note: the fetch tool truncated this page at 32768 characters; "
     "content beyond this point was not retrieved and may be missing.]"
 )
+
+# A refused page-open from the hosted web_search tool (observed for
+# robots.txt-banned / bot-blocked sites such as instagram.com): the payload
+# carries a canned refusal sentence in "content" plus can_open=false. That
+# is a failure signal, not page text — extract_page must skip it so the
+# refusal never masquerades as the page's own words downstream.
+REFUSAL_MARKER = "This page could not be read"
 
 
 def _read_secret(value: str | None, file_env: str | None) -> str:
@@ -280,13 +294,19 @@ def _loads_maybe(text: str):
 
 
 def _page_fields(obj) -> dict | None:
-    if isinstance(obj, dict) and obj.get("content"):
-        return {
-            "url": obj.get("url") or "",
-            "content": obj["content"],
-            "title": obj.get("title") or "",
-        }
-    return None
+    if not (isinstance(obj, dict) and obj.get("content")):
+        return None
+    # A refused open (can_open=false, or the canned refusal sentence) is a
+    # fetch failure, not a page: skip it so the SERP fallback applies.
+    if obj.get("can_open") is False:
+        return None
+    if isinstance(obj["content"], str) and REFUSAL_MARKER in obj["content"]:
+        return None
+    return {
+        "url": obj.get("url") or "",
+        "content": obj["content"],
+        "title": obj.get("title") or "",
+    }
 
 
 def extract_page(data) -> dict | None:
