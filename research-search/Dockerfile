@@ -4,8 +4,8 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY app.py /app/app.py
 
-RUN useradd -m -u 1000 loader
-USER loader
+RUN useradd -m -u 1000 researcher
+USER researcher
 
 EXPOSE 8080
 CMD ["python", "-u", "/app/app.py"]

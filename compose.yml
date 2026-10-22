@@ -34,12 +34,29 @@ services:
       - ENABLE_IMAGE_GENERATION=${ENABLE_IMAGE_GENERATION}
       - IMAGE_GENERATION_ENGINE=${IMAGE_GENERATION_ENGINE}
       - COMFYUI_BASE_URL=${COMFYUI_BASE_URL}
-      # Voice chat TTS (Kokoro-FastAPI, OpenAI-compatible)
+      # Voice chat TTS/STT and RAG embeddings: Mistral Voxtral TTS, Voxtral
+      # transcription, and Mistral Embed — all routed through litellm, the
+      # same gateway as chat. The *_API_KEY env vars are deliberately unset:
+      # Open WebUI falls back to OPENAI_API_KEY (the litellm master key,
+      # injected by the entrypoint wrapper below) for all three.
+      # NOTE: these are ConfigVars — on an existing install the webui.db
+      # values win over env on restart. The DB rows were updated in place
+      # alongside this change (see README "Audio & RAG embeddings").
       - AUDIO_TTS_ENGINE=openai
-      - AUDIO_TTS_OPENAI_API_BASE_URL=http://kokoro:8880/v1
-      - AUDIO_TTS_OPENAI_API_KEY=not-needed
-      - AUDIO_TTS_MODEL=kokoro
-      - AUDIO_TTS_VOICE=af_heart
+      - AUDIO_TTS_OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL}
+      - AUDIO_TTS_MODEL=voxtral-tts
+      # Voice for voxtral-tts: "auto" routes by language (German -> Jo,
+      # anything else -> Jane) via the VoxtralVoiceAlias callback in the
+      # litellm stack. Readable names also work there: jo, de, jane, en,
+      # paul/oliver/marie + moods (jane-sarcasm, paul-cheerful, ...), or
+      # any Mistral Studio voice UUID / OpenAI alias.
+      - AUDIO_TTS_VOICE=auto
+      - AUDIO_STT_ENGINE=openai
+      - AUDIO_STT_OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL}
+      - AUDIO_STT_MODEL=voxtral-stt
+      - RAG_EMBEDDING_ENGINE=openai
+      - RAG_EMBEDDING_MODEL=mistral-embed
+      - RAG_OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL}
       # Shared entrypoint wrapper: reads the LiteLLM key file and exports it
       # as OPENAI_API_KEY (open-webui has no _FILE support). Mounted below.
       - APP_KEY_FILE=/run/secrets/litellm.key
@@ -64,26 +81,37 @@ services:
       - tika
       - mcpo
       - searxng
-      - kokoro
-      - exa-loader
+      - research-search
 
-  # External web loader backing web.loader.engine=external. Open WebUI POSTs
-  # {"urls":[...]} with a Bearer token; this adapter forwards to Exa /contents
-  # and returns clean article text, so URL fetch matches web-search quality.
-  # Internal only: no published ports.
-  exa-loader:
-    build: ./exa-loader
-    image: exa-loader:local
-    container_name: exa-loader
+  # Mistral-agent-backed web search + URL fetch. Serves BOTH of Open WebUI's
+  # `external` contracts from one process: POST /search {query,count} ->
+  # [{link,title,snippet}] and POST /fetch {urls} -> [{page_content,
+  # metadata}]. Both run the "Web Scout" Mistral Studio agent (web_search),
+  # which only runs the searches / opens the URL and replies
+  # "DONE"; this adapter harvests the raw tool results. Replaces the Exa
+  # search engine + exa-loader so all web access goes through Mistral (EU).
+  # Mistral-only by design: no direct HTTP fetching, so target sites never
+  # see this server's IP and there is no outbound-fetch/SSRF surface here.
+  # Pages truncated by Mistral's 32768-char tool cap are flagged
+  # (metadata.truncated + note in page_content). Internal only: no ports.
+  research-search:
+    build: ./research-search
+    image: research-search:local
+    container_name: research-search
     restart: unless-stopped
     environment:
-      - EXA_API_KEY_FILE=/run/secrets/exa.key
-      - LOADER_TOKEN_FILE=/run/secrets/exa-loader.token
+      # Same single source of truth as the litellm stack: the env-style key
+      # file is parsed for MISTRAL_API_KEY= at startup.
+      - MISTRAL_API_KEY_FILE=/run/secrets/mistral.env
+      - RESEARCH_TOKEN_FILE=/run/secrets/research-search.token
+      - SCOUT_AGENT_ID=${SCOUT_AGENT_ID}
       - PORT=8080
-      # - EXA_TEXT_MAX_CHARS=50000  # unset = let Exa return full page text
+      # All result pages fetch in one parallel round (each is a scout
+      # conversation); matches web.search.result_count=5 in OpenWebUI.
+      - FETCH_WORKERS=8
     volumes:
-      - /opt/secrets/exa.key:/run/secrets/exa.key:ro
-      - /opt/secrets/exa-loader.token:/run/secrets/exa-loader.token:ro
+      - /opt/secrets/mistral.env:/run/secrets/mistral.env:ro
+      - /opt/secrets/research-search.token:/run/secrets/research-search.token:ro
     healthcheck:
       test:
         - CMD
@@ -93,6 +121,12 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
+  # External web loader exa-loader: REMOVED when web search + URL fetch
+  # moved to the Mistral-backed research-search service (all web access via
+  # Mistral, no US search provider in the loop). Rollback = git revert of the
+  # commit that removed it, plus restoring the web.search.*/web.loader.* config
+  # rows from data/backups/config-web-backup-2026-10-20.json (README).
 
   # Translates Open WebUI's native ComfyUI protocol (ws + /prompt + /history +
   # /view) into RunPod serverless calls so the flux1-dev endpoint can serve
@@ -121,13 +155,9 @@ services:
         export RUNPOD_API_KEY="$$(cat /run/secrets/runpod.key)"
         exec python app.py
 
-  kokoro:
-    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
-    container_name: kokoro
-    restart: unless-stopped
-    environment:
-      - API_LOG_LEVEL=WARNING
-      - DEFAULT_VOICE=af_heart
+  # Kokoro-FastAPI TTS: removed when voice chat switched to Mistral Voxtral
+  # via litellm (see AUDIO_TTS_* above). Rollback = git revert of the commit
+  # that removed it, plus restoring the audio.tts.* config rows (README).
 
   open-terminal:
     image: ghcr.io/open-webui/open-terminal:latest

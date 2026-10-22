@@ -7,11 +7,16 @@ A self-hosted AI chat interface with extended capabilities, powered by [Open Web
 | Service | Description | Port |
 |---------|-------------|------|
 | **open-webui** | Main UI for AI conversations | 3001 |
-| **mcpo** | MCP server gateway (Trilium, filesystem, search) | internal |
+| **mcpo** | MCP server gateway (Trilium, filesystem, deep-research, …) | internal |
 | **searxng** | Privacy-respecting search engine | 8081 |
-| **exa-loader** | External web loader: clean URL fetch via Exa `/contents` | internal |
+| **research-search** | Web search + URL fetch via the Mistral "Web Scout" agent | internal |
 | **tika** | Document extraction & preprocessing | internal |
-| **kokoro** | TTS engine (Kokoro-FastAPI, OpenAI-compatible) | internal |
+
+Voice chat (TTS/STT) and RAG embeddings are **not** separate services: they
+route through litellm to Mistral (Voxtral TTS + transcription, Mistral Embed).
+Web search and URL fetch **are** a service (research-search), but the actual
+searching happens in a Mistral agent — see
+[Web search & page fetching](#web-search--page-fetching-research-search).
 
 ## Prerequisites
 
@@ -63,36 +68,108 @@ The `mcpo` service connects to various Model Context Protocol servers. The confi
 - **trilium**: Integration with Trilium note-taking app (requires `TRILIUM_API_KEY`)
 - **searxng**: Web search via the SearXNG service
 - **trainlocks**: Training log integration
+- **deep-research**: Deep web research tool fronting the "Deep Researcher"
+  Mistral Studio agent (`web_search_premium`). One tool,
+  `deep_research(question)`: runs several refined searches with page opens and
+  returns a structured, cited report (30–120 s, ~$0.10–0.30 per call).
+  The same server is also registered in `opencode.json`, so coding agents
+  can call it. Both `MISTRAL_API_KEY` and the agent id come from
+  `/opt/secrets/mistral.env` (start.sh's envsubst for mcpo; the script's
+  file fallback for opencode).
 
 ### SearXNG (`searxng/`)
 
 Privacy-respecting metasearch engine. Configuration is in [`searxng/config/settings.yml`](searxng/config/settings.yml ).
 
-### Web search & page fetching (`exa-loader/`)
+### Web search & page fetching (`research-search/`)
 
-Web search uses **Exa** (`web.search.engine=exa`, key in `/opt/secrets/exa.key`).
-Automatic search bypasses Open WebUI's own web loader and embedding stage
-(`web.search.bypass_web_loader=true`, `web.search.bypass_embedding_and_retrieval=true`,
-`exa_max_content_length=8000`, `result_count=8`): Exa's cleaned results go straight
-to the model — no second fetch and no lossy local embed/retrieve hop. Document
-RAG (`rag.*`) is unaffected.
+All web access goes through **Mistral** (EU) — Exa was dropped for privacy,
+and there is no direct HTTPS fetching anywhere in this stack. The
+`research-search` service serves both of Open WebUI's `external` web
+contracts from one process, backed by the "Web Scout" Mistral Studio agent
+(`web_search`):
 
-URL *fetches* would otherwise use Open WebUI's built-in `safe_web` loader, which
-is `BeautifulSoup(html).get_text()` over the whole DOM and therefore returns
-navigation/sidebar/footer boilerplate. `exa-loader` reuses the same Exa key to
-return clean article text instead, wired via these DB keys:
+- **Search** (`web.search.engine=external`): the scout runs the query (up to
+  3 refined searches), this service harvests the raw results —
+  `[{link, title, snippet}]`, SERP-style only. The agent never answers the
+  question: synthesis stays with whichever chat model is in use, so the
+  research quality composes with every model. When a result matters, the
+  chat model requests the full page via the fetch loader.
+- **Fetch** (`web.loader.engine=external`): every URL goes through the scout
+  agent, which opens the page — target sites see Mistral's fetchers, never
+  this stack, and there is no outbound-fetch/SSRF surface here. Pages capped
+  at 32K chars by Mistral's tool channel are flagged
+  (`metadata.truncated` + note in `page_content`). Only if the open never
+  happens do the page's own SERP snippets serve as text.
+
+Wired via these DB keys:
 
 | Key | Value |
 |---|---|
+| `web.search.engine` | `external` |
+| `web.search.external_web_search_url` | `http://research-search:8080/search` |
+| `web.search.external_web_search_api_key` | token in `/opt/secrets/research-search.token` |
 | `web.loader.engine` | `external` |
-| `web.loader.external_web_loader_url` | `http://exa-loader:8080/contents` |
-| `web.loader.external_web_loader_api_key` | token in `/opt/secrets/exa-loader.token` |
+| `web.loader.external_web_loader_url` | `http://research-search:8080/fetch` |
+| `web.loader.external_web_loader_api_key` | token in `/opt/secrets/research-search.token` |
 
-Secrets live outside the repo (gitignored): `/opt/secrets/exa.key`,
-`/opt/secrets/exa-loader.token`. The service is internal-only (no published
-ports). Set `EXA_TEXT_MAX_CHARS` in `compose.yml` to cap fetched page length
-(unset = full page). These retrieval/loader keys are read from the DB on every
-request, so changes apply **without** an Open WebUI restart.
+Cost per search-enabled chat turn: ~$0.03–0.09 for the search plus ~$0.06
+per fetched page (each fetch is a scout conversation). Details, config and
+limits: [`research-search/README.md`](research-search/README.md).
+
+Pre-change backup of all `web.search.*` / `web.loader.*` rows (incl. the
+Exa key): `data/backups/config-web-backup-2026-10-20.json`. Rollback: stop
+open-webui, restore the rows, `git revert` the exa-loader removal commit,
+`docker compose up -d`.
+
+## Audio & RAG embeddings
+
+Voice chat and document embeddings route through litellm (same gateway and
+key as chat) to Mistral's audio/embedding APIs — no local Kokoro/Whisper/
+sentence-transformers anymore:
+
+- **TTS**: Voxtral TTS (`voxtral-tts` on litellm, ~$0.016/1k chars). The
+  TTS Voice field in OpenWebUI accepts readable names, thanks to the
+  `VoxtralVoiceAlias` callback in the litellm stack (`custom_callbacks.py`),
+  which rewrites them to the UUIDs Mistral actually accepts:
+  - `auto` (current default): language routing — German text is spoken by
+    **Jo** (the only native German preset), anything else by **Jane** (en-GB).
+    OpenWebUI splits replies on punctuation, so detection runs per chunk and
+    mixed-language answers use the right voice per sentence; ambiguous
+    chunks default to Jo.
+  - `jo` / `de`, `jane` / `en`, and mood variants: `jane-sarcasm`,
+    `paul-cheerful`, `oliver-curious`, `marie-happy`, … (full map in
+    `custom_callbacks.py`).
+  - Mistral Studio display names ("Jane") do **not** work — only UUIDs,
+    readable aliases (above), or OpenAI names (`alloy`, `nova`, …, which
+    litellm maps to English presets; `nova`/`shimmer` are both Jane-Sarcasm).
+- **STT**: Voxtral batch transcription (`voxtral-stt`, $0.003/min) — better
+  German accuracy than the previous local Whisper `base`.
+- **Embeddings**: Mistral Embed (`mistral-embed`, $0.10/M tokens, 1024-dim),
+  a large quality jump over the previous local all-MiniLM (384-dim).
+
+These are Open WebUI ConfigVars: the `webui.db` `config` rows win over the
+compose env on an existing install (the env matches for fresh deploys). The
+rows changed in place (backup: `data/backups/config-audio-rag-backup-20261019.json`):
+
+| Key | Value |
+|---|---|
+| `audio.tts.openai.api_base_url` / `audio.stt.openai.api_base_url` / `rag.openai.api_base_url` | `http://192.168.0.46:4000/v1` |
+| `audio.tts.model` / `audio.stt.model` | `voxtral-tts` / `voxtral-stt` |
+| `audio.stt.engine` / `rag.embedding_engine` | `openai` |
+| `audio.tts.voice` | `auto` (readable names/UUIDs also work — see above) |
+| `rag.embedding_model` | `mistral-embed` |
+| `*.api_key` | the litellm master key |
+
+**Important**: the embedding model changed (384→1024 dims), so existing
+documents/knowledge bases need re-embedding — Admin → Documents → **Reindex**
+(or "Re-sync" per knowledge base). Until then, retrieval over old uploads
+errors; new uploads work immediately.
+
+Rollback to the local setup: restore the backup JSON rows above (engine `""`
+for STT/RAG, `sentence-transformers/all-MiniLM-L6-v2` as embedding model,
+kokoro TTS values), `git revert` the kokoro service removal in `compose.yml`,
+and reindex again.
 
 ### Image generation & editing (`workflows/`)
 
@@ -230,12 +307,16 @@ Other services run internally and are not exposed.
 ├── start.sh             # Helper script to generate config & start services
 ├── mcpo/
 │   ├── template_config.json  # MCP config template with ${VAR} placeholders
-│   └── config.json           # Generated from template (gitignored, contains secrets)
+│   ├── config.json           # Generated from template (gitignored, contains secrets)
+│   ├── deep-research/        # Deep Research MCP server (Mistral Studio agent + premium search)
+│   ├── trainlocks/           # Training log MCP server
+│   └── trilium/              # Trilium MCP integration
 ├── searxng/
 │   └── config/
 │       └── settings.yml      # SearXNG configuration
-├── exa-loader/              # External web loader (clean URL fetch via Exa /contents)
-│   ├── app.py               # stdlib HTTP adapter
+├── research-search/         # Web search + URL fetch via the Mistral "Web Scout" agent
+│   ├── app.py               # stdlib HTTP adapter (search + fetch contracts)
+│   ├── test_app.py          # unit tests for the parsing helpers
 │   ├── Dockerfile
 │   └── README.md
 ├── workflows/               # ComfyUI API workflows for Open WebUI (Qwen-Image-2.1)
