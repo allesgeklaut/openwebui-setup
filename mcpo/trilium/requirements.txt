@@ -1,2 +1,2 @@
 asyncio
-mcp>=1.0.0
+mcp>=2.3.0
