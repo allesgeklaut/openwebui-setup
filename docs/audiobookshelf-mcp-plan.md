@@ -1,8 +1,21 @@
 # Audiobookshelf MCP server — project plan
 
 Status: first read-only milestone implemented and independently verified locally
-(2026-10-24). Not deployed or connected to real credentials. Live deployment and
-changes to accounts, credentials, or media are not part of this milestone.
+(2026-10-24); Round 2 podcast management implemented and independently verified
+locally the same day. Not deployed or connected to real credentials. Live
+deployment and changes to accounts, credentials, or media are not part of this
+milestone.
+
+Round 2: podcast management implementation/testing is authorized on the existing
+feature branch. The user accepts the admin-token tradeoff, with that credential
+kept exclusively in the connector. Subscriptions, downloads, scheduling,
+retention, episode deletion, and podcast deletion must remain restricted to
+allowed podcast libraries. The user subsequently chose stateless HTTP without
+extra confirmation: valid retention/deletion tool calls execute directly and may
+remove files/history or authorize future automatic removals. Writes remain
+default-off. No deployment, live media mutation, push, or new commit is authorized
+by this round. Native elicitation research found stateful transport would be
+needed for confirmation, but approval/session infrastructure is now out of scope.
 
 Implementation principles: KISS, DRY, YAGNI. Start with a small authenticated
 read-only server and tests; add podcast writes only after the API/permission and
@@ -11,7 +24,8 @@ or a separate scheduler.
 
 Current delivery includes only `list_libraries`, `search_library`, and
 `get_item`, plus a Docker build, locked dependencies, tests, and CI/Dependabot.
-Podcast additions, downloads, settings changes, and deployment remain unfinished.
+Podcast additions, downloads, and settings changes are now in progress; deployment
+remains separate and unfinished.
 There is no root Compose service or `start.sh` change in this milestone.
 
 Initial limitation: backend responses are capped at 1 MiB before projection.
@@ -22,14 +36,19 @@ from other unavailable items. Search consumes only book/podcast item matches,
 not separate author, series, tag, or episode-only search categories. Retain these
 bounds rather than adding speculative endpoints or parser dependencies.
 
-Verification: 163 service tests passed on Python 3.14; the image runs Python
-3.14.9, non-root, with a read-only root filesystem and no runtime package manager.
-Direct HTTP interoperability with OpenWebUI's exact MCP client 1.27.2 was tested
-against synthetic data. Locked runtime dependency audit passed; the final image
-has zero known fixable HIGH/CRITICAL findings in the dated Trivy database. A full
-scan still reports 8 unfixed upstream CVEs across 44 HIGH package findings; these
-are documented, not a claim of zero vulnerabilities. CI and weekly Dependabot
-updates are configured; GitHub-hosted execution awaits an authorized push.
+Verification: 163 service tests passed on Python 3.14 for the read-only
+foundation; Round 2 raises the suite to 510 tests, all passing, including
+independent probes. Both modes speak stateless Streamable HTTP: the exact
+OpenWebUI MCP client 1.27.2 negotiated protocol 2025-11-25 with no session ID
+against the writes-enabled server, listed all eleven tools, and executed a
+direct destructive delete without elicitation. The image runs Python 3.14.9,
+non-root, offline with a read-only root filesystem, no runtime package manager,
+and fails closed on an invalid write flag. Locked runtime dependency audit
+passed; the final image has zero known fixable HIGH/CRITICAL findings in the
+dated Trivy database. A full scan still reports 8 unfixed upstream CVEs across
+44 HIGH package findings; these are documented, not a claim of zero
+vulnerabilities. CI and weekly Dependabot updates are configured; GitHub-hosted
+execution awaits an authorized push. Round 2 remains uncommitted.
 
 ## Goal
 
@@ -48,7 +67,6 @@ OpenWebUI -- authenticated Streamable HTTP --> audiobookshelf-mcp
                                                |
                                                +-- restricted API --> Audiobookshelf
 
-Trusted human approval --> exact pending destructive change (if enabled)
 Audiobookshelf --> podcast feeds / enclosure downloads / native scheduler
 ```
 
@@ -78,8 +96,8 @@ Audiobookshelf --> podcast feeds / enclosure downloads / native scheduler
   Compose `${...}` interpolation, which has separate input rules. Prefer file
   mounts for credentials to avoid storing their values in container environment
   metadata. File-backed Compose secrets are not automatically encrypted at rest.
-- Stateless HTTP transport where supported. Do not treat an MCP session ID as
-  authentication. Persistent approval state, if needed, is a separate concern.
+- Stateless HTTP transport in both modes. No extra approval UI, approval tokens,
+  or persistent session state. Podcast writes execute directly when called.
 
 Local API access does not imply local AI processing. External chat models may
 receive tool results. No embedding, transcription, or full-library indexing is
@@ -95,13 +113,14 @@ Names are provisional; finalize against the installed Audiobookshelf API.
 | `list_libraries` | List permitted libraries | Read-only |
 | `search_library` | Search books/podcasts with bounded pagination | Read-only |
 | `get_item` | Compact metadata for one permitted item | Read-only |
-| `list_podcast_episodes` | Downloaded episodes and available feed episodes, distinguished clearly | Read-only; fetching feeds needs URL controls |
+| `list_podcast_episodes` | List downloaded episode metadata | Read-only; bounded list |
 | `get_podcast_settings` | Current schedule, limits, timezone interpretation | Read-only |
 | `add_podcast` | Subscribe using an RSS URL in an allowed podcast library | Explicit user request; URL validation; duplicate detection |
-| `download_episodes` | Download explicit episode IDs or the newest N | Bounded count and queue; no implicit full-feed download |
+| `download_latest_episodes` | Queue the newest N not already downloaded/queued/active | Bounded count and queue; no implicit full-feed download |
 | `set_podcast_schedule` | Enable/disable auto-download and configure frequency/new-episode limit | Validated settings; preview and read-back |
-| `preview_podcast_retention` | Preview a proposed retention policy | No mutation; clearly state deletion uncertainty |
-| `apply_podcast_retention` | Apply an approved retention change | Disabled until trusted human approval is verified |
+| `set_podcast_retention` | Set native retention and optionally trim existing episodes | Direct execution when writes enabled; bounded deletion batch |
+| `delete_podcast_episode` | Remove a downloaded episode and its associated data | Podcast/library validation; no extra confirmation |
+| `delete_podcast` | Remove a podcast subscription, media, and associated data | Podcast/library validation; no extra confirmation |
 
 Examples to support:
 
@@ -119,7 +138,7 @@ auto-download must not silently delete files or claim to cancel queued jobs.
 
 Out of scope initially: playback control, user/server administration, generic
 API proxying, arbitrary URLs/HTTP methods, shell execution, filesystem access,
-book uploads, explicit episode/item deletion, progress editing, and other service
+book uploads, non-podcast deletion, progress editing, and other service
 integrations (Paperless, Nextcloud, Gmail, iCloud).
 
 ## Security requirements
@@ -158,19 +177,19 @@ integrations (Paperless, Nextcloud, Gmail, iCloud).
   restrictions are needed. Do not claim SSRF protection until the actual fetch
   path is tested; keep feed additions disabled if controls are insufficient.
 
-### Retention and approval
+### Retention and destructive execution
 
 - Retention is potentially destructive even if no delete tool is exposed.
-- Preview current/proposed policy, affected podcast, and known deletion impact.
-  A snapshot may become stale; confirm state again before applying.
-- Approval must originate from an authenticated person, not a model-set boolean
-  or a token returned to the model. Bind it to the exact action/arguments,
-  expiration, and state; make it single-use and replay-resistant.
-- Test MCP elicitation end-to-end in the installed OpenWebUI. Do not assume
-  transport support means approval UI support. If unsupported, either design a
-  separate trusted approval UI or leave retention changes to Audiobookshelf's UI.
-- Explicitly disclose that approving retention permits future automatic episode
-  removals under that policy, not just one immediate deletion.
+- The user explicitly chose direct execution without extra confirmation, to keep
+  the connector stateless and simple. Do not add approval booleans, tokens, UI,
+  databases, or elicitation/session infrastructure.
+- Revalidate actual podcast/library identity and current state under the mutation
+  lock before applying; an external Audiobookshelf actor can still race this.
+- Explain known immediate deletion impact and report partial failures honestly;
+  never promise rollback or blindly retry a potentially successful mutation.
+- Explicitly disclose that setting retention permits future automatic episode
+  removals under that policy, not just one immediate deletion. Model tool calls
+  can therefore be destructive without another user prompt.
 
 ### Container and supply chain
 
@@ -206,8 +225,21 @@ integrations (Paperless, Nextcloud, Gmail, iCloud).
 - `/checknew` and `/clear-queue` are mutating GETs, not safe browsing APIs.
 - Retention currently removes one oldest dated episode after each automatic
   episode download, regardless of listened state; changing the policy does not
-  immediately trim the archive, and manual downloads do not enforce it. Zero
-  means unlimited. Do not promise a strict immediate “keep latest N” invariant.
+  immediately trim the archive, and manual downloads do not enforce it. An
+  already-over-limit archive stays over limit (add one, delete at most one).
+  Zero means unlimited. Optional bounded immediate trimming is a separate action.
+  Do not promise a strict ongoing “keep latest N” invariant.
+- Hard item deletion recursively removes the item's directory; reject a podcast
+  located at its library folder root or outside the registered folder. Verify
+  episode file paths remain inside the podcast directory before hard episode
+  deletion. Backend success does not prove physical file removal: filesystem
+  failures are logged while database deletion can continue. Reject destructive
+  trimming/deletion during queued or active downloads instead of clearing queues.
+- Native SSRF filter flags were checked without reading credentials:
+  `DISABLE_SSRF_REQUEST_FILTER`, `EXP_PROXY_SUPPORT`, and
+  `SSRF_REQUEST_FILTER_WHITELIST` are unset in the running instance. Redirect,
+  proxy, and DNS-rebinding behavior is not proven by this configuration check;
+  verify backend egress controls before rollout.
 - Live OpenWebUI is 0.12.3 with Python MCP client 1.27.2; compatibility and client
   security review are needed before rollout. No live credentials were accessed.
 
@@ -252,11 +284,12 @@ unexpected requests, downloads, permission escalation, or data loss.
 - Implement native schedule enable/disable and per-check download limits;
   validate cron/frequency, minimum interval, timezone, and DST interpretation.
 - Read settings back after changes; show effective values to the user.
-- Implement retention preview, then enable application only after the trusted
-  approval gate passes. Otherwise ship without retention writes.
+- Implement bounded retention application and optional immediate trimming with
+  direct execution, as explicitly selected by the user. Keep writes default-off.
 
 Gate: schedules run in Audiobookshelf independently of OpenWebUI/MCP; disabling
-works as documented; retention behavior and approval protections pass tests.
+works as documented; retention behavior, podcast boundaries, and deletion bounds
+pass tests without requiring elicitation or stateful sessions.
 
 ### 5. Hardened deployment and CI
 
@@ -302,11 +335,12 @@ Gate: user accepts the demonstrated behavior before broader deployment.
 - Schedule enable/disable, invalid/too-frequent schedules, timezone/DST, existing
   queue behavior, and no scheduler dependency on an active chat.
 - Retention boundaries (including zero semantics), listened/unlistened behavior,
-  concurrent state changes, and expired/replayed/model-generated approvals.
+  concurrent state changes, direct execution without elicitation, and partial
+  deletion results.
 - Config validation/redaction, secret rotation and permissions, non-root/read-
   only runtime, no public port, and no runtime dependency installation.
-- End-to-end OpenWebUI tool discovery, calls, errors, access visibility, and
-  approval flow; use Playwright artifact paths required by repository policy.
+- End-to-end OpenWebUI tool discovery, calls, errors, and access visibility;
+  use Playwright artifact paths required by repository policy when browser testing.
 
 ## Proposed file layout
 
@@ -322,7 +356,6 @@ audiobookshelf-mcp/
     config.py                   # typed settings and secret-file loading
     client.py                   # bounded, allowlisted API adapter
     tools/                      # browsing, podcasts, scheduling
-    approvals.py                # only if a trusted flow is implemented
   tests/
 .github/dependabot.yml
 .github/workflows/audiobookshelf-mcp.yml
@@ -335,7 +368,7 @@ compose.yml                     # new service only when deployment is approved
 1. Which Audiobookshelf libraries/account may the connector access?
 2. Which feed domains are allowed, and how will backend fetches be restricted?
 3. What download caps and scheduling timezone should apply?
-4. Is native OpenWebUI approval reliable, or should retention remain UI-only?
+4. Confirmation policy resolved: stateless/direct execution, without extra prompts.
 5. May external chat providers receive returned library metadata, or is a local
    model required for this connection?
 

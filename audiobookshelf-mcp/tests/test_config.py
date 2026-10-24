@@ -9,6 +9,7 @@ import pytest
 from audiobookshelf_mcp.config import (
     DEFAULT_ALLOWED_HOSTS,
     MIN_MCP_TOKEN_LENGTH,
+    Config,
     ConfigError,
     load_config,
 )
@@ -260,3 +261,83 @@ def test_secret_errors_do_not_contain_secret_values(tmp_path: Path) -> None:
         load_config(env)
 
     assert secret_value not in str(raised.value)
+
+
+def test_podcast_writes_are_disabled_by_default(tmp_path: Path) -> None:
+    config = load_config(_valid_env(tmp_path))
+
+    assert config.podcast_writes_enabled is False
+
+
+def test_config_constructed_directly_defaults_to_read_only() -> None:
+    config = Config(
+        abs_url="http://abs.test",
+        api_key="backend-key",
+        mcp_auth_token="t" * 32,
+        allowed_library_ids=frozenset({"lib1"}),
+    )
+
+    assert config.podcast_writes_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("true", True),
+        ("TRUE", True),
+        ("True", True),
+        ("  true  ", True),
+        ("false", False),
+        ("FALSE", False),
+        ("False", False),
+        ("\tfalse\n", False),
+    ],
+)
+def test_podcast_writes_accept_case_insensitive_booleans(
+    tmp_path: Path, raw: str, expected: bool
+) -> None:
+    env = _valid_env(tmp_path)
+    env["ABS_ENABLE_PODCAST_WRITES"] = raw
+
+    assert load_config(env).podcast_writes_enabled is expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        " ",
+        "1",
+        "0",
+        "yes",
+        "no",
+        "on",
+        "off",
+        "enabled",
+        "disabled",
+        "truthy",
+        "tru",
+        "true,false",
+        "true false",
+        "true1",
+    ],
+)
+def test_invalid_podcast_writes_values_fail_closed(tmp_path: Path, raw: str) -> None:
+    env = _valid_env(tmp_path)
+    env["ABS_ENABLE_PODCAST_WRITES"] = raw
+
+    with pytest.raises(
+        ConfigError, match="ABS_ENABLE_PODCAST_WRITES must be true or false"
+    ):
+        load_config(env)
+
+
+def test_invalid_podcast_writes_value_is_not_echoed(tmp_path: Path) -> None:
+    raw = "do-not-echo-this-value"
+    env = _valid_env(tmp_path)
+    env["ABS_ENABLE_PODCAST_WRITES"] = raw
+
+    with pytest.raises(ConfigError) as raised:
+        load_config(env)
+
+    assert raw not in str(raised.value)

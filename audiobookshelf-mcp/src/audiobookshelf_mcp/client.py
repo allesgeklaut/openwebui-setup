@@ -1,4 +1,10 @@
-"""Bounded, read-only HTTP adapter for the fixed Audiobookshelf backend."""
+"""Bounded HTTP adapter for the fixed Audiobookshelf backend.
+
+The base class exposes only read-only operations. A private, status- and
+size-bounded request helper exists for the fixed podcast operations in
+:mod:`audiobookshelf_mcp.podcasts`; no tool can supply a method, path, header,
+or arbitrary body.
+"""
 
 from __future__ import annotations
 
@@ -55,9 +61,9 @@ class ABSResponseError(ABSClientError):
 
 
 class ABSClient:
-    """Fixed GET-only Audiobookshelf adapter.
+    """Fixed Audiobookshelf read adapter with a private bounded request core.
 
-    Only the three read-only endpoints used by the tools exist here. The
+    Only the read-only endpoints used by the tools are public here. The
     backend base URL, credential, redirect policy, timeout, response cap, and
     connection limits are fixed at construction; no tool can supply a host,
     path, method, or headers.
@@ -70,6 +76,9 @@ class ABSClient:
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._allowed_library_ids = config.allowed_library_ids
+        # Read by the podcast write adapter as defense in depth. The read-only
+        # operations never consult it.
+        self._podcast_writes_enabled = config.podcast_writes_enabled
         self._client = httpx.AsyncClient(
             base_url=f"{config.abs_url}/",
             headers={
@@ -217,38 +226,79 @@ class ABSClient:
     async def _get_json(
         self, path: str, params: Mapping[str, str] | None = None
     ) -> dict[str, Any]:
-        # ``path`` is always a module constant or built from a validated ID.
-        # The outer timeout bounds the whole operation (connecting, waiting for
-        # connection capacity, headers, and streaming), while httpx's timeout
-        # separately bounds each network phase.
+        data = await self._request_json("GET", path, params=params)
+        if data is None:  # pragma: no cover - GET never allows an empty body
+            raise ABSResponseError("Audiobookshelf returned an unexpected response.")
+        return data
+
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, str] | None = None,
+        json_body: object | None = None,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
+        allow_empty: bool = False,
+    ) -> dict[str, Any] | None:
+        """Perform one fixed-method request and return its JSON object.
+
+        ``method`` and ``path`` are always module constants or built from a
+        validated ID by a hardcoded public method; neither is ever a tool
+        argument. GET accepts only 200. Write methods accept only 200, 201, and
+        204, and may return ``None`` when ``allow_empty`` is set because some
+        native Audiobookshelf mutations answer with an empty or plain-text 200.
+
+        The outer timeout bounds the whole operation (connecting, waiting for
+        connection capacity, headers, and streaming), while httpx's timeout
+        separately bounds each network phase.
+        """
+        allowed_statuses = (200,) if method == "GET" else (200, 201, 204)
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
                 async with self._requests:
                     async with self._client.stream(
-                        "GET", path, params=params
+                        method,
+                        path,
+                        params=params,
+                        json=json_body,
                     ) as response:
-                        if response.status_code != 200:
+                        if response.status_code not in allowed_statuses:
                             raise _status_error(response.status_code)
-                        body = await _read_bounded(response)
+                        body = await _read_bounded(response, max_response_bytes)
         except ABSClientError:
             raise
         except (TimeoutError, httpx.TimeoutException):
             raise ABSUnavailable("Audiobookshelf request timed out.") from None
+        except (TypeError, UnicodeError):
+            # A backend-supplied value that cannot be serialized must never
+            # escape as an internal encoding exception.
+            raise ABSResponseError(
+                "Audiobookshelf returned an unexpected response."
+            ) from None
         except httpx.HTTPError:
             raise ABSUnavailable("Audiobookshelf is unavailable.") from None
 
+        if allow_empty and not body.strip():
+            return None
         try:
             data = json.loads(body)
         except (ValueError, RecursionError):
+            if allow_empty:
+                return None
             raise ABSResponseError(
                 "Audiobookshelf returned an unexpected response."
             ) from None
         if not isinstance(data, dict):
+            if allow_empty:
+                return None
             raise ABSResponseError("Audiobookshelf returned an unexpected response.")
         return data
 
 
-async def _read_bounded(response: httpx.Response) -> bytes:
+async def _read_bounded(
+    response: httpx.Response, max_bytes: int = MAX_RESPONSE_BYTES
+) -> bytes:
     content_length = response.headers.get("content-length")
     if content_length is not None:
         try:
@@ -256,7 +306,7 @@ async def _read_bounded(response: httpx.Response) -> bytes:
         except ValueError:
             pass
         else:
-            if declared_length > MAX_RESPONSE_BYTES:
+            if declared_length > max_bytes:
                 raise ABSResponseError(
                     "Audiobookshelf response exceeded the size limit."
                 )
@@ -265,7 +315,7 @@ async def _read_bounded(response: httpx.Response) -> bytes:
     total = 0
     async for chunk in response.aiter_bytes():
         total += len(chunk)
-        if total > MAX_RESPONSE_BYTES:
+        if total > max_bytes:
             raise ABSResponseError("Audiobookshelf response exceeded the size limit.")
         chunks.append(chunk)
     return b"".join(chunks)

@@ -1,4 +1,4 @@
-"""Typed, fail-closed configuration for the read-only Audiobookshelf MCP server."""
+"""Typed, fail-closed configuration for the Audiobookshelf MCP server."""
 
 from __future__ import annotations
 
@@ -49,6 +49,7 @@ class Config:
     port: int = DEFAULT_PORT
     allowed_hosts: tuple[str, ...] = DEFAULT_ALLOWED_HOSTS
     allowed_origins: tuple[str, ...] = ()
+    podcast_writes_enabled: bool = False
 
 
 def is_valid_resource_id(value: object) -> bool:
@@ -77,6 +78,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     port = _parse_port(values)
     allowed_hosts = _parse_allowed_hosts(values)
     allowed_origins = _parse_allowed_origins(values)
+    podcast_writes_enabled = _parse_podcast_writes(values)
 
     return Config(
         abs_url=abs_url,
@@ -87,6 +89,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         port=port,
         allowed_hosts=allowed_hosts,
         allowed_origins=allowed_origins,
+        podcast_writes_enabled=podcast_writes_enabled,
     )
 
 
@@ -174,6 +177,21 @@ def _parse_host(env: Mapping[str, str]) -> str:
     if not host or _BIND_HOST_RE.fullmatch(host) is None:
         raise ConfigError("MCP_HOST must be a valid bind host.")
     return host
+
+
+def _parse_podcast_writes(env: Mapping[str, str]) -> bool:
+    """Read the podcast write opt-in, failing closed on anything but true/false."""
+    raw = env.get("ABS_ENABLE_PODCAST_WRITES")
+    if raw is None:
+        return False
+    if not isinstance(raw, str):
+        raise ConfigError("ABS_ENABLE_PODCAST_WRITES must be true or false.")
+    value = raw.strip().lower()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ConfigError("ABS_ENABLE_PODCAST_WRITES must be true or false.")
 
 
 def _parse_port(env: Mapping[str, str]) -> int:

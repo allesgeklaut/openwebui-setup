@@ -1,7 +1,8 @@
-"""Transport authentication, DNS-rebinding, body-limit, and MCP lifecycle tests."""
+"""Transport, MCP lifecycle, and podcast write-tool integration tests."""
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -548,3 +549,1019 @@ async def test_oversized_backend_response_does_not_reach_tool_output(
     text = json.dumps([content.model_dump() for content in result.content])
     assert "size limit" in text
     assert "zzzz" not in text
+
+
+# --- Podcast write tools -------------------------------------------------
+#
+# These tests use a synthetic Audiobookshelf backend (httpx.MockTransport) and
+# a real PodcastClient. They never contact a live service and never use real
+# credentials. The MCP client deliberately registers no elicitation callback:
+# every write tool must work in stateless mode without client interaction.
+
+FEED_URL = "https://93.184.216.34/feed.xml"
+FEED_EPISODE_URLS = tuple(
+    f"https://93.184.216.34/new{index}.mp3" for index in range(1, 4)
+)
+READ_TOOL_NAMES = {"list_libraries", "search_library", "get_item"}
+WRITE_TOOL_NAMES = {
+    "get_podcast_settings",
+    "list_podcast_episodes",
+    "add_podcast",
+    "download_latest_episodes",
+    "set_podcast_schedule",
+    "set_podcast_retention",
+    "delete_podcast_episode",
+    "delete_podcast",
+}
+BACKEND_LEAK = "private-backend-body"
+
+
+def _podcast_episode(
+    episode_id: str, title: str, published_at: int, duration: int, url: str
+) -> dict[str, Any]:
+    return {
+        "id": episode_id,
+        "title": title,
+        "publishedAt": published_at,
+        "duration": duration,
+        "enclosure": {"url": url},
+        "audioFile": {
+            "metadata": {"path": f"/podcasts/pod1/{episode_id}.mp3"}
+        },
+    }
+
+
+def _podcast_item(
+    *,
+    podcast_id: str = "pod1",
+    library_id: str = "lib1",
+    keep_episodes: int = 0,
+    episodes: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if episodes is None:
+        episodes = [
+            _podcast_episode(
+                "ep1",
+                "Oldest",
+                1000,
+                60,
+                "https://93.184.216.34/old.mp3",
+            ),
+            _podcast_episode(
+                "ep2",
+                "Newest",
+                3000,
+                90,
+                "https://93.184.216.34/new.mp3",
+            ),
+            _podcast_episode(
+                "ep3",
+                "Middle",
+                2000,
+                120,
+                "https://93.184.216.34/mid.mp3",
+            ),
+        ]
+    return {
+        "id": podcast_id,
+        "libraryId": library_id,
+        "mediaType": "podcast",
+        "path": f"/podcasts/{podcast_id}",
+        "folderId": "folder1",
+        "media": {
+            "metadata": {"title": "Test Podcast", "feedUrl": FEED_URL},
+            "autoDownloadEpisodes": False,
+            "autoDownloadSchedule": "",
+            "maxNewEpisodesToDownload": 0,
+            "maxEpisodesToKeep": keep_episodes,
+            "episodes": episodes,
+        },
+    }
+
+
+def _book_item() -> dict[str, Any]:
+    return {
+        "id": "book1",
+        "libraryId": "lib1",
+        "mediaType": "book",
+        "media": {"metadata": {"title": "Secret Book Title"}},
+    }
+
+
+class _PodcastBackend(httpx.MockTransport):
+    """Synthetic backend for the fixed Audiobookshelf podcast endpoints."""
+
+    def __init__(
+        self,
+        *,
+        stale_on_read: int | None = None,
+        keep_episodes: int = 0,
+        episodes: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.requests: list[httpx.Request] = []
+        self.items: dict[str, dict[str, Any]] = {
+            "pod1": _podcast_item(
+                keep_episodes=keep_episodes, episodes=episodes
+            ),
+            "book1": _book_item(),
+            "pod2": _podcast_item(podcast_id="pod2", library_id="lib3"),
+        }
+        self.stale_on_read = stale_on_read
+        self.item_reads = 0
+        self.library_items: list[dict[str, Any]] = []
+        self.feed_episodes = [
+            {
+                "title": "Newest Feed Episode",
+                "guid": "feed-3",
+                "publishedAt": 6000,
+                "enclosure": {
+                    "url": FEED_EPISODE_URLS[2],
+                    "type": "audio/mpeg",
+                    "length": 1003,
+                },
+            },
+            {
+                "title": "Middle Feed Episode",
+                "guid": "feed-2",
+                "publishedAt": 5000,
+                "enclosure": {
+                    "url": FEED_EPISODE_URLS[1],
+                    "type": "audio/mpeg",
+                    "length": 1002,
+                },
+            },
+            {
+                "title": "Oldest Feed Episode",
+                "guid": "feed-1",
+                "publishedAt": 4000,
+                "enclosure": {
+                    "url": FEED_EPISODE_URLS[0],
+                    "type": "audio/mpeg",
+                    "length": 1001,
+                },
+            },
+        ]
+        self.created_podcast: dict[str, Any] | None = None
+        self.deleted = False
+        self.fail_delete = False
+        self.fail_second_episode_delete = False
+        self.episode_delete_calls = 0
+        super().__init__(self.__call__)
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        method = request.method
+        path = request.url.path
+
+        if method == "GET" and path.startswith("/api/items/"):
+            return self._read_item(path.rsplit("/", 1)[-1])
+        if method == "GET" and path == "/api/libraries/lib1":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "lib1",
+                    "name": "Podcasts",
+                    "mediaType": "podcast",
+                    "folders": [{"id": "folder1", "fullPath": "/podcasts"}],
+                },
+            )
+        if method == "GET" and path == "/api/libraries/lib1/items":
+            return httpx.Response(
+                200,
+                json={
+                    "results": self.library_items,
+                    "total": len(self.library_items),
+                },
+            )
+        if method == "PATCH" and path == "/api/items/pod1/media":
+            body = json.loads(request.content or b"{}")
+            media = self.items["pod1"]["media"]
+            for key in (
+                "autoDownloadEpisodes",
+                "autoDownloadSchedule",
+                "maxNewEpisodesToDownload",
+                "maxEpisodesToKeep",
+            ):
+                if key in body:
+                    media[key] = body[key]
+            return httpx.Response(200, json={})
+        if method == "POST" and path == "/api/podcasts/feed":
+            return httpx.Response(
+                200,
+                json={
+                    "podcast": {
+                        "metadata": {"title": "Test Podcast"},
+                        "episodes": copy.deepcopy(self.feed_episodes),
+                    }
+                },
+            )
+        if method == "POST" and path == "/api/podcasts":
+            body = json.loads(request.content)
+            self.created_podcast = body
+            return httpx.Response(
+                201,
+                json={
+                    "id": "pod9",
+                    "libraryId": body["libraryId"],
+                    "mediaType": "podcast",
+                    "media": {"metadata": {"title": "Test Podcast"}},
+                },
+            )
+        if method == "POST" and path == "/api/podcasts/pod1/download-episodes":
+            return httpx.Response(200)
+        if method == "DELETE" and path.startswith("/api/podcasts/pod1/episode/"):
+            self.episode_delete_calls += 1
+            if self.fail_second_episode_delete and self.episode_delete_calls == 2:
+                return httpx.Response(500, text=BACKEND_LEAK)
+            episode_id = path.rsplit("/", 1)[-1]
+            media = self.items["pod1"]["media"]
+            media["episodes"] = [
+                episode
+                for episode in media["episodes"]
+                if episode["id"] != episode_id
+            ]
+            return httpx.Response(204)
+        if method == "DELETE" and path == "/api/items/pod1":
+            if self.fail_delete:
+                return httpx.Response(
+                    500,
+                    text=(
+                        f"{BACKEND_LEAK} {BACKEND_API_KEY} "
+                        "http://abs.test/private"
+                    ),
+                )
+            self.deleted = True
+            return httpx.Response(204)
+        return httpx.Response(404, json={"error": "not found"})
+
+    def _read_item(self, item_id: str) -> httpx.Response:
+        item = self.items.get(item_id)
+        if item is None:
+            return httpx.Response(404, json={"error": "not found"})
+        if item_id == "pod1":
+            self.item_reads += 1
+            if self.stale_on_read == self.item_reads:
+                item["media"]["autoDownloadEpisodes"] = True
+        return httpx.Response(200, json=copy.deepcopy(item))
+
+
+@asynccontextmanager
+async def _mcp_session(
+    config: Config,
+    transport: httpx.AsyncBaseTransport,
+) -> AsyncIterator[ClientSession]:
+    """Open one initialized MCP client with no elicitation capability."""
+    server = create_server(config, transport=transport)
+    app = server.streamable_http_app()
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url=BASE_URL,
+            headers={"Authorization": f"Bearer {TEST_MCP_TOKEN}"},
+        ) as http:
+            async with streamable_http_client(
+                f"{BASE_URL}/mcp", http_client=http
+            ) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    yield session
+
+
+def _error_text(result: Any) -> str:
+    return json.dumps([content.model_dump() for content in result.content])
+
+
+async def test_write_mode_registers_exactly_read_and_podcast_tools(
+    config_factory: Callable[..., Config],
+) -> None:
+    mcp = create_server(
+        config_factory(podcast_writes_enabled=True),
+        transport=httpx.MockTransport(lambda request: httpx.Response(404)),
+    )
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+
+    assert set(tools) == READ_TOOL_NAMES | WRITE_TOOL_NAMES
+    for name in WRITE_TOOL_NAMES:
+        properties = tools[name].inputSchema["properties"]
+        assert not {
+            "ctx",
+            "approved",
+            "confirm",
+            "confirmation",
+            "fingerprint",
+            "expected_fingerprint",
+        } & set(properties)
+        serialized = json.dumps(tools[name].inputSchema)
+        for forbidden in ("approved", "confirm", "fingerprint"):
+            assert forbidden not in serialized
+
+    assert tools["list_podcast_episodes"].inputSchema["properties"]["limit"][
+        "maximum"
+    ] == 50
+    assert tools["download_latest_episodes"].inputSchema["properties"]["count"][
+        "maximum"
+    ] == 25
+    retention = tools["set_podcast_retention"].inputSchema["properties"]
+    assert retention["keep"]["minimum"] == 0
+    assert retention["keep"]["maximum"] == 1000
+    assert tools["set_podcast_schedule"].inputSchema["properties"]["enabled"][
+        "type"
+    ] == "boolean"
+
+
+async def test_write_mode_is_stateless_and_deletes_directly(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+    config = config_factory(podcast_writes_enabled=True)
+
+    async with _serve(config, backend) as http:
+        response = await http.post(
+            "/mcp", json=INITIALIZE_REQUEST, headers=_headers()
+        )
+
+    assert response.status_code == 200
+    assert "mcp-session-id" not in response.headers
+
+    async with _mcp_session(config, backend) as session:
+        result = await session.call_tool(
+            "delete_podcast_episode",
+            {"podcast_id": "pod1", "episode_id": "ep1"},
+        )
+
+    assert result.isError is not True
+    payload = _tool_payload(result)
+    assert payload["podcast_id"] == "pod1"
+    assert payload["episode_id"] == "ep1"
+    assert payload["status"] == "deleted"
+    assert payload["deleted_count"] == 1
+    assert payload["filesystem_removal"] == "not_verified"
+    assert "/podcasts" not in json.dumps(payload)
+    deletes = [request for request in backend.requests if request.method == "DELETE"]
+    assert [(request.url.path, request.url.params["hard"]) for request in deletes] == [
+        ("/api/podcasts/pod1/episode/ep1", "1")
+    ]
+    assert all(b"elicitation" not in request.content for request in backend.requests)
+
+
+async def test_write_mode_raw_stateless_tool_call_deletes_directly(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+    config = config_factory(podcast_writes_enabled=True)
+
+    async with _serve(config, backend) as http:
+        initialized = await http.post(
+            "/mcp", json=INITIALIZE_REQUEST, headers=_headers()
+        )
+        called = await http.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "delete_podcast",
+                    "arguments": {"podcast_id": "pod1"},
+                },
+            },
+            headers=_headers(),
+        )
+
+    assert initialized.status_code == 200
+    assert "mcp-session-id" not in initialized.headers
+    assert called.status_code == 200
+    payload = _rpc_payload(called)
+    assert payload["result"].get("isError") is not True
+    assert "deleted" in json.dumps(payload["result"])
+    assert backend.deleted is True
+
+
+async def test_write_mode_disabled_exposes_no_write_tools_and_makes_no_http(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+
+    async with _mcp_session(config_factory(), backend) as session:
+        tools = await session.list_tools()
+        assert {tool.name for tool in tools.tools} == READ_TOOL_NAMES
+
+        for name, arguments in (
+            ("delete_podcast", {"podcast_id": "pod1"}),
+            ("add_podcast", {"library_id": "lib1", "feed_url": FEED_URL}),
+        ):
+            result = await session.call_tool(name, arguments)
+            assert result.isError is True
+            assert "unknown" in _error_text(result).lower()
+
+    assert backend.requests == []
+
+
+async def test_get_podcast_settings_projects_safe_state(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend(keep_episodes=5)
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "get_podcast_settings", {"podcast_id": "pod1"}
+        )
+
+    assert result.isError is not True
+    payload = _tool_payload(result)
+    assert payload["podcast_id"] == "pod1"
+    assert payload["library_id"] == "lib1"
+    assert payload["auto_download"] is False
+    assert payload["schedule"] == ""
+    assert payload["max_new_episodes"] == 0
+    assert payload["keep_episodes"] == 5
+    assert payload["downloaded_count"] == 3
+    assert "local timezone" in payload["notes"]
+    assert "does not trim" in payload["notes"]
+
+    serialized = json.dumps(payload)
+    assert "fingerprint" not in serialized
+    assert "Test Podcast" not in serialized
+    assert FEED_URL not in serialized
+
+
+async def test_list_podcast_episodes_returns_newest_safe_metadata(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "list_podcast_episodes", {"podcast_id": "pod1"}
+        )
+        limited = await session.call_tool(
+            "list_podcast_episodes", {"podcast_id": "pod1", "limit": 2}
+        )
+
+    assert result.isError is not True
+    payload = _tool_payload(result)
+    assert payload["podcast_id"] == "pod1"
+    assert payload["count"] == 3
+    assert [episode["id"] for episode in payload["episodes"]] == [
+        "ep2",
+        "ep3",
+        "ep1",
+    ]
+    for episode in payload["episodes"]:
+        assert set(episode) == {
+            "id",
+            "title",
+            "published_at",
+            "duration_seconds",
+        }
+    assert "http" not in json.dumps(payload)
+
+    limited_payload = _tool_payload(limited)
+    assert limited_payload["count"] == 2
+    assert [episode["id"] for episode in limited_payload["episodes"]] == [
+        "ep2",
+        "ep3",
+    ]
+
+
+async def test_add_podcast_creates_and_reports_existing(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        created = await session.call_tool(
+            "add_podcast", {"library_id": "lib1", "feed_url": FEED_URL}
+        )
+
+    assert created.isError is not True
+    assert _tool_payload(created) == {
+        "podcast_id": "pod9",
+        "library_id": "lib1",
+        "title": "Test Podcast",
+        "status": "created",
+    }
+    assert backend.created_podcast is not None
+    assert backend.created_podcast["libraryId"] == "lib1"
+    assert backend.created_podcast["folderId"] == "folder1"
+    assert backend.created_podcast["path"].startswith("/podcasts/")
+    assert backend.created_podcast["media"]["autoDownloadEpisodes"] is False
+    assert "Test Podcast" not in backend.created_podcast["path"]
+
+    duplicate_backend = _PodcastBackend()
+    duplicate_backend.library_items = [
+        {
+            "id": "pod4",
+            "libraryId": "lib1",
+            "mediaType": "podcast",
+            "media": {"metadata": {"feedUrl": FEED_URL, "title": "Existing"}},
+        }
+    ]
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), duplicate_backend
+    ) as session:
+        existing = await session.call_tool(
+            "add_podcast", {"library_id": "lib1", "feed_url": FEED_URL}
+        )
+
+    assert existing.isError is not True
+    assert _tool_payload(existing)["status"] == "already_exists"
+    assert _tool_payload(existing)["podcast_id"] == "pod4"
+    assert duplicate_backend.created_podcast is None
+
+
+async def test_add_podcast_enforces_library_and_url_guards_before_http(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        foreign = await session.call_tool(
+            "add_podcast", {"library_id": "lib3", "feed_url": FEED_URL}
+        )
+        internal = await session.call_tool(
+            "add_podcast",
+            {"library_id": "lib1", "feed_url": "http://127.0.0.1/feed.xml"},
+        )
+
+    assert foreign.isError is True
+    assert "not permitted" in _error_text(foreign)
+    assert internal.isError is True
+    assert "not publicly routable" in _error_text(internal)
+    assert backend.requests == []
+
+
+async def test_download_latest_episodes_returns_queued_not_completed(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "download_latest_episodes", {"podcast_id": "pod1", "count": 2}
+        )
+
+    assert result.isError is not True
+    payload = _tool_payload(result)
+    assert payload["status"] == "queued"
+    assert payload["queued_count"] == 2
+    assert [episode["title"] for episode in payload["episodes"]] == [
+        "Newest Feed Episode",
+        "Middle Feed Episode",
+    ]
+    assert "http" not in json.dumps(payload)
+
+    downloads = [
+        request
+        for request in backend.requests
+        if request.url.path == "/api/podcasts/pod1/download-episodes"
+    ]
+    assert len(downloads) == 1
+    sent = json.loads(downloads[0].content)
+    assert [episode["title"] for episode in sent] == [
+        "Newest Feed Episode",
+        "Middle Feed Episode",
+    ]
+    assert all(episode["enclosure"]["url"] for episode in sent)
+
+
+async def test_set_podcast_schedule_defaults_and_preserves_on_disable(
+    config_factory: Callable[..., Config],
+) -> None:
+    # keep_episodes > 0 used to require an extra approval prompt. There is no
+    # approval flow: the change executes immediately.
+    backend = _PodcastBackend(keep_episodes=5)
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        enabled = await session.call_tool(
+            "set_podcast_schedule", {"podcast_id": "pod1", "enabled": True}
+        )
+        disabled = await session.call_tool(
+            "set_podcast_schedule", {"podcast_id": "pod1", "enabled": False}
+        )
+
+    assert enabled.isError is not True
+    enabled_payload = _tool_payload(enabled)
+    assert enabled_payload["auto_download"] is True
+    assert enabled_payload["schedule"] == "0 * * * *"
+    assert enabled_payload["max_new_episodes"] == 3
+    assert enabled_payload["keep_episodes"] == 5
+    assert "fingerprint" not in json.dumps(enabled_payload)
+
+    assert disabled.isError is not True
+    disabled_payload = _tool_payload(disabled)
+    assert disabled_payload["auto_download"] is False
+    assert disabled_payload["schedule"] == "0 * * * *"
+    assert disabled_payload["max_new_episodes"] == 3
+    assert disabled_payload["keep_episodes"] == 5
+
+    patches = [
+        json.loads(request.content)
+        for request in backend.requests
+        if request.method == "PATCH"
+    ]
+    assert patches == [
+        {
+            "autoDownloadEpisodes": True,
+            "autoDownloadSchedule": "0 * * * *",
+            "maxNewEpisodesToDownload": 3,
+        },
+        {"autoDownloadEpisodes": False},
+    ]
+    assert not any(
+        request.method == "DELETE" for request in backend.requests
+    )
+
+
+async def test_set_podcast_schedule_explicit_values_and_disable_guard(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "set_podcast_schedule",
+            {
+                "podcast_id": "pod1",
+                "enabled": True,
+                "schedule": "*/30 * * * *",
+                "max_new_episodes": 5,
+            },
+        )
+        request_count = len(backend.requests)
+        contradictory = await session.call_tool(
+            "set_podcast_schedule",
+            {
+                "podcast_id": "pod1",
+                "enabled": False,
+                "schedule": "*/30 * * * *",
+            },
+        )
+
+    assert result.isError is not True
+    patch = next(
+        json.loads(request.content)
+        for request in backend.requests
+        if request.method == "PATCH"
+    )
+    assert patch == {
+        "autoDownloadEpisodes": True,
+        "autoDownloadSchedule": "*/30 * * * *",
+        "maxNewEpisodesToDownload": 5,
+    }
+
+    assert contradictory.isError is True
+    assert "require enabled=true" in _error_text(contradictory)
+    assert len(backend.requests) == request_count
+
+
+async def test_set_podcast_retention_updates_without_trimming(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "set_podcast_retention", {"podcast_id": "pod1", "keep": 1}
+        )
+        unlimited = await session.call_tool(
+            "set_podcast_retention", {"podcast_id": "pod1", "keep": 0}
+        )
+
+    assert result.isError is not True
+    payload = _tool_payload(result)
+    assert payload["keep_episodes"] == 1
+    assert payload["trim_existing"] is False
+    assert payload["deleted_count"] == 0
+    assert payload["status"] == "updated"
+    assert "not removed immediately" in payload["note"]
+    assert payload["state"]["downloaded_count"] == 3
+    assert "fingerprint" not in json.dumps(payload)
+
+    assert unlimited.isError is not True
+    assert _tool_payload(unlimited)["keep_episodes"] == 0
+
+    patches = [
+        json.loads(request.content)
+        for request in backend.requests
+        if request.method == "PATCH"
+    ]
+    assert patches == [
+        {"maxEpisodesToKeep": 1},
+        {"maxEpisodesToKeep": 0},
+    ]
+    assert not any(
+        request.method == "DELETE" for request in backend.requests
+    )
+
+
+async def test_set_podcast_retention_trim_deletes_oldest_surplus(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "set_podcast_retention",
+            {"podcast_id": "pod1", "keep": 1, "trim_existing": True},
+        )
+
+    assert result.isError is not True
+    payload = _tool_payload(result)
+    assert payload["keep_episodes"] == 1
+    assert payload["trim_existing"] is True
+    assert payload["deleted_count"] == 2
+    assert payload["status"] == "completed"
+    assert payload["state"]["downloaded_count"] == 1
+    assert payload["state"]["keep_episodes"] == 1
+    assert "fingerprint" not in json.dumps(payload)
+
+    assert next(
+        json.loads(request.content)
+        for request in backend.requests
+        if request.method == "PATCH"
+    ) == {"maxEpisodesToKeep": 1}
+    deletes = [
+        (request.url.path, request.url.params["hard"])
+        for request in backend.requests
+        if request.method == "DELETE"
+    ]
+    assert deletes == [
+        ("/api/podcasts/pod1/episode/ep1", "1"),
+        ("/api/podcasts/pod1/episode/ep3", "1"),
+    ]
+
+
+async def test_set_podcast_retention_reports_partial_trim_failure(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+    backend.fail_second_episode_delete = True
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "set_podcast_retention",
+            {"podcast_id": "pod1", "keep": 1, "trim_existing": True},
+        )
+
+    assert result.isError is not True
+    payload = _tool_payload(result)
+    assert payload["status"] == "partial"
+    assert payload["deleted_count"] == 1
+    assert "unavailable" in payload["error"]
+    assert BACKEND_LEAK not in json.dumps(payload)
+    assert backend.episode_delete_calls == 2
+
+
+async def test_set_podcast_retention_rejects_trim_unlimited_before_http(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "set_podcast_retention",
+            {"podcast_id": "pod1", "keep": 0, "trim_existing": True},
+        )
+
+    assert result.isError is True
+    assert "unlimited" in _error_text(result)
+    assert backend.requests == []
+
+
+async def test_set_podcast_retention_bounds_trim_to_100_before_mutation(
+    config_factory: Callable[..., Config],
+) -> None:
+    episodes = [
+        _podcast_episode(
+            f"ep{index}",
+            f"Episode {index}",
+            index * 1000,
+            60,
+            f"https://93.184.216.34/{index}.mp3",
+        )
+        for index in range(1, 103)
+    ]
+    backend = _PodcastBackend(episodes=episodes)
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "set_podcast_retention",
+            {"podcast_id": "pod1", "keep": 1, "trim_existing": True},
+        )
+
+    assert result.isError is True
+    assert "more than 100" in _error_text(result)
+    assert not any(
+        request.method in {"PATCH", "DELETE"} for request in backend.requests
+    )
+
+
+async def test_delete_podcast_executes_directly(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "delete_podcast", {"podcast_id": "pod1"}
+        )
+
+    assert result.isError is not True
+    payload = _tool_payload(result)
+    assert payload["podcast_id"] == "pod1"
+    assert payload["library_id"] == "lib1"
+    assert payload["status"] == "deleted"
+    assert payload["filesystem_removal"] == "not_verified"
+    assert "/podcasts" not in json.dumps(payload)
+    assert backend.deleted is True
+    deletes = [request for request in backend.requests if request.method == "DELETE"]
+    assert [(request.url.path, request.url.params["hard"]) for request in deletes] == [
+        ("/api/items/pod1", "1")
+    ]
+
+
+async def test_stale_state_blocks_destructive_mutation(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend(stale_on_read=2)
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "delete_podcast", {"podcast_id": "pod1"}
+        )
+
+    assert result.isError is True
+    assert "Podcast changed" in _error_text(result)
+    assert backend.deleted is False
+    assert not any(
+        request.method == "DELETE" for request in backend.requests
+    )
+
+
+async def test_non_podcast_and_foreign_library_items_never_mutate(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        for podcast_id in ("book1", "pod2"):
+            result = await session.call_tool(
+                "delete_podcast", {"podcast_id": podcast_id}
+            )
+            assert result.isError is True
+            assert "not found or not permitted" in _error_text(result)
+            assert "Secret Book Title" not in _error_text(result)
+
+        foreign_settings = await session.call_tool(
+            "get_podcast_settings", {"podcast_id": "pod2"}
+        )
+        assert foreign_settings.isError is True
+        assert "not found or not permitted" in _error_text(foreign_settings)
+        assert "Test Podcast" not in _error_text(foreign_settings)
+
+        retention = await session.call_tool(
+            "set_podcast_retention", {"podcast_id": "book1", "keep": 5}
+        )
+
+    assert retention.isError is True
+    assert not any(
+        request.method in {"PATCH", "DELETE"} for request in backend.requests
+    )
+
+
+async def test_invalid_episode_ids_never_mutate(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        malformed = await session.call_tool(
+            "delete_podcast_episode",
+            {"podcast_id": "pod1", "episode_id": "bad/id"},
+        )
+        not_member = await session.call_tool(
+            "delete_podcast_episode",
+            {"podcast_id": "pod1", "episode_id": "ep9"},
+        )
+
+    assert malformed.isError is True
+    assert "Invalid episode ID" in _error_text(malformed)
+    assert not_member.isError is True
+    assert "Podcast episode not found" in _error_text(not_member)
+    assert not any(
+        request.method == "DELETE" for request in backend.requests
+    )
+
+
+async def test_write_backend_error_is_redacted(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+    backend.fail_delete = True
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "delete_podcast", {"podcast_id": "pod1"}
+        )
+
+    assert result.isError is True
+    text = _error_text(result)
+    assert "unavailable" in text
+    for secret in (BACKEND_LEAK, BACKEND_API_KEY, "abs.test", "private"):
+        assert secret not in text
+
+
+async def test_write_tool_argument_bounds_are_strict_and_never_reach_backend(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+    invalid_calls = (
+        ("list_podcast_episodes", {"podcast_id": "pod1", "limit": 0}),
+        ("list_podcast_episodes", {"podcast_id": "pod1", "limit": 51}),
+        ("list_podcast_episodes", {"podcast_id": "pod1", "limit": True}),
+        ("list_podcast_episodes", {"podcast_id": "pod1", "limit": 1.0}),
+        ("download_latest_episodes", {"podcast_id": "pod1", "count": 0}),
+        ("download_latest_episodes", {"podcast_id": "pod1", "count": 26}),
+        ("download_latest_episodes", {"podcast_id": "pod1", "count": True}),
+        ("download_latest_episodes", {"podcast_id": "pod1", "count": 1.0}),
+        ("set_podcast_schedule", {"podcast_id": "pod1", "enabled": 1}),
+        ("set_podcast_schedule", {"podcast_id": "pod1", "enabled": "true"}),
+        (
+            "set_podcast_schedule",
+            {"podcast_id": "pod1", "enabled": True, "max_new_episodes": 0},
+        ),
+        (
+            "set_podcast_schedule",
+            {"podcast_id": "pod1", "enabled": True, "max_new_episodes": 26},
+        ),
+        (
+            "set_podcast_schedule",
+            {"podcast_id": "pod1", "enabled": True, "max_new_episodes": True},
+        ),
+        (
+            "set_podcast_schedule",
+            {"podcast_id": "pod1", "enabled": True, "max_new_episodes": 1.0},
+        ),
+        (
+            "set_podcast_schedule",
+            {"podcast_id": "pod1", "enabled": True, "schedule": 123},
+        ),
+        ("set_podcast_retention", {"podcast_id": "pod1", "keep": -1}),
+        ("set_podcast_retention", {"podcast_id": "pod1", "keep": 1001}),
+        ("set_podcast_retention", {"podcast_id": "pod1", "keep": True}),
+        ("set_podcast_retention", {"podcast_id": "pod1", "keep": 1.0}),
+        (
+            "set_podcast_retention",
+            {"podcast_id": "pod1", "keep": 1, "trim_existing": "true"},
+        ),
+        (
+            "set_podcast_retention",
+            {"podcast_id": "pod1", "keep": 1, "trim_existing": 1},
+        ),
+        ("get_podcast_settings", {"podcast_id": "bad/id"}),
+        ("delete_podcast", {"podcast_id": "bad/id"}),
+    )
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        for tool_name, arguments in invalid_calls:
+            result = await session.call_tool(tool_name, arguments)
+            assert result.isError is True, (tool_name, arguments)
+
+    assert backend.requests == []
