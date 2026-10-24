@@ -228,7 +228,7 @@ services:
 
   # Audiobookshelf MCP connector (built from ./audiobookshelf-mcp).
   # Speaks authenticated Streamable HTTP for OpenWebUI only. No published port.
-  # Podcast write tools stay off until E2E read-only stages pass.
+  # Podcast write tools are enabled after user-confirmed read-only verification.
   audiobookshelf-mcp:
     build: ./audiobookshelf-mcp
     image: audiobookshelf-mcp:local
@@ -248,7 +248,7 @@ services:
       - ABS_ALLOWED_LIBRARY_IDS=9d99120c-273d-4e10-a6bb-11a43aab88f0
       - ABS_API_KEY_FILE=/run/secrets/abs_api_key
       - MCP_AUTH_TOKEN_FILE=/run/secrets/mcp_token
-      - ABS_ENABLE_PODCAST_WRITES=false
+      - ABS_ENABLE_PODCAST_WRITES=true
     volumes:
       - /opt/secrets/audiobookshelf-mcp/abs_api_key:/run/secrets/abs_api_key:ro
       - /opt/secrets/audiobookshelf-mcp/mcp_token:/run/secrets/mcp_token:ro
