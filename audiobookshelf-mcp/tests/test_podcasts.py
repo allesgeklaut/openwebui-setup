@@ -8,6 +8,7 @@ is tested with synthetic monkeypatches or in its dedicated test module.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -27,6 +28,7 @@ from audiobookshelf_mcp.podcasts import PodcastClient
 
 FEED_URL = "https://feeds.example/show.xml"
 BACKEND_SECRET = "backend-secret-body"
+FEED_ID_RE = re.compile(r"\Afeed_[0-9a-f]{64}\Z")
 
 RouteValue = dict[str, Any] | list[Any] | httpx.Response | Callable[[httpx.Request], httpx.Response]
 Routes = dict[tuple[str, str], RouteValue]
@@ -1646,3 +1648,1756 @@ async def test_download_accepts_empty_feed_without_mutation(
     assert result["status"] == "nothing_new"
     assert result["queued_count"] == 0
     assert _posts(requests, "/api/podcasts/pod1/download-episodes") == []
+
+
+# --- Bounded downloaded browsing -----------------------------------------
+
+
+def _titles(payload: dict[str, Any]) -> list[str]:
+    return [episode["title"] for episode in payload["episodes"]]
+
+
+def _selectors_by_title(payload: dict[str, Any]) -> dict[str, str]:
+    return {
+        episode["title"]: episode["id"]
+        for episode in payload["episodes"]
+    }
+
+
+def _series_feed(count: int) -> list[dict[str, Any]]:
+    return [
+        _feed_episode(
+            f"g{index}",
+            f"https://cdn.example/{index}.mp3",
+            1000 * index,
+            f"Episode {index}",
+        )
+        for index in range(1, count + 1)
+    ]
+
+
+async def test_list_episodes_query_casefold_orders_paging_and_undated(
+    podcast_factory: Any,
+) -> None:
+    episodes = [
+        _episode("ep1", 1000),
+        _episode("ep2", 3000),
+        _episode("ep3", 2000),
+        _episode("ep4", None),
+        _episode("ep5", 3000),
+    ]
+    for episode, title in zip(
+        episodes,
+        ["Alpha One", "beta ALPHA", "Gamma", "Undated Alpha", "alpha"],
+        strict=True,
+    ):
+        episode["title"] = title
+    item = _podcast(episodes=episodes)
+    transport, requests = _make_transport({("GET", "/api/items/pod1"): item})
+    client = podcast_factory(transport)
+
+    newest = await client.list_podcast_episodes("pod1", 5, query="ALPHA")
+    assert newest["podcast_id"] == "pod1"
+    assert newest["total"] == 4
+    assert newest["count"] == 4
+    assert newest["limit"] == 5
+    assert newest["offset"] == 0
+    assert newest["has_more"] is False
+    assert newest["next_offset"] is None
+    assert [episode["id"] for episode in newest["episodes"]] == [
+        "ep5",
+        "ep2",
+        "ep1",
+        "ep4",
+    ]
+    assert newest["episodes"][-1]["published_at"] is None
+
+    oldest = await client.list_podcast_episodes(
+        "pod1", 5, query="alpha", order="oldest"
+    )
+    assert [episode["id"] for episode in oldest["episodes"]] == [
+        "ep1",
+        "ep2",
+        "ep5",
+        "ep4",
+    ]
+
+    page = await client.list_podcast_episodes(
+        "pod1", 2, query="alpha", order="newest", offset=1
+    )
+    assert [episode["id"] for episode in page["episodes"]] == ["ep2", "ep1"]
+    assert page["count"] == 2
+    assert page["total"] == 4
+    assert page["has_more"] is True
+    assert page["next_offset"] == 3
+
+    last = await client.list_podcast_episodes(
+        "pod1", 2, query="alpha", order="newest", offset=3
+    )
+    assert [episode["id"] for episode in last["episodes"]] == ["ep4"]
+    assert last["count"] == 1
+    assert last["has_more"] is False
+    assert last["next_offset"] is None
+
+    rendered = json.dumps(newest)
+    for forbidden in ("cdn.example", "/podcasts", "guid-ep1", "audio/mpeg"):
+        assert forbidden not in rendered
+    assert len(requests) == 4
+
+
+async def test_list_episodes_pages_more_than_fifty_downloaded(
+    podcast_factory: Any,
+) -> None:
+    episodes = [
+        _episode(f"ep{index:03d}", 1000 * index) for index in range(120)
+    ]
+    transport, _ = _make_transport(
+        {("GET", "/api/items/pod1"): _podcast(episodes=episodes)}
+    )
+    client = podcast_factory(transport)
+
+    first = await client.list_podcast_episodes("pod1", 50)
+    assert first["total"] == 120
+    assert first["count"] == 50
+    assert first["has_more"] is True
+    assert first["next_offset"] == 50
+    assert first["episodes"][0]["id"] == "ep119"
+    assert first["episodes"][-1]["id"] == "ep070"
+
+    second = await client.list_podcast_episodes("pod1", 50, offset=50)
+    assert second["episodes"][0]["id"] == "ep069"
+    assert second["episodes"][-1]["id"] == "ep020"
+    assert second["has_more"] is True
+    assert second["next_offset"] == 100
+
+    third = await client.list_podcast_episodes("pod1", 50, offset=100)
+    assert third["count"] == 20
+    assert third["episodes"][0]["id"] == "ep019"
+    assert third["episodes"][-1]["id"] == "ep000"
+    assert third["has_more"] is False
+    assert third["next_offset"] is None
+
+    beyond = await client.list_podcast_episodes("pod1", 50, offset=500)
+    assert beyond["episodes"] == []
+    assert beyond["count"] == 0
+    assert beyond["total"] == 120
+    assert beyond["has_more"] is False
+    assert beyond["next_offset"] is None
+
+    oldest = await client.list_podcast_episodes(
+        "pod1", 50, order="oldest"
+    )
+    assert oldest["episodes"][0]["id"] == "ep000"
+    assert oldest["episodes"][-1]["id"] == "ep049"
+
+
+async def test_list_episode_search_and_page_bounds_never_reach_backend(
+    podcast_factory: Any,
+) -> None:
+    transport, requests = _make_transport({})
+    client = podcast_factory(transport)
+
+    invalid_queries: list[object] = ["", "   ", "x" * 201, "bad\nquery", 5]
+    invalid_orders: list[object] = ["Oldest", "NEWEST", "", None, 1]
+    invalid_offsets: list[object] = [-1, 100001, True, "0", 1.0, None]
+    for query in invalid_queries:
+        with pytest.raises(ABSInvalidRequest):
+            await client.list_podcast_episodes("pod1", query=query)  # type: ignore[arg-type]
+    for order in invalid_orders:
+        with pytest.raises(ABSInvalidRequest):
+            await client.list_podcast_episodes("pod1", order=order)  # type: ignore[arg-type]
+    for offset in invalid_offsets:
+        with pytest.raises(ABSInvalidRequest):
+            await client.list_podcast_episodes("pod1", offset=offset)  # type: ignore[arg-type]
+
+    assert requests == []
+
+
+# --- Selected and chronological downloads --------------------------------
+
+
+async def test_selected_download_arbitrary_entries_in_caller_order(
+    podcast_factory: Any,
+) -> None:
+    feed_entries = _series_feed(12)
+    shuffled = feed_entries[::2] + feed_entries[1::2]
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): _podcast(),
+        ("POST", "/api/podcasts/feed"): _feed(*shuffled),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    listing = await client.list_available_podcast_episodes("pod1", 50)
+    selectors = _selectors_by_title(listing)
+
+    result = await client.download_podcast_episodes(
+        "pod1", [selectors["Episode 2"], selectors["Episode 9"]]
+    )
+
+    assert result["podcast_id"] == "pod1"
+    assert result["status"] == "queued"
+    assert result["selected_count"] == 2
+    assert result["queued_count"] == 2
+    assert result["skipped_count"] == 0
+    assert [entry["title"] for entry in result["episodes"]] == [
+        "Episode 2",
+        "Episode 9",
+    ]
+    for entry in result["episodes"]:
+        assert set(entry) == {"id", "title", "published_at"}
+        assert FEED_ID_RE.fullmatch(entry["id"])
+    assert "not completed downloads" in result["note"]
+
+    posts = _posts(requests, "/api/podcasts/pod1/download-episodes")
+    assert len(posts) == 1
+    sent = json.loads(posts[0].content)
+    assert [episode["title"] for episode in sent] == [
+        "Episode 2",
+        "Episode 9",
+    ]
+    assert sent[0]["guid"] == "g2"
+    assert sent[0]["publishedAt"] == 2000
+    assert set(sent[0]) == {"title", "guid", "publishedAt", "enclosure"}
+    assert set(sent[0]["enclosure"]) == {"url", "type", "length"}
+
+    item_reads = [
+        request
+        for request in requests
+        if request.method == "GET"
+        and request.url.path == "/api/items/pod1"
+    ]
+    # Browse read, download read, and the just-before-POST re-read.
+    assert len(item_reads) == 3
+
+    rendered = json.dumps(result)
+    for forbidden in ("cdn.example", "/podcasts", "guid", "audio/mpeg"):
+        assert forbidden not in rendered
+
+
+async def test_selected_download_skips_known_without_backfill(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode(
+                "epDownloaded",
+                100,
+                guid="g2",
+                url="https://cdn.example/downloaded.mp3",
+            )
+        ]
+    )
+    item["episodeDownloadsQueued"] = [
+        _queue_entry("g3", "https://cdn.example/queued.mp3")
+    ]
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): item,
+        ("POST", "/api/podcasts/feed"): _feed(*_series_feed(6)),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    selectors = _selectors_by_title(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+
+    result = await client.download_podcast_episodes(
+        "pod1",
+        [
+            selectors["Episode 1"],
+            selectors["Episode 2"],
+            selectors["Episode 3"],
+            selectors["Episode 4"],
+        ],
+    )
+
+    assert result["status"] == "queued"
+    assert result["selected_count"] == 4
+    assert result["queued_count"] == 2
+    assert result["skipped_count"] == 2
+    assert [entry["title"] for entry in result["episodes"]] == [
+        "Episode 1",
+        "Episode 4",
+    ]
+
+    posts = _posts(requests, "/api/podcasts/pod1/download-episodes")
+    assert len(posts) == 1
+    assert [episode["title"] for episode in json.loads(posts[0].content)] == [
+        "Episode 1",
+        "Episode 4",
+    ]
+
+
+async def test_selected_download_all_known_sends_no_mutation(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[_episode("ep1", 1000, guid="g1")]
+    )
+    item["episodesDownloading"] = [
+        _queue_entry("g2", "https://cdn.example/2.mp3")
+    ]
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): item,
+        ("POST", "/api/podcasts/feed"): _feed(*_series_feed(3)),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    selectors = _selectors_by_title(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+
+    result = await client.download_podcast_episodes(
+        "pod1", [selectors["Episode 1"], selectors["Episode 2"]]
+    )
+
+    assert set(result) == {
+        "podcast_id",
+        "status",
+        "selected_count",
+        "queued_count",
+        "skipped_count",
+        "episodes",
+        "note",
+    }
+    assert result["podcast_id"] == "pod1"
+    assert result["status"] == "nothing_new"
+    assert result["selected_count"] == 2
+    assert result["queued_count"] == 0
+    assert result["skipped_count"] == 2
+    assert result["episodes"] == []
+    assert "not completed downloads" in result["note"]
+    assert _posts(requests, "/api/podcasts/pod1/download-episodes") == []
+
+
+async def test_selected_download_rejects_stale_selector_before_post(
+    podcast_factory: Any,
+) -> None:
+    holder: dict[str, Any] = {"feed": _feed(*_series_feed(3))}
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): _podcast(),
+        ("POST", "/api/podcasts/feed"): lambda request: httpx.Response(
+            200, json=holder["feed"]
+        ),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    selectors = _selectors_by_title(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+    selected = selectors["Episode 2"]
+
+    holder["feed"] = _feed(
+        _feed_episode("g1", "https://cdn.example/1.mp3", 1000, "Episode 1"),
+        _feed_episode("g3", "https://cdn.example/3.mp3", 3000, "Episode 3"),
+    )
+    with pytest.raises(ABSInvalidRequest, match="Unknown or stale"):
+        await client.download_podcast_episodes("pod1", [selected])
+
+    holder["feed"] = _feed(
+        _feed_episode("g1", "https://cdn.example/1.mp3", 1000, "Episode 1"),
+        _feed_episode("g2", "https://cdn.example/2.mp3", 2500, "Episode 2"),
+        _feed_episode("g3", "https://cdn.example/3.mp3", 3000, "Episode 3"),
+    )
+    with pytest.raises(ABSInvalidRequest, match="Unknown or stale"):
+        await client.download_podcast_episodes("pod1", [selected])
+
+    assert _posts(requests, "/api/podcasts/pod1/download-episodes") == []
+
+
+async def test_selected_download_input_bounds_never_reach_backend(
+    podcast_factory: Any,
+) -> None:
+    transport, requests = _make_transport({})
+    client = podcast_factory(transport)
+    valid = "feed_" + "a" * 64
+
+    invalid: list[object] = [
+        [],
+        [valid, valid],
+        [123],
+        [None],
+        [""],
+        ["feed_" + "a" * 63],
+        ["feed_" + "A" * 64],
+        ["feed_" + "a" * 65],
+        ["feed_" + "g" * 64],
+        [valid] * 26,
+        (valid,),
+        "not-a-list",
+        None,
+    ]
+    for episode_ids in invalid:
+        with pytest.raises(ABSInvalidRequest):
+            await client.download_podcast_episodes(
+                "pod1", episode_ids  # type: ignore[arg-type]
+            )
+
+    assert requests == []
+
+
+async def test_selected_download_preflights_every_enclosure_before_post(
+    podcast_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): _podcast(),
+        ("POST", "/api/podcasts/feed"): _feed(
+            _feed_episode(
+                "g1", "https://cdn.example/one.mp3", 3000, "One"
+            ),
+            _feed_episode(
+                "g2", "https://private.example/two.mp3", 2000, "Two"
+            ),
+        ),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    selectors = _selectors_by_title(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+    seen: list[str] = []
+
+    async def guard(url: str) -> str:
+        if "cdn.example" in url or "private.example" in url:
+            seen.append(url)
+        if "private.example" in url:
+            raise ABSInvalidRequest("Remote URL host is not publicly routable.")
+        return url
+
+    monkeypatch.setattr(podcasts, "ensure_public_url", guard)
+
+    with pytest.raises(ABSInvalidRequest, match="publicly routable"):
+        await client.download_podcast_episodes(
+            "pod1", [selectors["One"], selectors["Two"]]
+        )
+
+    assert seen == [
+        "https://cdn.example/one.mp3",
+        "https://private.example/two.mp3",
+    ]
+    assert _posts(requests, "/api/podcasts/pod1/download-episodes") == []
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "https://cdn.example/a%zz.mp3",
+        "https://cdn.example/a%FF.mp3",
+    ],
+)
+async def test_selected_download_rejects_invalid_percent_before_post(
+    podcast_factory: Any, bad_url: str
+) -> None:
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): _podcast(),
+        ("POST", "/api/podcasts/feed"): _feed(
+            _feed_episode("bad", bad_url, 2000, "Bad")
+        ),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    selectors = _selectors_by_title(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+
+    with pytest.raises(ABSInvalidRequest, match="percent encoding") as raised:
+        await client.download_podcast_episodes("pod1", [selectors["Bad"]])
+
+    assert bad_url not in str(raised.value)
+    assert _posts(requests, "/api/podcasts/pod1/download-episodes") == []
+
+
+async def test_selected_download_keeps_multibyte_guid_unchanged(
+    podcast_factory: Any,
+) -> None:
+    guid = "guid-\u00e9-\U0001f4a9"
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): _podcast(),
+        ("POST", "/api/podcasts/feed"): _feed(
+            _feed_episode(
+                guid, "https://cdn.example/a%20b.mp3", 2000, "Multibyte"
+            )
+        ),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    selectors = _selectors_by_title(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+
+    result = await client.download_podcast_episodes(
+        "pod1", [selectors["Multibyte"]]
+    )
+
+    assert result["status"] == "queued"
+    posts = _posts(requests, "/api/podcasts/pod1/download-episodes")
+    assert len(posts) == 1
+    assert json.loads(posts[0].content)[0]["guid"] == guid
+
+
+async def test_selected_download_rereads_and_skips_newly_queued(
+    podcast_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _podcast()
+    holder: dict[str, Any] = {"item": item, "feed": _feed(*_series_feed(3))}
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): lambda request: httpx.Response(
+            200, json=holder["item"]
+        ),
+        ("POST", "/api/podcasts/feed"): lambda request: httpx.Response(
+            200, json=holder["feed"]
+        ),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    selectors = _selectors_by_title(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+
+    async def guard(url: str) -> str:
+        if url == "https://cdn.example/2.mp3":
+            holder["item"]["episodeDownloadsQueued"] = [
+                _queue_entry("g2", "https://cdn.example/2.mp3")
+            ]
+        return url
+
+    monkeypatch.setattr(podcasts, "ensure_public_url", guard)
+
+    result = await client.download_podcast_episodes(
+        "pod1", [selectors["Episode 1"], selectors["Episode 2"]]
+    )
+
+    assert result["status"] == "queued"
+    assert result["selected_count"] == 2
+    assert result["queued_count"] == 1
+    assert result["skipped_count"] == 1
+    posts = _posts(requests, "/api/podcasts/pod1/download-episodes")
+    assert len(posts) == 1
+    assert [episode["title"] for episode in json.loads(posts[0].content)] == [
+        "Episode 1"
+    ]
+    item_reads = [
+        request
+        for request in requests
+        if request.method == "GET"
+        and request.url.path == "/api/items/pod1"
+    ]
+    assert len(item_reads) == 3
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_error", "message"),
+    [
+        ("feed", ABSResponseError, "changed before download"),
+        ("library", ABSResponseError, "changed before download"),
+        ("path", ABSResponseError, "changed before download"),
+        ("folder", ABSResponseError, "changed before download"),
+        ("media_type", ABSNotAllowed, "not found or not permitted"),
+        ("out_of_scope", ABSNotAllowed, "not found or not permitted"),
+    ],
+)
+async def test_selected_download_fails_closed_when_scope_changes_during_preflight(
+    podcast_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    expected_error: type[Exception],
+    message: str,
+) -> None:
+    item = _podcast()
+    holder: dict[str, Any] = {
+        "item": item,
+        "feed": _feed(*_series_feed(1)),
+    }
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): lambda request: httpx.Response(
+            200, json=holder["item"]
+        ),
+        ("POST", "/api/podcasts/feed"): lambda request: httpx.Response(
+            200, json=holder["feed"]
+        ),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    selectors = _selectors_by_title(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+
+    def mutate() -> None:
+        if case == "feed":
+            holder["item"]["media"]["metadata"]["feedUrl"] = (
+                "https://feeds.example/changed.xml"
+            )
+        elif case == "library":
+            holder["item"]["libraryId"] = "lib2"
+        elif case == "path":
+            holder["item"]["path"] = "/podcasts/other"
+        elif case == "folder":
+            holder["item"]["folderId"] = "folder2"
+        elif case == "media_type":
+            holder["item"]["mediaType"] = "book"
+        else:
+            holder["item"]["libraryId"] = "lib3"
+
+    async def guard(url: str) -> str:
+        if url.startswith("https://cdn.example/"):
+            mutate()
+        return url
+
+    monkeypatch.setattr(podcasts, "ensure_public_url", guard)
+
+    with pytest.raises(expected_error, match=message):
+        await client.download_podcast_episodes(
+            "pod1", [selectors["Episode 1"]]
+        )
+
+    assert _posts(requests, "/api/podcasts/pod1/download-episodes") == []
+
+
+async def test_chronological_window_includes_anchor_plus_newer(
+    podcast_factory: Any,
+) -> None:
+    feed_entries = _series_feed(20)
+    shuffled = feed_entries[::2] + feed_entries[1::2]
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): _podcast(),
+        ("POST", "/api/podcasts/feed"): _feed(*shuffled),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    selectors = _selectors_by_title(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+
+    result = await client.download_episodes_from(
+        "pod1", selectors["Episode 5"], 10
+    )
+
+    assert result["status"] == "queued"
+    assert result["selected_count"] == 10
+    assert result["queued_count"] == 10
+    assert result["skipped_count"] == 0
+    posts = _posts(requests, "/api/podcasts/pod1/download-episodes")
+    assert len(posts) == 1
+    assert [episode["title"] for episode in json.loads(posts[0].content)] == [
+        f"Episode {index}" for index in range(5, 15)
+    ]
+
+
+async def test_chronological_window_near_end_returns_fewer(
+    podcast_factory: Any,
+) -> None:
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): _podcast(),
+        ("POST", "/api/podcasts/feed"): _feed(*_series_feed(20)),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    selectors = _selectors_by_title(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+
+    result = await client.download_episodes_from(
+        "pod1", selectors["Episode 17"], 10
+    )
+
+    assert result["selected_count"] == 4
+    assert result["queued_count"] == 4
+    posts = _posts(requests, "/api/podcasts/pod1/download-episodes")
+    assert [episode["title"] for episode in json.loads(posts[0].content)] == [
+        "Episode 17",
+        "Episode 18",
+        "Episode 19",
+        "Episode 20",
+    ]
+
+
+async def test_chronological_tied_dates_use_opaque_id_ascending(
+    podcast_factory: Any,
+) -> None:
+    entries = [
+        _feed_episode(
+            f"g{index}",
+            f"https://cdn.example/tie{index}.mp3",
+            5000,
+            f"Tie {index}",
+        )
+        for index in range(1, 7)
+    ]
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): _podcast(),
+        ("POST", "/api/podcasts/feed"): _feed(
+            entries[3], entries[0], entries[5], entries[2], entries[1], entries[4]
+        ),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    listing = await client.list_available_podcast_episodes("pod1", 50)
+
+    ids = [entry["id"] for entry in listing["episodes"]]
+    assert ids == sorted(ids)
+    expected = [entry["title"] for entry in listing["episodes"][2:5]]
+
+    result = await client.download_episodes_from(
+        "pod1", ids[2], 3
+    )
+
+    assert result["queued_count"] == 3
+    posts = _posts(requests, "/api/podcasts/pod1/download-episodes")
+    assert [episode["title"] for episode in json.loads(posts[0].content)] == expected
+
+
+async def test_chronological_skips_known_without_backfill(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("epSix", 6000, guid="g6"),
+            _episode("epTwelve", 12000, guid="g12"),
+        ]
+    )
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): item,
+        ("POST", "/api/podcasts/feed"): _feed(*_series_feed(15)),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    selectors = _selectors_by_title(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+
+    result = await client.download_episodes_from(
+        "pod1", selectors["Episode 5"], 10
+    )
+
+    assert result["selected_count"] == 10
+    assert result["queued_count"] == 8
+    assert result["skipped_count"] == 2
+    posts = _posts(requests, "/api/podcasts/pod1/download-episodes")
+    assert [episode["title"] for episode in json.loads(posts[0].content)] == [
+        "Episode 5",
+        "Episode 7",
+        "Episode 8",
+        "Episode 9",
+        "Episode 10",
+        "Episode 11",
+        "Episode 13",
+        "Episode 14",
+    ]
+
+
+async def test_chronological_stale_anchor_rejects_before_post(
+    podcast_factory: Any,
+) -> None:
+    holder: dict[str, Any] = {"feed": _feed(*_series_feed(5))}
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): _podcast(),
+        ("POST", "/api/podcasts/feed"): lambda request: httpx.Response(
+            200, json=holder["feed"]
+        ),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    selectors = _selectors_by_title(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+
+    holder["feed"] = _feed(*_series_feed(4))
+    with pytest.raises(ABSInvalidRequest, match="Unknown or stale"):
+        await client.download_episodes_from(
+            "pod1", selectors["Episode 5"], 2
+        )
+
+    assert _posts(requests, "/api/podcasts/pod1/download-episodes") == []
+
+
+async def test_chronological_input_bounds_never_reach_backend(
+    podcast_factory: Any,
+) -> None:
+    transport, requests = _make_transport({})
+    client = podcast_factory(transport)
+    anchor = "feed_" + "a" * 64
+
+    for count in (0, 26, True, "5", 1.0):
+        with pytest.raises(ABSInvalidRequest, match="integer"):
+            await client.download_episodes_from("pod1", anchor, count)  # type: ignore[arg-type]
+    for bad_anchor in (
+        "",
+        "feed_" + "a" * 63,
+        "feed_" + "A" * 64,
+        "episode-1",
+        123,
+        None,
+    ):
+        with pytest.raises(ABSInvalidRequest):
+            await client.download_episodes_from(
+                "pod1", bad_anchor, 5  # type: ignore[arg-type]
+            )
+
+    assert requests == []
+
+
+
+async def test_available_catalogue_dedupes_sorts_pages_and_flags(
+    podcast_factory: Any,
+) -> None:
+    feed_payload = _feed(
+        _feed_episode("g1", "https://cdn.example/u1.mp3", 5000, "Newest"),
+        _feed_episode("g1", "https://cdn.example/u3.mp3", 4000, "Dup Guid"),
+        _feed_episode("g2", "https://cdn.example/u2.mp3", 1000, "Oldest"),
+        _feed_episode("g4", "https://cdn.example/u1.mp3", 3000, "Dup Url"),
+        _feed_episode("g5", "https://cdn.example/u5.mp3", 3000, "Middle"),
+        _feed_episode("g6", "https://cdn.example/u6.mp3", 2000, "Undated"),
+    )
+    feed_payload["podcast"]["episodes"].pop()  # no publishedAt -> excluded
+    feed_payload["podcast"]["episodes"].append(
+        {"title": "No Enclosure", "guid": "g7", "publishedAt": 2600}
+    )
+    feed_payload["podcast"]["episodes"].append(
+        {"title": "", "guid": "g8", "publishedAt": 2700}
+    )
+    item = _podcast(
+        episodes=[
+            _episode("epA", 9000, guid="g5"),
+            _episode(
+                "epB", 8000, guid="", url="https://cdn.example/u2.mp3"
+            ),
+        ]
+    )
+    item["episodeDownloadsQueued"] = [
+        _queue_entry("g1", "https://cdn.example/u1.mp3")
+    ]
+    holder: dict[str, Any] = {"feed": feed_payload}
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): item,
+        ("POST", "/api/podcasts/feed"): lambda request: httpx.Response(
+            200, json=holder["feed"]
+        ),
+    }
+    transport, _ = _make_transport(routes)
+    client = podcast_factory(transport)
+
+    result = await client.list_available_podcast_episodes("pod1")
+    assert result["podcast_id"] == "pod1"
+    assert result["total"] == 3
+    assert result["count"] == 3
+    assert result["offset"] == 0
+    assert result["limit"] == 25
+    assert result["has_more"] is False
+    assert result["next_offset"] is None
+    assert "metadata-eligible" in result["note"]
+    assert "preflight occurs only on download" in result["note"]
+    assert "not a complete archive" in result["note"]
+    assert _titles(result) == ["Newest", "Middle", "Oldest"]
+
+    newest, middle, oldest = result["episodes"]
+    assert newest["downloaded"] is False
+    assert newest["queued"] is True
+    assert "downloaded_episode_id" not in newest
+    assert middle["downloaded"] is True
+    assert middle["downloaded_episode_id"] == "epA"
+    assert middle["queued"] is False
+    assert oldest["downloaded"] is True
+    assert oldest["downloaded_episode_id"] == "epB"
+    assert all(FEED_ID_RE.fullmatch(entry["id"]) for entry in result["episodes"])
+    for entry in result["episodes"]:
+        assert set(entry) <= {
+            "id",
+            "title",
+            "published_at",
+            "downloaded",
+            "queued",
+            "downloaded_episode_id",
+        }
+
+    rendered = json.dumps(result)
+    for forbidden in (
+        "cdn.example",
+        "guid",
+        "private feed description",
+        "Undated",
+        "No Enclosure",
+    ):
+        assert forbidden not in rendered
+
+    filtered = await client.list_available_podcast_episodes(
+        "pod1", query="MID"
+    )
+    assert _titles(filtered) == ["Middle"]
+
+    page = await client.list_available_podcast_episodes(
+        "pod1", 1, order="newest", offset=1
+    )
+    assert _titles(page) == ["Middle"]
+    assert page["total"] == 3
+    assert page["has_more"] is True
+    assert page["next_offset"] == 2
+
+    oldest_order = await client.list_available_podcast_episodes(
+        "pod1", 25, order="oldest"
+    )
+    assert _titles(oldest_order) == ["Oldest", "Middle", "Newest"]
+
+    # Reordering the feed must not change selectors or deduplication.
+    holder["feed"] = _feed(*reversed(feed_payload["podcast"]["episodes"]))
+    reordered = await client.list_available_podcast_episodes("pod1")
+    assert [entry["id"] for entry in reordered["episodes"]] == [
+        entry["id"] for entry in result["episodes"]
+    ]
+
+
+async def test_available_selectors_track_identity_not_feed_order_or_title(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast()
+    base = [
+        _feed_episode("g1", "https://cdn.example/a.mp3", 1000, "A"),
+        _feed_episode("g2", "https://cdn.example/b.mp3", 2000, "B"),
+        _feed_episode("g3", "https://cdn.example/c.mp3", 3000, "C"),
+    ]
+    holder: dict[str, Any] = {"feed": _feed(*base)}
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): item,
+        ("POST", "/api/podcasts/feed"): lambda request: httpx.Response(
+            200, json=holder["feed"]
+        ),
+    }
+    transport, _ = _make_transport(routes)
+    client = podcast_factory(transport)
+
+    def ids(payload: dict[str, Any]) -> dict[str, str]:
+        return {
+            episode["title"]: episode["id"] for episode in payload["episodes"]
+        }
+
+    first = ids(await client.list_available_podcast_episodes("pod1", 50))
+    assert list(first) == ["C", "B", "A"]
+
+    holder["feed"] = _feed(
+        _feed_episode("g2", "https://cdn.example/b.mp3", 2000, "B renamed"),
+        _feed_episode("g1", "https://cdn.example/a.mp3", 1000, "A renamed"),
+        _feed_episode("g3", "https://cdn.example/c.mp3", 3000, "C renamed"),
+    )
+    reordered = await client.list_available_podcast_episodes("pod1", 50)
+    assert [entry["id"] for entry in reordered["episodes"]] == [
+        first["C"],
+        first["B"],
+        first["A"],
+    ]
+
+    holder["feed"] = _feed(
+        _feed_episode("g1", "https://cdn.example/a.mp3", 1000, "A"),
+        _feed_episode("g2", "https://cdn.example/b.mp3", 2500, "B"),
+        _feed_episode("g3", "https://cdn.example/c.mp3", 3000, "C"),
+    )
+    date_changed = ids(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+    assert date_changed["A"] == first["A"]
+    assert date_changed["C"] == first["C"]
+    assert date_changed["B"] != first["B"]
+
+    holder["feed"] = _feed(
+        _feed_episode("g1", "https://cdn.example/a.mp3", 1000, "A"),
+        _feed_episode("g2", "https://cdn.example/b2.mp3", 2000, "B"),
+        _feed_episode("g3", "https://cdn.example/c.mp3", 3000, "C"),
+    )
+    url_changed = ids(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+    assert url_changed["B"] != first["B"]
+
+    holder["feed"] = _feed(
+        _feed_episode("g1", "https://cdn.example/a.mp3", 1000, "A"),
+        _feed_episode("g9", "https://cdn.example/b.mp3", 2000, "B"),
+        _feed_episode("g3", "https://cdn.example/c.mp3", 3000, "C"),
+    )
+    guid_changed = ids(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+    assert guid_changed["B"] != first["B"]
+
+
+async def test_available_selectors_are_podcast_scoped(
+    podcast_factory: Any,
+) -> None:
+    feed_episodes = _series_feed(3)
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): _podcast(),
+        ("GET", "/api/items/pod2"): _podcast("pod2"),
+        ("POST", "/api/podcasts/feed"): _feed(*feed_episodes),
+    }
+    transport, _ = _make_transport(routes)
+    client = podcast_factory(transport)
+
+    pod1 = await client.list_available_podcast_episodes("pod1")
+    pod2 = await client.list_available_podcast_episodes("pod2")
+    pod1_ids = [entry["id"] for entry in pod1["episodes"]]
+    pod2_ids = [entry["id"] for entry in pod2["episodes"]]
+    assert len(set(pod1_ids) & set(pod2_ids)) == 0
+
+    with pytest.raises(ABSInvalidRequest, match="Unknown or stale"):
+        await client.download_podcast_episodes("pod1", [pod2_ids[0]])
+
+
+@pytest.mark.parametrize("case", ["book", "unlisted"])
+async def test_available_rejects_other_scope_before_feed_fetch(
+    podcast_factory: Any, case: str
+) -> None:
+    item = _podcast()
+    if case == "book":
+        item["mediaType"] = "book"
+    else:
+        item["libraryId"] = "lib3"
+    routes: Routes = {("GET", "/api/items/pod1"): item}
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+
+    with pytest.raises(ABSNotAllowed) as raised:
+        await client.list_available_podcast_episodes("pod1")
+
+    assert str(raised.value) == "Podcast not found or not permitted."
+    assert _posts(requests, "/api/podcasts/feed") == []
+
+
+async def test_available_revalidates_stored_feed_url_before_fetch(
+    podcast_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transport, requests = _make_transport(
+        {("GET", "/api/items/pod1"): _podcast()}
+    )
+    client = podcast_factory(transport)
+
+    async def deny(url: str) -> str:
+        raise ABSInvalidRequest("Remote URL host is not publicly routable.")
+
+    monkeypatch.setattr(podcasts, "ensure_public_url", deny)
+
+    with pytest.raises(ABSInvalidRequest, match="publicly routable"):
+        await client.list_available_podcast_episodes("pod1")
+
+    assert _posts(requests, "/api/podcasts/feed") == []
+
+
+@pytest.mark.parametrize(
+    "feed_payload",
+    [
+        {"podcast": {"episodes": "nope"}},
+        {"podcast": {"episodes": [42]}},
+        {
+            "podcast": {
+                "episodes": [
+                    {
+                        "title": "x",
+                        "guid": "g",
+                        "publishedAt": 1,
+                        "enclosure": "not-a-dict",
+                    }
+                ]
+            }
+        },
+    ],
+)
+async def test_available_malformed_feed_is_generic(
+    podcast_factory: Any, feed_payload: dict[str, Any]
+) -> None:
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): _podcast(),
+        ("POST", "/api/podcasts/feed"): feed_payload,
+    }
+    transport, _ = _make_transport(routes)
+    client = podcast_factory(transport)
+
+    with pytest.raises(ABSResponseError) as raised:
+        await client.list_available_podcast_episodes("pod1")
+
+    assert str(raised.value) == "Audiobookshelf returned an unexpected response."
+
+
+async def test_available_ambiguous_downloaded_match_omits_native_id(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode(
+                "epA", 1000, guid="g", url="https://cdn.example/other.mp3"
+            ),
+            _episode("epB", 2000, guid="other", url="https://cdn.example/u.mp3"),
+        ]
+    )
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): item,
+        ("POST", "/api/podcasts/feed"): _feed(
+            _feed_episode("g", "https://cdn.example/u.mp3", 1000, "Both")
+        ),
+    }
+    transport, _ = _make_transport(routes)
+    client = podcast_factory(transport)
+
+    result = await client.list_available_podcast_episodes("pod1")
+
+    assert result["episodes"][0]["downloaded"] is True
+    assert "downloaded_episode_id" not in result["episodes"][0]
+
+
+async def test_available_matches_quoted_and_unquoted_enclosure_urls(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode(
+                "epDownloaded",
+                5000,
+                guid="g-downloaded",
+                url="https://cdn.example/a b.mp3",
+            )
+        ]
+    )
+    item["episodeDownloadsQueued"] = [
+        _queue_entry("g-queued", "https://cdn.example/b%20b.mp3")
+    ]
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): item,
+        ("POST", "/api/podcasts/feed"): _feed(
+            _feed_episode(
+                "g-feed-encoded",
+                "https://cdn.example/a%20b.mp3",
+                3000,
+                "Encoded",
+            ),
+            _feed_episode(
+                "g-feed-raw", "https://cdn.example/b b.mp3", 2000, "Raw"
+            ),
+            _feed_episode(
+                "g-feed-fresh", "https://cdn.example/c.mp3", 1000, "Fresh"
+            ),
+        ),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+
+    listing = await client.list_available_podcast_episodes("pod1", 50)
+    by_title = {entry["title"]: entry for entry in listing["episodes"]}
+    assert by_title["Encoded"]["downloaded"] is True
+    assert by_title["Encoded"]["downloaded_episode_id"] == "epDownloaded"
+    assert by_title["Encoded"]["queued"] is False
+    assert by_title["Raw"]["downloaded"] is False
+    assert by_title["Raw"]["queued"] is True
+    assert by_title["Fresh"]["downloaded"] is False
+    assert by_title["Fresh"]["queued"] is False
+
+    result = await client.download_podcast_episodes(
+        "pod1",
+        [
+            by_title["Encoded"]["id"],
+            by_title["Raw"]["id"],
+            by_title["Fresh"]["id"],
+        ],
+    )
+
+    assert result["selected_count"] == 3
+    assert result["queued_count"] == 1
+    assert result["skipped_count"] == 2
+    posts = _posts(requests, "/api/podcasts/pod1/download-episodes")
+    assert len(posts) == 1
+    assert [entry["title"] for entry in json.loads(posts[0].content)] == [
+        "Fresh"
+    ]
+
+
+async def test_available_pages_past_fifty_feed_entries(
+    podcast_factory: Any,
+) -> None:
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): _podcast(),
+        ("POST", "/api/podcasts/feed"): _feed(*_series_feed(60)),
+    }
+    transport, _ = _make_transport(routes)
+    client = podcast_factory(transport)
+
+    first = await client.list_available_podcast_episodes("pod1", 50)
+    second = await client.list_available_podcast_episodes(
+        "pod1", 50, offset=50
+    )
+
+    assert first["total"] == 60
+    assert first["count"] == 50
+    assert first["has_more"] is True
+    assert first["next_offset"] == 50
+    assert first["episodes"][0]["title"] == "Episode 60"
+    assert first["episodes"][-1]["title"] == "Episode 11"
+
+    assert second["count"] == 10
+    assert second["total"] == 60
+    assert second["has_more"] is False
+    assert second["next_offset"] is None
+    assert [entry["title"] for entry in second["episodes"]] == [
+        f"Episode {index}" for index in range(10, 0, -1)
+    ]
+    assert all(
+        FEED_ID_RE.fullmatch(entry["id"])
+        for entry in first["episodes"] + second["episodes"]
+    )
+
+
+async def test_available_search_and_page_bounds_never_reach_backend(
+    podcast_factory: Any,
+) -> None:
+    transport, requests = _make_transport({})
+    client = podcast_factory(transport)
+
+    for query in ("", "  ", "x" * 201, "bad\nquery", 5):
+        with pytest.raises(ABSInvalidRequest):
+            await client.list_available_podcast_episodes(
+                "pod1", query=query  # type: ignore[arg-type]
+            )
+    for order in ("Oldest", "", None, 1):
+        with pytest.raises(ABSInvalidRequest):
+            await client.list_available_podcast_episodes(
+                "pod1", order=order  # type: ignore[arg-type]
+            )
+    for offset in (-1, 100001, True, "0", 1.0):
+        with pytest.raises(ABSInvalidRequest):
+            await client.list_available_podcast_episodes(
+                "pod1", offset=offset  # type: ignore[arg-type]
+            )
+
+    assert requests == []
+
+
+# --- Selected episode deletion -------------------------------------------
+
+
+def _delete_handler(
+    item: dict[str, Any],
+    *,
+    fail: dict[str, httpx.Response] | None = None,
+    after: Callable[[str], None] | None = None,
+) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        episode_id = request.url.path.rsplit("/", 1)[-1]
+        if fail is not None and episode_id in fail:
+            return fail[episode_id]
+        item["media"]["episodes"] = [
+            episode
+            for episode in item["media"]["episodes"]
+            if episode["id"] != episode_id
+        ]
+        if after is not None:
+            after(episode_id)
+        return httpx.Response(204)
+
+    return handler
+
+
+def _delete_routes(
+    item: dict[str, Any],
+    episode_ids: list[str],
+    *,
+    fail: dict[str, httpx.Response] | None = None,
+    after: Callable[[str], None] | None = None,
+    podcast_id: str = "pod1",
+    library_id: str = "lib1",
+) -> Routes:
+    handler = _delete_handler(item, fail=fail, after=after)
+    routes: Routes = {
+        ("GET", f"/api/items/{podcast_id}"): lambda request: httpx.Response(
+            200, json=item
+        ),
+        ("GET", f"/api/libraries/{library_id}"): _podcast_library(library_id),
+    }
+    for episode_id in episode_ids:
+        routes[
+            ("DELETE", f"/api/podcasts/{podcast_id}/episode/{episode_id}")
+        ] = handler
+    return routes
+
+
+async def test_delete_selected_episodes_in_caller_order(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("ep1", 1000),
+            _episode("ep2", 2000),
+            _episode("ep3", 3000),
+        ]
+    )
+    routes = _delete_routes(item, ["ep1", "ep2", "ep3"])
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.delete_podcast_episodes(
+        "pod1",
+        ["ep2", "ep1", "ep3"],
+        expected_fingerprint=fingerprint,
+    )
+
+    assert result["podcast_id"] == "pod1"
+    assert result["status"] == "completed"
+    assert result["requested_count"] == 3
+    assert result["deleted_count"] == 3
+    assert result["deleted_episode_ids"] == ["ep2", "ep1", "ep3"]
+    assert result["filesystem_removal"] == "not_verified"
+    assert "may already have been applied" in result["note"]
+    assert "filesystem removal is not verified" in result["note"]
+
+    deletes = [
+        request for request in requests if request.method == "DELETE"
+    ]
+    assert [request.url.path for request in deletes] == [
+        "/api/podcasts/pod1/episode/ep2",
+        "/api/podcasts/pod1/episode/ep1",
+        "/api/podcasts/pod1/episode/ep3",
+    ]
+    assert all(request.url.params.get("hard") == "1" for request in deletes)
+    assert not any(
+        "/api/files" in path for _, path in _method_paths(requests)
+    )
+
+    rendered = json.dumps(result)
+    for forbidden in (
+        "cdn.example",
+        "/podcasts",
+        "fingerprint",
+        "http",
+        BACKEND_SECRET,
+    ):
+        assert forbidden not in rendered
+
+
+async def test_delete_selected_prevalidation_rejects_with_zero_deletes(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[_episode("ep1", 1000), _episode("ep2", 2000)]
+    )
+    routes = _delete_routes(item, ["ep1", "ep2"])
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    invalid: list[object] = [
+        [],
+        ["ep1", "ep1"],
+        [f"ep{index}" for index in range(26)],
+        ("ep1",),
+        [123],
+        [None],
+        [""],
+        ["a/b"],
+    ]
+    for episode_ids in invalid:
+        with pytest.raises(ABSInvalidRequest):
+            await client.delete_podcast_episodes(
+                "pod1",
+                episode_ids,  # type: ignore[arg-type]
+                expected_fingerprint=fingerprint,
+            )
+
+    with pytest.raises(ABSNotFound, match="episode not found"):
+        await client.delete_podcast_episodes(
+            "pod1", ["ep9"], expected_fingerprint=fingerprint
+        )
+    with pytest.raises(ABSNotFound, match="episode not found"):
+        await client.delete_podcast_episodes(
+            "pod1",
+            ["feed_" + "a" * 64],
+            expected_fingerprint=fingerprint,
+        )
+
+    assert not any(request.method == "DELETE" for request in requests)
+
+
+async def test_delete_selected_refuses_active_queue_and_stale_fingerprint(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(episodes=[_episode("ep1", 1000)])
+    item["episodeDownloadsQueued"] = [
+        _queue_entry("gx", "https://cdn.example/x.mp3")
+    ]
+    routes = _delete_routes(item, ["ep1"])
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    with pytest.raises(ABSResponseError, match="queued or active"):
+        await client.delete_podcast_episodes(
+            "pod1", ["ep1"], expected_fingerprint=fingerprint
+        )
+
+    item.pop("episodeDownloadsQueued")
+    with pytest.raises(ABSInvalidRequest, match="retry with current settings"):
+        await client.delete_podcast_episodes(
+            "pod1", ["ep1"], expected_fingerprint="0" * 64
+        )
+
+    assert not any(request.method == "DELETE" for request in requests)
+
+
+@pytest.mark.parametrize("case", ["episode-path", "item-path"])
+async def test_delete_selected_prevalidates_all_paths_before_first_delete(
+    podcast_factory: Any, case: str
+) -> None:
+    episodes = [_episode("ep1", 1000), _episode("ep2", 2000)]
+    item = _podcast(episodes=episodes)
+    if case == "episode-path":
+        episodes[1]["audioFile"] = {
+            "metadata": {"path": "/podcasts/other/evil.mp3"}
+        }
+    else:
+        item["path"] = "/podcasts"
+
+    routes = _delete_routes(item, ["ep1", "ep2"])
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    with pytest.raises(ABSResponseError, match="not safe to delete"):
+        await client.delete_podcast_episodes(
+            "pod1", ["ep1", "ep2"], expected_fingerprint=fingerprint
+        )
+
+    assert not any(request.method == "DELETE" for request in requests)
+
+
+async def test_delete_selected_stops_on_first_failure_without_retry(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("ep1", 1000),
+            _episode("ep2", 2000),
+            _episode("ep3", 3000),
+        ]
+    )
+    routes = _delete_routes(
+        item,
+        ["ep1", "ep2", "ep3"],
+        fail={"ep2": httpx.Response(500, text=BACKEND_SECRET)},
+    )
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.delete_podcast_episodes(
+        "pod1", ["ep1", "ep2", "ep3"], expected_fingerprint=fingerprint
+    )
+
+    assert result["status"] == "partial"
+    assert result["requested_count"] == 3
+    assert result["deleted_count"] == 1
+    assert result["deleted_episode_ids"] == ["ep1"]
+    assert result["failed_episode_id"] == "ep2"
+    assert "unavailable" in result["error"]
+    assert result["filesystem_removal"] == "not_verified"
+    assert "may already have been applied" in result["note"]
+    assert BACKEND_SECRET not in json.dumps(result)
+
+    deletes = [
+        request for request in requests if request.method == "DELETE"
+    ]
+    assert [request.url.path for request in deletes] == [
+        "/api/podcasts/pod1/episode/ep1",
+        "/api/podcasts/pod1/episode/ep2",
+    ]
+
+
+async def test_delete_selected_ambiguous_oversize_failure_is_not_retried(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(episodes=[_episode("ep1", 1000)])
+    oversized = b'{"episode": "' + b"z" * (4 * 1024 * 1024 + 1) + b'"}'
+    routes = _delete_routes(
+        item,
+        ["ep1"],
+        fail={
+            "ep1": httpx.Response(
+                200,
+                content=oversized,
+                headers={"Content-Type": "application/json"},
+            )
+        },
+    )
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.delete_podcast_episodes(
+        "pod1", ["ep1"], expected_fingerprint=fingerprint
+    )
+
+    assert result["status"] == "partial"
+    assert result["deleted_count"] == 0
+    assert result["deleted_episode_ids"] == []
+    assert result["failed_episode_id"] == "ep1"
+    assert "size limit" in result["error"]
+    assert "zzzz" not in json.dumps(result)
+    deletes = [
+        request for request in requests if request.method == "DELETE"
+    ]
+    assert len(deletes) == 1
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("policy", "changed during deletion"),
+        ("queue", "queued or active"),
+        ("item-path", "changed during deletion"),
+    ],
+)
+async def test_delete_selected_detects_external_change_after_first_ack(
+    podcast_factory: Any, case: str, message: str
+) -> None:
+    item = _podcast(
+        episodes=[_episode("ep1", 1000), _episode("ep2", 2000)]
+    )
+
+    def after(episode_id: str) -> None:
+        if case == "policy":
+            item["media"]["maxEpisodesToKeep"] = 7
+        elif case == "queue":
+            item["episodesDownloading"] = [
+                _queue_entry("gx", "https://cdn.example/x.mp3")
+            ]
+        else:
+            item["path"] = "/podcasts/other"
+
+    routes = _delete_routes(item, ["ep1", "ep2"], after=after)
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.delete_podcast_episodes(
+        "pod1", ["ep1", "ep2"], expected_fingerprint=fingerprint
+    )
+
+    assert result["status"] == "partial"
+    assert result["deleted_count"] == 1
+    assert result["deleted_episode_ids"] == ["ep1"]
+    assert result["failed_episode_id"] == "ep2"
+    assert message in result["error"]
+    assert "fingerprint" not in json.dumps(result)
+    deletes = [
+        request for request in requests if request.method == "DELETE"
+    ]
+    assert len(deletes) == 1
+
+
+async def test_delete_selected_late_unsafe_path_reports_partial_honestly(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[_episode("ep1", 1000), _episode("ep2", 2000)]
+    )
+    library_reads = 0
+
+    def library_route(request: httpx.Request) -> httpx.Response:
+        nonlocal library_reads
+        library_reads += 1
+        payload = _podcast_library("lib1")
+        if library_reads >= 3:
+            # Same folder ID and unchanged item path, but the folder root
+            # moved between the two per-target revalidations.
+            payload["folders"] = [
+                {
+                    "id": "folder1",
+                    "fullPath": "/different-root",
+                    "libraryId": "lib1",
+                }
+            ]
+        return httpx.Response(200, json=payload)
+
+    handler = _delete_handler(item)
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): lambda request: httpx.Response(
+            200, json=item
+        ),
+        ("GET", "/api/libraries/lib1"): library_route,
+        ("DELETE", "/api/podcasts/pod1/episode/ep1"): handler,
+        ("DELETE", "/api/podcasts/pod1/episode/ep2"): handler,
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.delete_podcast_episodes(
+        "pod1", ["ep1", "ep2"], expected_fingerprint=fingerprint
+    )
+
+    assert result["status"] == "partial"
+    assert result["requested_count"] == 2
+    assert result["deleted_count"] == 1
+    assert result["deleted_episode_ids"] == ["ep1"]
+    assert result["failed_episode_id"] == "ep2"
+    assert "this target was not deleted" in result["error"]
+    assert "Earlier acknowledged deletions" in result["error"]
+    assert "no files were changed" not in result["error"]
+    assert result["filesystem_removal"] == "not_verified"
+    assert library_reads == 3
+
+    deletes = [
+        request for request in requests if request.method == "DELETE"
+    ]
+    assert [request.url.path for request in deletes] == [
+        "/api/podcasts/pod1/episode/ep1"
+    ]
+    assert [episode["id"] for episode in item["media"]["episodes"]] == [
+        "ep2"
+    ]
+
+
+async def test_delete_selected_rejects_changed_safe_episode_path(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[_episode("ep1", 1000), _episode("ep2", 2000)]
+    )
+
+    def after(episode_id: str) -> None:
+        if episode_id != "ep1":
+            return
+        for episode in item["media"]["episodes"]:
+            if episode["id"] == "ep2":
+                # Same native ID, same safe item directory, different file.
+                episode["audioFile"] = {
+                    "metadata": {"path": "/podcasts/pod1/renamed.mp3"}
+                }
+
+    routes = _delete_routes(item, ["ep1", "ep2"], after=after)
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.delete_podcast_episodes(
+        "pod1", ["ep1", "ep2"], expected_fingerprint=fingerprint
+    )
+
+    assert result["status"] == "partial"
+    assert result["deleted_count"] == 1
+    assert result["deleted_episode_ids"] == ["ep1"]
+    assert result["failed_episode_id"] == "ep2"
+    assert "changed during deletion" in result["error"]
+    deletes = [
+        request for request in requests if request.method == "DELETE"
+    ]
+    assert [request.url.path for request in deletes] == [
+        "/api/podcasts/pod1/episode/ep1"
+    ]
+
+
+async def test_delete_selected_rejects_ambiguous_duplicate_native_rows(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[_episode("ep1", 1000), _episode("ep1", 2000)]
+    )
+    routes = _delete_routes(item, ["ep1"])
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    with pytest.raises(ABSResponseError, match="ambiguous"):
+        await client.delete_podcast_episodes(
+            "pod1", ["ep1"], expected_fingerprint=fingerprint
+        )
+
+    assert not any(request.method == "DELETE" for request in requests)
+
+
+async def test_delete_selected_allows_distinct_ids_sharing_feed_identity(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode(
+                "epA", 1000, guid="same", url="https://cdn.example/same.mp3"
+            ),
+            _episode(
+                "epB", 2000, guid="same", url="https://cdn.example/same.mp3"
+            ),
+        ]
+    )
+    routes = _delete_routes(item, ["epA", "epB"])
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.delete_podcast_episodes(
+        "pod1", ["epA"], expected_fingerprint=fingerprint
+    )
+
+    assert result["status"] == "completed"
+    assert result["deleted_episode_ids"] == ["epA"]
+    deletes = [
+        request for request in requests if request.method == "DELETE"
+    ]
+    assert [request.url.path for request in deletes] == [
+        "/api/podcasts/pod1/episode/epA"
+    ]
+    assert [episode["id"] for episode in item["media"]["episodes"]] == [
+        "epB"
+    ]
+
+
+async def test_new_podcast_mutations_require_writes_enabled(
+    podcast_factory: Any,
+) -> None:
+    transport, requests = _make_transport({})
+    client = podcast_factory(transport, writes=False)
+    anchor = "feed_" + "a" * 64
+
+    calls = [
+        lambda: client.download_podcast_episodes("pod1", [anchor]),
+        lambda: client.download_episodes_from("pod1", anchor, 5),
+        lambda: client.delete_podcast_episodes(
+            "pod1", ["ep1"], expected_fingerprint="f" * 64
+        ),
+    ]
+    for call in calls:
+        with pytest.raises(ABSNotAllowed, match="disabled"):
+            await call()
+
+    assert requests == []
