@@ -16,3 +16,17 @@ updates:
     directory: "/mcpo"
     schedule:
       interval: "weekly"
+  # Audiobookshelf MCP: uv.lock + pyproject.toml. `uv` is a supported
+  # Dependabot ecosystem; review PRs manually (no automerge).
+  - package-ecosystem: "uv"
+    directory: "/audiobookshelf-mcp"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "docker"
+    directory: "/audiobookshelf-mcp"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

@@ -5,3 +5,10 @@ terminal/
 *.env
 __pycache__/
 mcpo/config.json
+
+# audiobookshelf-mcp local tooling artifacts
+audiobookshelf-mcp/.venv/
+audiobookshelf-mcp/.pytest_cache/
+
+# Playwright agent artifacts (see AGENTS.md)
+.playwright-out/

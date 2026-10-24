@@ -1,0 +1,111 @@
+# CI for the Audiobookshelf MCP service (read-only foundation).
+#
+# Runs the locked test suite, audits locked runtime dependencies, and builds the
+# local service image for a vulnerability scan. Nothing is published, no
+# repository secrets are used, and dependency PRs are reviewed manually.
+name: audiobookshelf-mcp
+
+on:
+  pull_request:
+    paths:
+      - "audiobookshelf-mcp/**"
+      - ".github/workflows/audiobookshelf-mcp.yml"
+      - ".github/dependabot.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "audiobookshelf-mcp/**"
+      - ".github/workflows/audiobookshelf-mcp.yml"
+      - ".github/dependabot.yml"
+  schedule:
+    # Weekly re-scan of unchanged sources for newly disclosed issues.
+    - cron: "19 4 * * 1"
+  workflow_dispatch:
+
+# Least privilege: no job needs more than read access to the repository.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: audiobookshelf-mcp
+
+jobs:
+  test:
+    name: Tests (Python 3.14)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.12.1"
+          python-version: "3.14"
+      - name: Sync locked dependencies
+        run: uv sync --frozen
+      - name: Run tests
+        run: uv run --frozen pytest
+
+  dependency-audit:
+    name: Dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.12.1"
+          python-version: "3.14"
+      - name: Export locked runtime requirements
+        run: >-
+          uv export --frozen --no-dev --no-emit-project --no-hashes
+          --format requirements-txt
+          --output-file "$RUNNER_TEMP/requirements.txt"
+      - name: Audit locked runtime dependencies
+        # Exact scanner pin; `uvx` fetches it from PyPI at run time.
+        run: >-
+          uvx --python 3.14 pip-audit==2.10.1 --strict --progress-spinner off
+          --no-deps --disable-pip
+          --requirement "$RUNNER_TEMP/requirements.txt"
+
+  container:
+    name: Container build and image scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build image from the service Dockerfile
+        run: docker build --tag audiobookshelf-mcp:ci .
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: audiobookshelf-mcp:ci
+          version: "v0.76.1" # Trivy binary version, pinned explicitly
+          scanners: "vuln"
+          severity: "HIGH,CRITICAL"
+          # Fail only on findings that already have a fixed version. Unfixed
+          # findings are excluded from these results and must be triaged
+          # separately; they never block this gate.
+          ignore-unfixed: true
+          exit-code: "1"
+          vuln-type: "os,library"
+          hide-progress: true
+          timeout: "10m"
