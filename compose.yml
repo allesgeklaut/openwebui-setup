@@ -1,6 +1,6 @@
 services:
   open-webui:
-    image: ghcr.io/open-webui/open-webui:v0.12.3
+    image: ghcr.io/open-webui/open-webui:v0.12.4
     container_name: open-webui
     restart: unless-stopped
     ports:
@@ -226,10 +226,53 @@ services:
       - searxng-valkey-data:/data
     # internal only — no port exposure needed
 
+  # Audiobookshelf MCP connector (built from ./audiobookshelf-mcp).
+  # Speaks authenticated Streamable HTTP for OpenWebUI only. No published port.
+  # Podcast write tools are enabled after user-confirmed read-only verification.
+  audiobookshelf-mcp:
+    build: ./audiobookshelf-mcp
+    image: audiobookshelf-mcp:local
+    container_name: audiobookshelf-mcp
+    restart: unless-stopped
+    # Run as the host user (1000:1000) so user-owned secret files
+    # can be 0600 instead of world-readable. The image's own default remains
+    # 10001:10001 in audiobookshelf-mcp/Dockerfile.
+    user: "1000:1000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - ABS_URL=http://audiobookshelf:13378
+      - ABS_ALLOWED_LIBRARY_IDS=${ABS_ALLOWED_LIBRARY_IDS:?Set ABS_ALLOWED_LIBRARY_IDS in your local .env}
+      - ABS_API_KEY_FILE=/run/secrets/abs_api_key
+      - MCP_AUTH_TOKEN_FILE=/run/secrets/mcp_token
+      - ABS_ENABLE_PODCAST_WRITES=true
+      # Operator assertion only: must match Audiobookshelf's own configured
+      # server time zone (verified natively in the ABS container). This is not
+      # the connector container's local zone, and it does not change ABS.
+      - ABS_SERVER_TIMEZONE=Europe/Vienna
+    volumes:
+      - /opt/secrets/audiobookshelf-mcp/abs_api_key:/run/secrets/abs_api_key:ro
+      - /opt/secrets/audiobookshelf-mcp/mcp_token:/run/secrets/mcp_token:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket;socket.create_connection(('127.0.0.1',8000),2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - default
+      - audiobookshelf
+
 networks:
   default:
   stacks-shared:
     external: true
+  audiobookshelf:
+    external: true
+    name: audiobookshelf_default
 
 volumes:
   searxng-valkey-data:
