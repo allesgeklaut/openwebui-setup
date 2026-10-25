@@ -357,9 +357,10 @@ delete_podcast_episodes and delete_podcast_episode accept only native
 downloaded episode IDs returned by list_podcast_episodes;
 delete_finished_podcast_episodes takes only a native podcast ID and a limit and
 hard-deletes at most limit downloaded episodes the connector account marked
-finished, oldest first, rechecking finished status before each delete and
-skipping episodes that changed; delete_podcast deletes a whole podcast by its
-podcast ID. Never use one ID type for the other.
+finished, oldest first, rechecking progress before each delete: a missing or
+newly unfinished progress record skips only that episode, while any other
+change or failure stops the batch with a partial result. delete_podcast deletes
+a whole podcast by its podcast ID. Never use one ID type for the other.
 
 download_episodes_from uses a fixed, inclusive window: the anchor episode plus
 the next count-1 episodes in publication order, skipping episodes that are

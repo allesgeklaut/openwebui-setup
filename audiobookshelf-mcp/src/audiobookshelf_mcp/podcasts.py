@@ -1013,12 +1013,14 @@ class PodcastClient(ABSClient):
         API-key account progress joined to the downloaded episodes, oldest
         ``publishedAt`` first with undated episodes last. Every target is
         prevalidated like a selected multi-delete, then its progress record is
-        re-read immediately before its DELETE. A record that vanished (404) or
-        is no longer strictly finished skips only that target with a fixed
-        reason and does not stop the batch; any other failure stops the run with
-        the honest partial count. There is no rollback and no retry, filesystem
-        removal is not verified, and progress can change between the recheck
-        and the DELETE, so the remaining count is a snapshot estimate.
+        re-read immediately before its DELETE and must name this podcast and
+        this episode with a strict boolean finished flag. A record that vanished
+        (404) or is valid and no longer strictly finished skips only that target
+        with a fixed reason and does not stop the batch; any other failure,
+        including a malformed recheck record, stops the run with the honest
+        partial count. There is no rollback and no retry, filesystem removal is
+        not verified, and progress can change between the recheck and the
+        DELETE, so the remaining count is a snapshot estimate.
         """
         self._require_writes_enabled()
         if type(limit) is not int or not 1 <= limit <= MAX_SELECTED_EPISODES:
@@ -1662,11 +1664,15 @@ class PodcastClient(ABSClient):
         """Delete targets whose finished status survives a fresh recheck.
 
         The shared per-DELETE fence runs first and is unchanged. A fresh
-        per-episode progress read then decides: a missing record or a record
-        that is no longer strictly finished skips only that target and the batch
-        continues, because the safety condition was never met for it. Any other
-        failure — including the fence, the progress read, or the DELETE — stops
-        the batch with the honest partial count; nothing is retried.
+        per-episode progress read then decides. The URL scopes that read but
+        does not prove identity, so the record must name this podcast and this
+        episode and carry a strict boolean ``isFinished``, exactly like the bulk
+        progress join, or the batch fails closed with the unexpected-response
+        error before the flag is honored. Only a missing record (404) or a
+        validated record that is no longer strictly finished skips that target;
+        the batch continues. Every other failure — the fence, the progress read,
+        or the DELETE — stops the batch with the honest partial count. Nothing
+        is retried.
         """
         deleted: list[str] = []
         skipped: list[dict[str, str]] = []
@@ -1689,6 +1695,16 @@ class PodcastClient(ABSClient):
                 break
             try:
                 record = await self._fetch_episode_progress(podcast_id, target)
+                # The request path scopes the read but does not prove the
+                # record's identity, so require the same identity the bulk
+                # progress join requires before honoring the finished flag.
+                # A malformed record is an unexpected response, never a skip.
+                if (
+                    record.get("libraryItemId") != podcast_id
+                    or record.get("episodeId") != target
+                    or type(record.get("isFinished")) is not bool
+                ):
+                    raise ABSResponseError(_UNEXPECTED)
             except ABSNotFound:
                 skipped.append({"id": target, "reason": _PROGRESS_RECORD_MISSING})
                 continue

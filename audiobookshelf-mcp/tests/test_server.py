@@ -2212,6 +2212,90 @@ async def test_delete_finished_podcast_episodes_uses_internal_state_fence(
     )
 
 
+async def test_delete_finished_podcast_episodes_recheck_identity_mismatch_sanitized(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+    backend.media_progress = [_finished_progress("ep1")]
+    # The route returns ep1's record for ep1, so a record naming another
+    # episode is an identity mismatch, not a scoping artifact.
+    backend.episode_progress_overrides["ep1"] = httpx.Response(
+        200, json=_finished_progress("ep2")
+    )
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "delete_finished_podcast_episodes", {"podcast_id": "pod1"}
+        )
+
+    assert result.isError is not True
+    payload = _tool_payload(result)
+    assert payload["status"] == "partial"
+    assert payload["deleted_count"] == 0
+    assert payload["deleted_episode_ids"] == []
+    assert payload["skipped"] == []
+    assert payload["failed_episode_id"] == "ep1"
+    assert payload["error"] == "Audiobookshelf returned an unexpected response."
+    text = json.dumps(payload)
+    for forbidden in (
+        BACKEND_LEAK,
+        BACKEND_API_KEY,
+        "abs.test",
+        "private",
+        "http",
+        "fingerprint",
+    ):
+        assert forbidden not in text
+    assert not any(
+        request.method == "DELETE" for request in backend.requests
+    )
+    assert [
+        request.url.path
+        for request in backend.requests
+        if request.url.path.startswith("/api/me/progress/pod1/")
+    ] == ["/api/me/progress/pod1/ep1"]
+
+
+async def test_delete_finished_podcast_episodes_malformed_progress_tool_error_sanitized(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+    # A bulk row for this podcast with a non-boolean flag fails before any
+    # selection, so the whole call surfaces one sanitized tool error.
+    backend.media_progress = [
+        {"libraryItemId": "pod1", "episodeId": "ep1", "isFinished": 1}
+    ]
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "delete_finished_podcast_episodes", {"podcast_id": "pod1"}
+        )
+
+    assert result.isError is True
+    text = _error_text(result)
+    assert "unexpected response" in text
+    for forbidden in (
+        BACKEND_LEAK,
+        BACKEND_API_KEY,
+        "abs.test",
+        "private",
+        "http",
+        "fingerprint",
+    ):
+        assert forbidden not in text
+    assert not any(
+        request.method == "DELETE" for request in backend.requests
+    )
+    assert not any(
+        request.url.path.startswith("/api/me/progress/pod1/")
+        for request in backend.requests
+    )
+
+
 async def test_new_podcast_tools_still_require_a_valid_bearer_token(
     config_factory: Callable[..., Config],
 ) -> None:
