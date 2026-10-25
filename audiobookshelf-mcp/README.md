@@ -521,6 +521,11 @@ Audiobookshelf zone; that setting is committed in `0d15a14` and active in the
 running connector. It remains reporting metadata only: it does not change the
 Audiobookshelf zone, and unset still means `null`/unknown.
 
+The root Compose service reads `ABS_ALLOWED_LIBRARY_IDS` from the local,
+gitignored `.env` and fails configuration validation when it is empty or unset.
+Copy the placeholder from `.env.example` and replace it with your own native
+library IDs. The tracked Compose file contains no deployment-specific library ID.
+
 ### Credentials and permissions
 
 The Audiobookshelf API key inherits the permissions of its owning user; it is

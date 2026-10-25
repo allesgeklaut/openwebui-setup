@@ -245,7 +245,7 @@ services:
       - no-new-privileges:true
     environment:
       - ABS_URL=http://audiobookshelf:13378
-      - ABS_ALLOWED_LIBRARY_IDS=9d99120c-273d-4e10-a6bb-11a43aab88f0
+      - ABS_ALLOWED_LIBRARY_IDS=${ABS_ALLOWED_LIBRARY_IDS:?Set ABS_ALLOWED_LIBRARY_IDS in your local .env}
       - ABS_API_KEY_FILE=/run/secrets/abs_api_key
       - MCP_AUTH_TOKEN_FILE=/run/secrets/mcp_token
       - ABS_ENABLE_PODCAST_WRITES=true
