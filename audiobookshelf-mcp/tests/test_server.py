@@ -580,6 +580,7 @@ WRITE_TOOL_NAMES = {
     "set_podcast_retention",
     "delete_podcast_episode",
     "delete_podcast_episodes",
+    "delete_finished_podcast_episodes",
     "delete_podcast",
 }
 BACKEND_LEAK = "private-backend-body"
@@ -689,6 +690,32 @@ def _book_item() -> dict[str, Any]:
     }
 
 
+def _finished_progress(
+    episode_id: str,
+    *,
+    is_finished: object = True,
+    current_time: object = 0,
+    library_item_id: str = "pod1",
+) -> dict[str, Any]:
+    """Build one synthetic connector-account progress record."""
+    return {
+        "id": f"progress-{library_item_id}-{episode_id}",
+        "userId": "connector-user",
+        "libraryItemId": library_item_id,
+        "episodeId": episode_id,
+        "mediaItemId": library_item_id,
+        "mediaItemType": "podcastEpisode",
+        "duration": 600,
+        "progress": 0,
+        "currentTime": current_time,
+        "isFinished": is_finished,
+        "hideFromContinueListening": False,
+        "finishedAt": 0,
+        "lastUpdate": 2000,
+        "createdAt": 1000,
+    }
+
+
 class _PodcastBackend(httpx.MockTransport):
     """Synthetic backend for the fixed Audiobookshelf podcast endpoints."""
 
@@ -756,6 +783,8 @@ class _PodcastBackend(httpx.MockTransport):
         self.fail_download_post = False
         self.fail_second_episode_delete = False
         self.episode_delete_calls = 0
+        self.media_progress: list[dict[str, Any]] = []
+        self.episode_progress_overrides: dict[str, httpx.Response] = {}
         super().__init__(self.__call__)
 
     def _backend_error(self) -> httpx.Response:
@@ -769,6 +798,12 @@ class _PodcastBackend(httpx.MockTransport):
         method = request.method
         path = request.url.path
 
+        if method == "GET" and path == "/api/me/progress":
+            return httpx.Response(
+                200, json={"mediaProgress": copy.deepcopy(self.media_progress)}
+            )
+        if method == "GET" and path.startswith("/api/me/progress/"):
+            return self._read_episode_progress(path)
         if method == "GET" and path.startswith("/api/items/"):
             return self._read_item(path.rsplit("/", 1)[-1])
         if method == "GET" and path == "/api/libraries":
@@ -883,6 +918,19 @@ class _PodcastBackend(httpx.MockTransport):
                 item["media"]["autoDownloadEpisodes"] = True
         return httpx.Response(200, json=copy.deepcopy(item))
 
+    def _read_episode_progress(self, path: str) -> httpx.Response:
+        _, _, _, _, item_id, episode_id = path.split("/")
+        override = self.episode_progress_overrides.get(episode_id)
+        if override is not None:
+            return override
+        for record in self.media_progress:
+            if (
+                record.get("libraryItemId") == item_id
+                and record.get("episodeId") == episode_id
+            ):
+                return httpx.Response(200, json=copy.deepcopy(record))
+        return httpx.Response(404, json={"error": "not found"})
+
 
 @asynccontextmanager
 async def _mcp_session(
@@ -920,7 +968,7 @@ async def test_write_mode_registers_exactly_read_and_podcast_tools(
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
 
     assert set(tools) == READ_TOOL_NAMES | WRITE_TOOL_NAMES
-    assert len(tools) == 16
+    assert len(tools) == 17
     for name, tool in tools.items():
         assert tool.inputSchema["additionalProperties"] is False, name
         properties = tool.inputSchema["properties"]
@@ -985,6 +1033,7 @@ async def test_write_mode_registers_exactly_read_and_podcast_tools(
         "delete_podcast",
         "delete_podcast_episode",
         "delete_podcast_episodes",
+        "delete_finished_podcast_episodes",
         "set_podcast_retention",
         "set_podcast_schedule",
     ):
@@ -1036,6 +1085,15 @@ async def test_write_mode_registers_exactly_read_and_podcast_tools(
     assert tools["set_podcast_schedule"].inputSchema["properties"]["enabled"][
         "type"
     ] == "boolean"
+
+    finished_delete = tools["delete_finished_podcast_episodes"].inputSchema[
+        "properties"
+    ]
+    assert set(finished_delete) == {"podcast_id", "limit"}
+    assert finished_delete["limit"]["minimum"] == 1
+    assert finished_delete["limit"]["maximum"] == 25
+    assert finished_delete["limit"]["default"] == 25
+    assert finished_delete["limit"]["description"]
 
 
 async def test_write_mode_is_stateless_and_deletes_directly(
@@ -1192,6 +1250,10 @@ async def test_list_podcast_episodes_returns_newest_safe_metadata(
     config_factory: Callable[..., Config],
 ) -> None:
     backend = _PodcastBackend()
+    backend.media_progress = [
+        _finished_progress("ep2"),
+        _finished_progress("ep1", is_finished=False, current_time=30.5),
+    ]
 
     async with _mcp_session(
         config_factory(podcast_writes_enabled=True), backend
@@ -1218,7 +1280,16 @@ async def test_list_podcast_episodes_returns_newest_safe_metadata(
             "title",
             "published_at",
             "duration_seconds",
+            "listening_status",
         }
+    assert {
+        episode["id"]: episode["listening_status"]
+        for episode in payload["episodes"]
+    } == {
+        "ep2": "finished",
+        "ep3": "not_started",
+        "ep1": "in_progress",
+    }
     assert "http" not in json.dumps(payload)
 
     limited_payload = _tool_payload(limited)
@@ -1311,6 +1382,7 @@ async def test_list_podcast_episodes_supports_query_order_paging_and_undated_las
     assert undated_payload["episodes"][0]["id"] == "ep4"
     assert undated_payload["episodes"][0]["published_at"] is None
     assert undated_payload["episodes"][0]["duration_seconds"] == 30
+    assert undated_payload["episodes"][0]["listening_status"] == "not_started"
     assert "http" not in json.dumps(newest_payload)
 
 
@@ -2015,6 +2087,131 @@ async def test_delete_podcast_episodes_uses_internal_state_fence(
     )
 
 
+async def test_delete_finished_podcast_episodes_deletes_account_finished(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+    backend.media_progress = [
+        _finished_progress("ep1"),
+        _finished_progress("ep2", is_finished=False, current_time=60),
+        # Rows for other library items are ignored, never returned.
+        _finished_progress("book1", library_item_id="book1"),
+    ]
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "delete_finished_podcast_episodes", {"podcast_id": "pod1"}
+        )
+
+    assert result.isError is not True
+    payload = _tool_payload(result)
+    assert payload["podcast_id"] == "pod1"
+    assert payload["status"] == "completed"
+    assert payload["requested_count"] == 1
+    assert payload["deleted_count"] == 1
+    assert payload["deleted_episode_ids"] == ["ep1"]
+    assert payload["skipped"] == []
+    assert payload["skipped_episode_ids"] == []
+    assert payload["finished_episode_count"] == 1
+    assert payload["remaining_finished_count"] == 0
+    assert payload["limit"] == 25
+    assert payload["filesystem_removal"] == "not_verified"
+    assert "fingerprint" not in json.dumps(payload)
+    assert "connector-user" not in json.dumps(payload)
+    assert "http" not in json.dumps(payload)
+
+    deletes = [
+        request for request in backend.requests if request.method == "DELETE"
+    ]
+    assert [
+        (request.url.path, request.url.params["hard"]) for request in deletes
+    ] == [("/api/podcasts/pod1/episode/ep1", "1")]
+    assert (
+        len(
+            [
+                request
+                for request in backend.requests
+                if request.url.path == "/api/me/progress"
+            ]
+        )
+        == 1
+    )
+    assert [
+        request.url.path
+        for request in backend.requests
+        if request.url.path.startswith("/api/me/progress/pod1/")
+    ] == ["/api/me/progress/pod1/ep1"]
+
+
+async def test_delete_finished_podcast_episodes_projects_skip_reasons(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+    backend.media_progress = [
+        _finished_progress("ep1"),
+        _finished_progress("ep3"),
+    ]
+    backend.episode_progress_overrides["ep1"] = httpx.Response(
+        200, json=_finished_progress("ep1", is_finished=False)
+    )
+    backend.episode_progress_overrides["ep3"] = httpx.Response(
+        404, json={"error": "not found"}
+    )
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "delete_finished_podcast_episodes",
+            {"podcast_id": "pod1", "limit": 2},
+        )
+
+    assert result.isError is not True
+    payload = _tool_payload(result)
+    assert payload["status"] == "completed"
+    assert payload["requested_count"] == 2
+    assert payload["deleted_count"] == 0
+    assert payload["deleted_episode_ids"] == []
+    assert payload["skipped"] == [
+        {"id": "ep1", "reason": "finished_flag_cleared"},
+        {"id": "ep3", "reason": "progress_record_missing"},
+    ]
+    assert payload["skipped_episode_ids"] == ["ep1", "ep3"]
+    assert payload["finished_episode_count"] == 2
+    assert payload["remaining_finished_count"] == 0
+    assert "failed_episode_id" not in payload
+    assert not any(
+        request.method == "DELETE" for request in backend.requests
+    )
+
+
+async def test_delete_finished_podcast_episodes_uses_internal_state_fence(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend(stale_on_read=2)
+    backend.media_progress = [_finished_progress("ep1")]
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "delete_finished_podcast_episodes", {"podcast_id": "pod1"}
+        )
+
+    assert result.isError is True
+    assert "Podcast changed" in _error_text(result)
+    assert "fingerprint" not in _error_text(result)
+    assert not any(
+        request.method == "DELETE" for request in backend.requests
+    )
+    assert not any(
+        request.url.path.startswith("/api/me/progress")
+        for request in backend.requests
+    )
+
+
 async def test_new_podcast_tools_still_require_a_valid_bearer_token(
     config_factory: Callable[..., Config],
 ) -> None:
@@ -2081,6 +2278,14 @@ async def test_new_tools_reject_foreign_and_nonpodcast_items_before_mutation(
         (
             "delete_podcast_episodes",
             {"podcast_id": "book1", "episode_ids": ["ep1"]},
+        ),
+        (
+            "delete_finished_podcast_episodes",
+            {"podcast_id": "pod2"},
+        ),
+        (
+            "delete_finished_podcast_episodes",
+            {"podcast_id": "book1"},
         ),
     )
 
@@ -2750,6 +2955,17 @@ async def test_write_tool_argument_bounds_are_strict_and_never_reach_backend(
             "delete_podcast_episodes",
             {"podcast_id": "pod1", "episode_ids": [True]},
         ),
+        ("delete_finished_podcast_episodes", {"podcast_id": "pod1", "limit": 0}),
+        ("delete_finished_podcast_episodes", {"podcast_id": "pod1", "limit": 26}),
+        (
+            "delete_finished_podcast_episodes",
+            {"podcast_id": "pod1", "limit": True},
+        ),
+        (
+            "delete_finished_podcast_episodes",
+            {"podcast_id": "pod1", "limit": 1.0},
+        ),
+        ("delete_finished_podcast_episodes", {"podcast_id": "bad/id"}),
         ("download_latest_episodes", {"podcast_id": "pod1", "count": 0}),
         ("download_latest_episodes", {"podcast_id": "pod1", "count": 26}),
         ("download_latest_episodes", {"podcast_id": "pod1", "count": True}),
@@ -3045,6 +3261,46 @@ async def test_write_instructions_preserve_omitted_schedule_semantics(
     assert "An omitted or empty schedule defaults" not in instructions
 
 
+async def test_write_descriptions_document_finished_delete_and_listening_status(
+    config_factory: Callable[..., Config],
+) -> None:
+    config = config_factory(podcast_writes_enabled=True)
+
+    async with _mcp_session(config, _PodcastBackend()) as session:
+        tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+
+    finished = tools["delete_finished_podcast_episodes"].description
+    for phrase in (
+        "1-25",
+        "default 25",
+        "finished",
+        "oldest",
+        "rechecked",
+        "skipped",
+        "partial",
+        "nothing is retried",
+        "filesystem removal is not verified",
+        "remaining_finished_count",
+        "podcast ID only",
+    ):
+        assert phrase in finished, phrase
+
+    listing = tools["list_podcast_episodes"].description
+    assert "listening_status" in listing
+    assert "API-key account" in listing
+    assert "not any OpenWebUI" in listing
+
+    async with _serve(config, _PodcastBackend()) as http:
+        response = await http.post(
+            "/mcp", json=INITIALIZE_REQUEST, headers=_headers()
+        )
+
+    assert response.status_code == 200
+    instructions = _rpc_payload(response)["result"]["instructions"]
+    assert "delete_finished_podcast_episodes" in instructions
+    assert "listening_status" in instructions
+
+
 async def test_unknown_arguments_are_rejected_for_every_registered_tool(
     config_factory: Callable[..., Config],
 ) -> None:
@@ -3054,7 +3310,7 @@ async def test_unknown_arguments_are_rejected_for_every_registered_tool(
         config_factory(podcast_writes_enabled=True), backend
     ) as session:
         tools = (await session.list_tools()).tools
-        assert len(tools) == 16
+        assert len(tools) == 17
         for tool in tools:
             assert tool.inputSchema["additionalProperties"] is False, tool.name
             result = await session.call_tool(
@@ -3093,6 +3349,18 @@ async def test_unknown_safety_flags_cannot_delete_or_trim_before_backend(
         (
             "delete_podcast_episode",
             {"podcast_id": "pod1", "episode_id": "ep1", "only_listened": True},
+        ),
+        (
+            "delete_finished_podcast_episodes",
+            {"podcast_id": "pod1", "dry_run": True},
+        ),
+        (
+            "delete_finished_podcast_episodes",
+            {"podcast_id": "pod1", "confirm": False},
+        ),
+        (
+            "delete_finished_podcast_episodes",
+            {"podcast_id": "pod1", "expected_fingerprint": "fence"},
         ),
     )
 

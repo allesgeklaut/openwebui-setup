@@ -110,6 +110,38 @@ def _queue_entry(guid: str, url: str) -> dict[str, Any]:
     }
 
 
+def _progress(
+    episode_id: str | None = None,
+    *,
+    library_item_id: str = "pod1",
+    is_finished: object = False,
+    current_time: object = 0,
+) -> dict[str, Any]:
+    """Build one synthetic ``api/me/progress`` record (old JSON shape)."""
+    record: dict[str, Any] = {
+        "id": f"progress-{library_item_id}-{episode_id}",
+        "userId": "user1",
+        "libraryItemId": library_item_id,
+        "mediaItemId": library_item_id,
+        "mediaItemType": "podcastEpisode",
+        "duration": 600,
+        "progress": 0,
+        "currentTime": current_time,
+        "isFinished": is_finished,
+        "hideFromContinueListening": False,
+        "finishedAt": 0,
+        "lastUpdate": 2000,
+        "createdAt": 1000,
+    }
+    if episode_id is not None:
+        record["episodeId"] = episode_id
+    return record
+
+
+def _progress_payload(*records: dict[str, Any]) -> dict[str, Any]:
+    return {"mediaProgress": list(records)}
+
+
 def _podcast(
     podcast_id: str = "pod1",
     *,
@@ -286,6 +318,9 @@ async def test_mutations_reject_when_writes_flag_disabled(podcast_factory: Any) 
         ),
         lambda: client.delete_podcast_episode(
             "pod1", "ep1", expected_fingerprint="f" * 64
+        ),
+        lambda: client.delete_finished_podcast_episodes(
+            "pod1", 5, expected_fingerprint="f" * 64
         ),
         lambda: client.delete_podcast("pod1", expected_fingerprint="f" * 64),
     ]
@@ -2081,7 +2116,12 @@ async def test_list_episodes_sorted_newest_first_nulls_last_and_safe(
             _episode("ep3", published=2000),
         ]
     )
-    transport, requests = _make_transport({("GET", "/api/items/pod1"): item})
+    transport, requests = _make_transport(
+        {
+            ("GET", "/api/items/pod1"): item,
+            ("GET", "/api/me/progress"): _progress_payload(),
+        }
+    )
     client = podcast_factory(transport)
 
     result = await client.list_podcast_episodes("pod1", 2)
@@ -2089,6 +2129,7 @@ async def test_list_episodes_sorted_newest_first_nulls_last_and_safe(
     assert result["count"] == 2
     assert [episode["id"] for episode in result["episodes"]] == ["ep2", "ep3"]
     assert result["episodes"][0]["duration_seconds"] == 20
+    assert result["episodes"][0]["listening_status"] == "not_started"
     rendered = json.dumps(result)
     assert "cdn.example" not in rendered
     assert "/private" not in rendered
@@ -2101,6 +2142,7 @@ async def test_list_episodes_sorted_newest_first_nulls_last_and_safe(
         "ep0",
     ]
     assert all_episodes["episodes"][-1]["published_at"] is None
+    assert _method_paths(requests).count(("GET", "/api/me/progress")) == 2
 
     with pytest.raises(ABSInvalidRequest):
         await client.list_podcast_episodes("pod1", True)  # type: ignore[arg-type]
@@ -2910,7 +2952,12 @@ async def test_list_episodes_query_casefold_orders_paging_and_undated(
     ):
         episode["title"] = title
     item = _podcast(episodes=episodes)
-    transport, requests = _make_transport({("GET", "/api/items/pod1"): item})
+    transport, requests = _make_transport(
+        {
+            ("GET", "/api/items/pod1"): item,
+            ("GET", "/api/me/progress"): _progress_payload(),
+        }
+    )
     client = podcast_factory(transport)
 
     newest = await client.list_podcast_episodes("pod1", 5, query="ALPHA")
@@ -2959,7 +3006,8 @@ async def test_list_episodes_query_casefold_orders_paging_and_undated(
     rendered = json.dumps(newest)
     for forbidden in ("cdn.example", "/podcasts", "guid-ep1", "audio/mpeg"):
         assert forbidden not in rendered
-    assert len(requests) == 4
+    assert len(requests) == 8
+    assert _method_paths(requests).count(("GET", "/api/me/progress")) == 4
 
 
 async def test_list_episodes_pages_more_than_fifty_downloaded(
@@ -2969,7 +3017,10 @@ async def test_list_episodes_pages_more_than_fifty_downloaded(
         _episode(f"ep{index:03d}", 1000 * index) for index in range(120)
     ]
     transport, _ = _make_transport(
-        {("GET", "/api/items/pod1"): _podcast(episodes=episodes)}
+        {
+            ("GET", "/api/items/pod1"): _podcast(episodes=episodes),
+            ("GET", "/api/me/progress"): _progress_payload(),
+        }
     )
     client = podcast_factory(transport)
 
@@ -3028,6 +3079,163 @@ async def test_list_episode_search_and_page_bounds_never_reach_backend(
             await client.list_podcast_episodes("pod1", offset=offset)  # type: ignore[arg-type]
 
     assert requests == []
+
+
+# --- Listening status on native episode listings --------------------------
+
+
+async def test_list_episodes_joins_connector_account_listening_status(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("ep1", 1000),
+            _episode("ep2", 2000),
+            _episode("ep3", 3000),
+            _episode("ep4", 4000),
+        ]
+    )
+    records = [
+        _progress("ep1", is_finished=True),
+        _progress("ep2", current_time=42.5),
+        _progress("ep3", current_time=0),
+        # Rows for other library items (books, other podcasts) are ignored.
+        _progress(library_item_id="book1", is_finished=True),
+        _progress("ep9", library_item_id="pod2", is_finished=True),
+    ]
+    transport, requests = _make_transport(
+        {
+            ("GET", "/api/items/pod1"): item,
+            ("GET", "/api/me/progress"): _progress_payload(*records),
+        }
+    )
+    client = podcast_factory(transport)
+
+    result = await client.list_podcast_episodes("pod1", 50)
+
+    statuses = {
+        episode["id"]: episode["listening_status"]
+        for episode in result["episodes"]
+    }
+    assert statuses == {
+        "ep1": "finished",
+        "ep2": "in_progress",
+        "ep3": "not_started",
+        "ep4": "not_started",
+    }
+    for episode in result["episodes"]:
+        assert set(episode) == {
+            "id",
+            "title",
+            "published_at",
+            "duration_seconds",
+            "listening_status",
+        }
+    assert _method_paths(requests) == [
+        ("GET", "/api/items/pod1"),
+        ("GET", "/api/me/progress"),
+    ]
+    rendered = json.dumps(result)
+    for forbidden in ("currentTime", "isFinished", "userId", "ep9", "book1"):
+        assert forbidden not in rendered
+
+
+@pytest.mark.parametrize(
+    ("is_finished", "current_time", "expected"),
+    [
+        (False, 0, "not_started"),
+        (False, 0.0, "not_started"),
+        (False, -5, "not_started"),
+        (False, 0.5, "in_progress"),
+        (False, 5, "in_progress"),
+        (False, True, "not_started"),
+        (False, False, "not_started"),
+        (False, "12.5", "not_started"),
+        (False, None, "not_started"),
+        (True, 0, "finished"),
+        (True, 12.5, "finished"),
+    ],
+)
+async def test_list_episodes_listening_status_typed_current_time(
+    podcast_factory: Any,
+    is_finished: bool,
+    current_time: object,
+    expected: str,
+) -> None:
+    item = _podcast(episodes=[_episode("ep1", 1000)])
+    transport, _ = _make_transport(
+        {
+            ("GET", "/api/items/pod1"): item,
+            ("GET", "/api/me/progress"): _progress_payload(
+                _progress(
+                    "ep1", is_finished=is_finished, current_time=current_time
+                )
+            ),
+        }
+    )
+    client = podcast_factory(transport)
+
+    result = await client.list_podcast_episodes("pod1")
+
+    assert result["episodes"][0]["listening_status"] == expected
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"mediaProgress": None},
+        {"mediaProgress": {}},
+        {"mediaProgress": "records"},
+        {"mediaProgress": [None]},
+        {"mediaProgress": [{"libraryItemId": "pod1", "isFinished": True}]},
+        {
+            "mediaProgress": [
+                {"libraryItemId": "pod1", "episodeId": "", "isFinished": True}
+            ]
+        },
+        {
+            "mediaProgress": [
+                {"libraryItemId": "pod1", "episodeId": 7, "isFinished": True}
+            ]
+        },
+        {
+            "mediaProgress": [
+                {"libraryItemId": "pod1", "episodeId": "ep1", "isFinished": 1}
+            ]
+        },
+        {
+            "mediaProgress": [
+                {"libraryItemId": "pod1", "episodeId": "ep1", "isFinished": "true"}
+            ]
+        },
+        {
+            "mediaProgress": [
+                {"libraryItemId": "pod1", "episodeId": "ep1"}
+            ]
+        },
+    ],
+)
+async def test_list_episodes_malformed_progress_fails_closed(
+    podcast_factory: Any, payload: dict[str, Any]
+) -> None:
+    item = _podcast(episodes=[_episode("ep1", 1000)])
+    transport, requests = _make_transport(
+        {
+            ("GET", "/api/items/pod1"): item,
+            ("GET", "/api/me/progress"): payload,
+        }
+    )
+    client = podcast_factory(transport)
+
+    with pytest.raises(ABSResponseError, match="unexpected response"):
+        await client.list_podcast_episodes("pod1")
+
+    assert _method_paths(requests) == [
+        ("GET", "/api/items/pod1"),
+        ("GET", "/api/me/progress"),
+    ]
+    assert len(requests) == 2
 
 
 # --- Selected and chronological downloads --------------------------------
@@ -3855,6 +4063,8 @@ async def test_available_catalogue_dedupes_sorts_pages_and_flags(
             "queued",
             "downloaded_episode_id",
         }
+        # Feed entries have no native progress; listening status is native-only.
+        assert "listening_status" not in entry
 
     rendered = json.dumps(result)
     for forbidden in (
@@ -4682,9 +4892,504 @@ async def test_new_podcast_mutations_require_writes_enabled(
         lambda: client.delete_podcast_episodes(
             "pod1", ["ep1"], expected_fingerprint="f" * 64
         ),
+        lambda: client.delete_finished_podcast_episodes(
+            "pod1", expected_fingerprint="f" * 64
+        ),
     ]
     for call in calls:
         with pytest.raises(ABSNotAllowed, match="disabled"):
             await call()
 
     assert requests == []
+
+
+# --- Finished-only episode deletion ---------------------------------------
+
+
+def _finished_delete_routes(
+    item: dict[str, Any],
+    records: list[dict[str, Any]],
+    *,
+    per_episode: Callable[[str], httpx.Response] | None = None,
+    fail: dict[str, httpx.Response] | None = None,
+    progress_payload: object | None = None,
+    podcast_id: str = "pod1",
+    library_id: str = "lib1",
+) -> Routes:
+    """Native-like fixture for finished-episode selection and deletion."""
+    delete_handler = _delete_handler(item, fail=fail)
+    by_episode = {
+        record["episodeId"]: record
+        for record in records
+        if record.get("libraryItemId") == podcast_id
+        and isinstance(record.get("episodeId"), str)
+        and record["episodeId"]
+    }
+
+    def bulk(request: httpx.Request) -> httpx.Response:
+        if progress_payload is not None:
+            return httpx.Response(200, json=progress_payload)
+        return httpx.Response(200, json={"mediaProgress": records})
+
+    def progress(request: httpx.Request) -> httpx.Response:
+        episode_id = request.url.path.rsplit("/", 1)[-1]
+        if per_episode is not None:
+            return per_episode(episode_id)
+        record = by_episode.get(episode_id)
+        if record is None:
+            return httpx.Response(404, json={"error": "not found"})
+        return httpx.Response(200, json=record)
+
+    routes: Routes = {
+        ("GET", f"/api/items/{podcast_id}"): lambda request: httpx.Response(
+            200, json=item
+        ),
+        ("GET", f"/api/libraries/{library_id}"): _podcast_library(library_id),
+        ("GET", "/api/me/progress"): bulk,
+    }
+    for episode in list(item["media"]["episodes"]):
+        routes[
+            ("DELETE", f"/api/podcasts/{podcast_id}/episode/{episode['id']}")
+        ] = delete_handler
+        routes[
+            ("GET", f"/api/me/progress/{podcast_id}/{episode['id']}")
+        ] = progress
+    return routes
+
+
+def _finished_progress_path(episode_id: str) -> tuple[str, str]:
+    return ("GET", f"/api/me/progress/pod1/{episode_id}")
+
+
+def _episode_progress_reads(
+    requests: list[httpx.Request],
+) -> list[tuple[str, str]]:
+    return [
+        (request.method, request.url.path)
+        for request in requests
+        if request.method == "GET"
+        and request.url.path.startswith("/api/me/progress/pod1/")
+    ]
+
+
+def _episode_deletes(requests: list[httpx.Request]) -> list[str]:
+    return [
+        request.url.path for request in requests if request.method == "DELETE"
+    ]
+
+
+async def test_delete_finished_episodes_deletes_oldest_first_with_rechecks(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("ep1", 1000),
+            _episode("ep2", 3000),
+            _episode("ep3", 2000),
+            _episode("ep4", None),
+        ]
+    )
+    records = [
+        _progress(episode_id, is_finished=True)
+        for episode_id in ("ep1", "ep2", "ep3", "ep4")
+    ]
+    transport, requests = _make_transport(
+        _finished_delete_routes(item, records)
+    )
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.delete_finished_podcast_episodes(
+        "pod1", 2, expected_fingerprint=fingerprint
+    )
+
+    assert result["podcast_id"] == "pod1"
+    assert result["status"] == "completed"
+    assert result["requested_count"] == 2
+    assert result["deleted_count"] == 2
+    assert result["deleted_episode_ids"] == ["ep1", "ep3"]
+    assert result["skipped"] == []
+    assert result["skipped_episode_ids"] == []
+    assert result["finished_episode_count"] == 4
+    assert result["remaining_finished_count"] == 2
+    assert result["limit"] == 2
+    assert result["filesystem_removal"] == "not_verified"
+    assert "filesystem removal is not verified" in result["note"]
+    assert "is not retried" in result["note"]
+    assert "snapshot estimate" in result["note"]
+    assert "More finished episodes remain" in result["note"]
+
+    paths = _method_paths(requests)
+    assert paths.count(("GET", "/api/me/progress")) == 1
+    assert _episode_progress_reads(requests) == [
+        _finished_progress_path("ep1"),
+        _finished_progress_path("ep3"),
+    ]
+    assert _episode_deletes(requests) == [
+        "/api/podcasts/pod1/episode/ep1",
+        "/api/podcasts/pod1/episode/ep3",
+    ]
+    indexes = {path: index for index, path in enumerate(paths)}
+    assert (
+        indexes[_finished_progress_path("ep1")]
+        < indexes[("DELETE", "/api/podcasts/pod1/episode/ep1")]
+        < indexes[_finished_progress_path("ep3")]
+        < indexes[("DELETE", "/api/podcasts/pod1/episode/ep3")]
+    )
+    assert all(
+        request.url.params.get("hard") == "1"
+        for request in requests
+        if request.method == "DELETE"
+    )
+    rendered = json.dumps(result)
+    for forbidden in (
+        "cdn.example",
+        "/podcasts",
+        "fingerprint",
+        "http",
+        BACKEND_SECRET,
+    ):
+        assert forbidden not in rendered
+
+
+async def test_delete_finished_episodes_orders_undated_episodes_last(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("ep1", 2000),
+            _episode("ep2", None),
+            _episode("ep3", 1000),
+            _episode("ep4", 3000),
+        ]
+    )
+    records = [
+        _progress(episode_id, is_finished=True)
+        for episode_id in ("ep1", "ep2", "ep3", "ep4")
+    ]
+    transport, requests = _make_transport(
+        _finished_delete_routes(item, records)
+    )
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.delete_finished_podcast_episodes(
+        "pod1", 25, expected_fingerprint=fingerprint
+    )
+
+    assert result["status"] == "completed"
+    assert result["finished_episode_count"] == 4
+    assert result["remaining_finished_count"] == 0
+    assert result["deleted_episode_ids"] == ["ep3", "ep1", "ep4", "ep2"]
+    assert "More finished episodes remain" not in result["note"]
+    deletes = [
+        request.url.path.rsplit("/", 1)[-1]
+        for request in requests
+        if request.method == "DELETE"
+    ]
+    assert deletes == ["ep3", "ep1", "ep4", "ep2"]
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        [],
+        [_progress("ep1", current_time=300)],
+        [_progress("ep1", current_time=0)],
+    ],
+)
+async def test_delete_finished_episodes_zero_finished_completes_without_delete(
+    podcast_factory: Any, records: list[dict[str, Any]]
+) -> None:
+    item = _podcast(episodes=[_episode("ep1", 1000)])
+    transport, requests = _make_transport(
+        _finished_delete_routes(item, records)
+    )
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.delete_finished_podcast_episodes(
+        "pod1", expected_fingerprint=fingerprint
+    )
+
+    assert result["status"] == "completed"
+    assert result["requested_count"] == 0
+    assert result["deleted_count"] == 0
+    assert result["deleted_episode_ids"] == []
+    assert result["skipped"] == []
+    assert result["finished_episode_count"] == 0
+    assert result["remaining_finished_count"] == 0
+    assert result["limit"] == 25
+    assert result["filesystem_removal"] == "not_verified"
+    assert "No finished episodes found for the connector account" in result["note"]
+
+    paths = _method_paths(requests)
+    assert paths == [
+        ("GET", "/api/items/pod1"),
+        ("GET", "/api/items/pod1"),
+        ("GET", "/api/me/progress"),
+    ]
+    assert not any(method == "DELETE" for method, _ in paths)
+
+
+async def test_delete_finished_episodes_skips_cleared_and_missing_records(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("ep1", 1000),
+            _episode("ep2", 2000),
+            _episode("ep3", 3000),
+        ]
+    )
+    records = [
+        _progress(episode_id, is_finished=True)
+        for episode_id in ("ep1", "ep2", "ep3")
+    ]
+
+    def per_episode(episode_id: str) -> httpx.Response:
+        if episode_id == "ep1":
+            return httpx.Response(
+                200, json=_progress("ep1", is_finished=False)
+            )
+        if episode_id == "ep2":
+            return httpx.Response(404, json={"error": "not found"})
+        return httpx.Response(200, json=_progress(episode_id, is_finished=True))
+
+    transport, requests = _make_transport(
+        _finished_delete_routes(item, records, per_episode=per_episode)
+    )
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.delete_finished_podcast_episodes(
+        "pod1", expected_fingerprint=fingerprint
+    )
+
+    assert result["status"] == "completed"
+    assert result["requested_count"] == 3
+    assert result["deleted_count"] == 1
+    assert result["deleted_episode_ids"] == ["ep3"]
+    assert result["skipped"] == [
+        {"id": "ep1", "reason": "finished_flag_cleared"},
+        {"id": "ep2", "reason": "progress_record_missing"},
+    ]
+    assert result["skipped_episode_ids"] == ["ep1", "ep2"]
+    assert result["finished_episode_count"] == 3
+    assert result["remaining_finished_count"] == 0
+    assert "failed_episode_id" not in result
+    assert "error" not in result
+
+    paths = _method_paths(requests)
+    assert _episode_progress_reads(requests) == [
+        _finished_progress_path("ep1"),
+        _finished_progress_path("ep2"),
+        _finished_progress_path("ep3"),
+    ]
+    assert _episode_deletes(requests) == [
+        "/api/podcasts/pod1/episode/ep3"
+    ]
+    assert "ep1" in [episode["id"] for episode in item["media"]["episodes"]]
+    assert "ep2" in [episode["id"] for episode in item["media"]["episodes"]]
+
+
+async def test_delete_finished_episodes_hard_failure_stops_with_partial_counts(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("ep1", 1000),
+            _episode("ep2", 2000),
+            _episode("ep3", 3000),
+        ]
+    )
+    records = [
+        _progress(episode_id, is_finished=True)
+        for episode_id in ("ep1", "ep2", "ep3")
+    ]
+
+    def per_episode(episode_id: str) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_progress(episode_id, is_finished=episode_id != "ep1"),
+        )
+
+    transport, requests = _make_transport(
+        _finished_delete_routes(
+            item,
+            records,
+            per_episode=per_episode,
+            fail={"ep2": httpx.Response(500, text=BACKEND_SECRET)},
+        )
+    )
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.delete_finished_podcast_episodes(
+        "pod1", expected_fingerprint=fingerprint
+    )
+
+    assert result["status"] == "partial"
+    assert result["requested_count"] == 3
+    assert result["deleted_count"] == 0
+    assert result["deleted_episode_ids"] == []
+    assert result["skipped"] == [
+        {"id": "ep1", "reason": "finished_flag_cleared"}
+    ]
+    assert result["failed_episode_id"] == "ep2"
+    assert "unavailable" in result["error"]
+    assert result["finished_episode_count"] == 3
+    assert result["remaining_finished_count"] == 2
+    assert BACKEND_SECRET not in json.dumps(result)
+
+    paths = _method_paths(requests)
+    assert not any(
+        path == _finished_progress_path("ep3") for _, path in paths
+    )
+    deletes = [request.url.path for request in requests if request.method == "DELETE"]
+    assert deletes == ["/api/podcasts/pod1/episode/ep2"]
+
+
+async def test_delete_finished_episodes_never_selects_in_progress_episodes(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[_episode("ep1", 1000), _episode("ep2", 2000)]
+    )
+    records = [
+        _progress("ep1", current_time=120),
+        _progress("ep2", current_time=0.5),
+    ]
+    transport, requests = _make_transport(
+        _finished_delete_routes(item, records)
+    )
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.delete_finished_podcast_episodes(
+        "pod1", expected_fingerprint=fingerprint
+    )
+
+    assert result["status"] == "completed"
+    assert result["finished_episode_count"] == 0
+    assert result["deleted_count"] == 0
+    assert not any(request.method == "DELETE" for request in requests)
+    assert not any(
+        "/api/me/progress/pod1/" in request.url.path for request in requests
+    )
+
+
+@pytest.mark.parametrize("limit", [True, False, 0, 26, "5", 5.0, None, -1])
+async def test_delete_finished_episodes_limit_rejects_typed_values(
+    podcast_factory: Any, limit: object
+) -> None:
+    transport, requests = _make_transport({})
+    client = podcast_factory(transport)
+
+    with pytest.raises(ABSInvalidRequest):
+        await client.delete_finished_podcast_episodes(
+            "pod1", limit, expected_fingerprint="f" * 64  # type: ignore[arg-type]
+        )
+
+    assert requests == []
+
+
+async def test_delete_finished_episodes_accepts_max_limit(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(episodes=[_episode("ep1", 1000)])
+    records = [_progress("ep1", is_finished=True)]
+    transport, requests = _make_transport(
+        _finished_delete_routes(item, records)
+    )
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.delete_finished_podcast_episodes(
+        "pod1", 25, expected_fingerprint=fingerprint
+    )
+
+    assert result["status"] == "completed"
+    assert result["deleted_episode_ids"] == ["ep1"]
+    assert result["limit"] == 25
+
+
+async def test_delete_finished_episodes_refuses_queue_and_stale_fingerprint(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(episodes=[_episode("ep1", 1000)])
+    item["episodeDownloadsQueued"] = [
+        _queue_entry("gx", "https://cdn.example/x.mp3")
+    ]
+    records = [_progress("ep1", is_finished=True)]
+    transport, requests = _make_transport(
+        _finished_delete_routes(item, records)
+    )
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    with pytest.raises(ABSResponseError, match="queued or active"):
+        await client.delete_finished_podcast_episodes(
+            "pod1", expected_fingerprint=fingerprint
+        )
+
+    item.pop("episodeDownloadsQueued")
+    with pytest.raises(ABSInvalidRequest, match="retry with current settings"):
+        await client.delete_finished_podcast_episodes(
+            "pod1", expected_fingerprint="0" * 64
+        )
+
+    assert not any(request.method == "DELETE" for request in requests)
+    assert not any(
+        request.url.path == "/api/me/progress" for request in requests
+    )
+
+
+async def test_delete_finished_episodes_malformed_progress_never_deletes(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(episodes=[_episode("ep1", 1000)])
+    transport, requests = _make_transport(
+        _finished_delete_routes(
+            item,
+            [_progress("ep1", is_finished=True)],
+            progress_payload={
+                "mediaProgress": [
+                    {
+                        "libraryItemId": "pod1",
+                        "episodeId": "ep1",
+                        "isFinished": 1,
+                    }
+                ]
+            },
+        )
+    )
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    with pytest.raises(ABSResponseError, match="unexpected response"):
+        await client.delete_finished_podcast_episodes(
+            "pod1", expected_fingerprint=fingerprint
+        )
+
+    assert not any(request.method == "DELETE" for request in requests)
+
+
+async def test_delete_finished_episodes_prevalidates_paths_before_delete(
+    podcast_factory: Any,
+) -> None:
+    episode = _episode("ep1", 1000)
+    episode["audioFile"] = {"metadata": {"path": "/podcasts/other/evil.mp3"}}
+    item = _podcast(episodes=[episode])
+    transport, requests = _make_transport(
+        _finished_delete_routes(item, [_progress("ep1", is_finished=True)])
+    )
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    with pytest.raises(ABSResponseError, match="not safe to delete"):
+        await client.delete_finished_podcast_episodes(
+            "pod1", expected_fingerprint=fingerprint
+        )
+
+    assert not any(request.method == "DELETE" for request in requests)

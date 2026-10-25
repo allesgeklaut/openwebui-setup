@@ -1,7 +1,7 @@
 """Authenticated Streamable HTTP MCP server for Audiobookshelf.
 
 The default configuration exposes three read-only tools. When the explicit
-podcast write opt-in is enabled, thirteen fixed podcast tools are added; they
+podcast write opt-in is enabled, fourteen fixed podcast tools are added; they
 operate only on allowed podcast libraries and use the fixed native
 Audiobookshelf endpoints implemented by :mod:`audiobookshelf_mcp.podcasts`.
 Every tool input schema is closed and unknown arguments are rejected before
@@ -171,6 +171,18 @@ NativeEpisodeIds = Annotated[
         ),
     ),
 ]
+FinishedDeleteLimit = Annotated[
+    int,
+    Field(
+        strict=True,
+        ge=1,
+        le=MAX_SELECTED_EPISODES,
+        description=(
+            "Maximum finished episodes to hard-delete in this call, 1-25 "
+            "(default 25); oldest published first, undated last."
+        ),
+    ),
+]
 FeedUrl = Annotated[
     str,
     Field(
@@ -330,18 +342,24 @@ podcasts and their listening data; filesystem removal is not verified.
 
 Use list_libraries to find an allowed library whose media_type is podcast,
 then list_podcasts to list the podcast subscriptions in it when the user asks
-to list their subscriptions. Use list_podcast_episodes for downloaded episodes
-and their native episode IDs. Use list_available_podcast_episodes to browse
-the podcast's current RSS feed, including older entries that have not been
-downloaded; pass query and offset to find entries beyond the first page.
+to list their subscriptions. Use list_podcast_episodes for downloaded episodes,
+their native episode IDs, and each episode's listening_status (finished,
+in_progress, or not_started). listening_status is the connector's own
+Audiobookshelf API-key account, not any OpenWebUI or MCP user. Use
+list_available_podcast_episodes to browse the podcast's current RSS feed,
+including older entries that have not been downloaded; pass query and offset
+to find entries beyond the first page.
 
 Feed IDs and native episode IDs are different. download_podcast_episodes and
 download_episodes_from accept only the opaque feed_ IDs returned by
 list_available_podcast_episodes; download_latest_episodes takes only a count.
 delete_podcast_episodes and delete_podcast_episode accept only native
-downloaded episode IDs returned by list_podcast_episodes; delete_podcast
-deletes a whole podcast by its podcast ID. Never use one ID type for the
-other.
+downloaded episode IDs returned by list_podcast_episodes;
+delete_finished_podcast_episodes takes only a native podcast ID and a limit and
+hard-deletes at most limit downloaded episodes the connector account marked
+finished, oldest first, rechecking finished status before each delete and
+skipping episodes that changed; delete_podcast deletes a whole podcast by its
+podcast ID. Never use one ID type for the other.
 
 download_episodes_from uses a fixed, inclusive window: the anchor episode plus
 the next count-1 episodes in publication order, skipping episodes that are
@@ -712,10 +730,14 @@ def create_server(
             "oldest; query filters on a case-insensitive title substring and "
             "is 1-200 printable characters. Undated episodes sort last in "
             "both orders. Returns only native episode ID, sanitized title, "
-            "publish time, and duration, plus count, total, has_more, and "
+            "publish time, duration, and listening_status (finished, "
+            "in_progress, or not_started), plus count, total, has_more, and "
             "next_offset for paging; no feed, enclosure, path, or file URL is "
-            "returned. The id field is a native downloaded episode ID used by "
-            "the delete tools, not a feed_ selector."
+            "returned. listening_status is the connector's Audiobookshelf "
+            "API-key account, not any OpenWebUI or MCP user, and is the "
+            "account delete_finished_podcast_episodes acts on. The id field "
+            "is a native downloaded episode ID used by the delete tools, not "
+            "a feed_ selector."
         ),
         annotations=READ_ONLY_HINTS,
     )
@@ -848,6 +870,40 @@ def create_server(
             client.delete_podcast_episodes(
                 podcast_id,
                 episode_ids,
+                expected_fingerprint=_expected_fingerprint(state),
+            )
+        )
+        return _public_result(result, config.abs_server_timezone)
+
+    @mcp.tool(
+        name="delete_finished_podcast_episodes",
+        description=(
+            "Permanently hard-delete up to limit (1-25, default 25) downloaded "
+            "episodes of one allowed podcast that the connector's "
+            "Audiobookshelf API-key account has marked finished, oldest "
+            "published first with undated episodes last. This removes each "
+            "episode and its listening data; it is an explicit user action "
+            "with no extra confirmation. Finished status is rechecked "
+            "immediately before each delete: an episode whose progress record "
+            "is missing or no longer finished is skipped with reason "
+            "progress_record_missing or finished_flag_cleared and reported in "
+            "skipped. Processing stops at the first hard failure and returns "
+            "partial with the sanitized error and honest counts; nothing is "
+            "retried or rolled back, and filesystem removal is not verified. "
+            "More finished episodes may remain than limit: check "
+            "remaining_finished_count and call again. Takes a native podcast "
+            "ID only, never episode IDs."
+        ),
+        annotations=DESTRUCTIVE_HINTS,
+    )
+    async def delete_finished_podcast_episodes(
+        podcast_id: PodcastId, limit: FinishedDeleteLimit = 25
+    ) -> dict[str, Any]:
+        state = await _call(client.get_podcast_state(podcast_id))
+        result = await _call(
+            client.delete_finished_podcast_episodes(
+                podcast_id,
+                limit,
                 expected_fingerprint=_expected_fingerprint(state),
             )
         )

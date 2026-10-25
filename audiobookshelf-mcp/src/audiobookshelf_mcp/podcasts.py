@@ -4,6 +4,7 @@ All operations use the installed Audiobookshelf 2.37.2 native endpoints:
 
 * ``GET /api/items/{id}?expanded=1`` (plus ``include=downloads`` for queue state)
 * ``GET /api/libraries/{id}`` and ``GET /api/libraries/{id}/items``
+* ``GET /api/me/progress`` and ``GET /api/me/progress/{libraryItemId}/{episodeId}``
 * ``POST /api/podcasts/feed``
 * ``POST /api/podcasts``
 * ``POST /api/podcasts/{id}/download-episodes``
@@ -76,6 +77,14 @@ only native item IDs, sanitized titles, and the native episode count when that
 count is a valid non-negative integer; it never returns URLs, paths, or media
 details and makes no remote media request. The backend page cursor is bounded;
 this is the current upstream snapshot, not a complete archive.
+
+Listening status comes from the connector's own Audiobookshelf API-key account:
+one bounded ``GET /api/me/progress`` read joined to the downloaded episodes by
+native episode ID. It is never another user's progress and never a live
+playback session. A finished flag selected by ``delete_finished_podcast_episodes``
+is re-read for that episode immediately before its DELETE; a record that is
+missing or no longer finished skips only that episode, so progress which changes
+between the recheck and the DELETE is not covered by any fence.
 """
 
 from __future__ import annotations
@@ -158,6 +167,9 @@ _UNSAFE_EPISODE_PATH = (
 _ENCLOSURE_ENCODING_INVALID = (
     "Podcast enclosure URL has invalid percent encoding."
 )
+_NO_FINISHED_EPISODES = "No finished episodes found for the connector account."
+_PROGRESS_RECORD_MISSING = "progress_record_missing"
+_FINISHED_FLAG_CLEARED = "finished_flag_cleared"
 _UNEXPECTED = "Audiobookshelf returned an unexpected response."
 
 _MALFORMED_PERCENT_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
@@ -301,12 +313,18 @@ class PodcastClient(ABSClient):
         ``query`` filters on a case-insensitive title substring. ``order`` is
         ``newest`` or ``oldest``; undated episodes always sort last. ``count``
         is the size of this page and ``total`` is the filtered catalogue size.
+        Every episode view carries ``listening_status`` (``finished``,
+        ``in_progress``, or ``not_started``) from one bounded
+        ``GET api/me/progress`` read for the connector's Audiobookshelf
+        API-key account; it is not any other user's progress and is never a
+        live playback claim.
         """
         self._require_episode_limit(limit)
         query = _require_episode_query(query)
         order = _require_episode_order(order)
         offset = _require_episode_offset(offset)
         item = await self._load_podcast(podcast_id)
+        progress = await self._fetch_account_progress(podcast_id)
 
         projected: list[dict[str, Any]] = []
         for episode in self._downloaded_episodes(item):
@@ -323,6 +341,9 @@ class PodcastClient(ABSClient):
                         "published_at": _iso_timestamp(published_ms),
                         "duration_seconds": _duration_seconds(
                             episode.get("duration")
+                        ),
+                        "listening_status": _listening_status(
+                            progress.get(episode["id"])
                         ),
                     },
                 }
@@ -979,6 +1000,85 @@ class PodcastClient(ABSClient):
                 podcast_id, targets, deleted, failed_episode_id, error
             )
 
+    async def delete_finished_podcast_episodes(
+        self,
+        podcast_id: str,
+        limit: int = MAX_SELECTED_EPISODES,
+        *,
+        expected_fingerprint: str,
+    ) -> dict[str, Any]:
+        """Delete up to ``limit`` downloaded episodes the account marked finished.
+
+        Selection is one bounded snapshot of the connector's Audiobookshelf
+        API-key account progress joined to the downloaded episodes, oldest
+        ``publishedAt`` first with undated episodes last. Every target is
+        prevalidated like a selected multi-delete, then its progress record is
+        re-read immediately before its DELETE. A record that vanished (404) or
+        is no longer strictly finished skips only that target with a fixed
+        reason and does not stop the batch; any other failure stops the run with
+        the honest partial count. There is no rollback and no retry, filesystem
+        removal is not verified, and progress can change between the recheck
+        and the DELETE, so the remaining count is a snapshot estimate.
+        """
+        self._require_writes_enabled()
+        if type(limit) is not int or not 1 <= limit <= MAX_SELECTED_EPISODES:
+            raise ABSInvalidRequest(
+                f"Limit must be an integer between 1 and {MAX_SELECTED_EPISODES}."
+            )
+        expected = _require_fingerprint(expected_fingerprint)
+
+        async with _MUTATION_LOCK:
+            item = await self._load_podcast(podcast_id)
+            _require_unchanged(self._state(item), expected)
+            if self._queue_entries(item):
+                raise ABSResponseError(_DOWNLOADS_ACTIVE)
+
+            progress = await self._fetch_account_progress(podcast_id)
+            finished = [
+                episode
+                for episode in self._downloaded_episodes(item)
+                if _is_finished(progress.get(episode["id"]))
+            ]
+            finished_episode_count = len(finished)
+            targets = [
+                episode["id"]
+                for episode in _order_episodes_oldest(finished)[:limit]
+            ]
+            if not targets:
+                return {
+                    "podcast_id": podcast_id,
+                    "status": "completed",
+                    "requested_count": 0,
+                    "deleted_count": 0,
+                    "deleted_episode_ids": [],
+                    "skipped_episode_ids": [],
+                    "skipped": [],
+                    "finished_episode_count": finished_episode_count,
+                    "remaining_finished_count": 0,
+                    "limit": limit,
+                    "filesystem_removal": "not_verified",
+                    "note": _NO_FINISHED_EPISODES,
+                }
+
+            snapshots, item_snapshot = await self._prevalidate_delete_targets(
+                item, targets
+            )
+            deleted, skipped, failed_episode_id, error = (
+                await self._delete_finished_episode_batch(
+                    podcast_id, targets, item, snapshots, item_snapshot
+                )
+            )
+            return _finished_deletion_result(
+                podcast_id,
+                targets,
+                deleted,
+                skipped,
+                failed_episode_id,
+                error,
+                finished_episode_count,
+                limit,
+            )
+
     async def delete_podcast(
         self, podcast_id: str, *, expected_fingerprint: str
     ) -> dict[str, Any]:
@@ -1066,6 +1166,60 @@ class PodcastClient(ABSClient):
             or data.get("mediaType") != "podcast"
         ):
             raise ABSNotAllowed("Podcast library not found or not permitted.")
+        return data
+
+    async def _fetch_account_progress(
+        self, podcast_id: str
+    ) -> dict[str, dict[str, Any]]:
+        """Return this podcast's episode progress for the connector account.
+
+        One bounded ``GET api/me/progress`` request covers every library item,
+        so rows for other items (books, other podcasts) are ignored. A row
+        scoped to this podcast must carry a non-empty string ``episodeId`` and a
+        strict boolean ``isFinished``; anything else fails closed instead of
+        being guessed at. The mapping is keyed by native episode ID and is used
+        only for a fixed listening status or a strictly finished delete target.
+        """
+        data = await self._request_json(
+            "GET",
+            "api/me/progress",
+            max_response_bytes=MAX_PODCAST_RESPONSE_BYTES,
+        )
+        if not isinstance(data, dict):
+            raise ABSResponseError(_UNEXPECTED)
+        records = data.get("mediaProgress")
+        if not isinstance(records, list):
+            raise ABSResponseError(_UNEXPECTED)
+
+        progress: dict[str, dict[str, Any]] = {}
+        for raw in records:
+            if not isinstance(raw, dict):
+                raise ABSResponseError(_UNEXPECTED)
+            if raw.get("libraryItemId") != podcast_id:
+                continue
+            episode_id = raw.get("episodeId")
+            if not isinstance(episode_id, str) or not episode_id:
+                raise ABSResponseError(_UNEXPECTED)
+            if type(raw.get("isFinished")) is not bool:
+                raise ABSResponseError(_UNEXPECTED)
+            progress[episode_id] = raw
+        return progress
+
+    async def _fetch_episode_progress(
+        self, podcast_id: str, episode_id: str
+    ) -> dict[str, Any]:
+        """Read one episode's current progress record for the connector account.
+
+        A missing record surfaces as :class:`ABSNotFound`, which the caller
+        treats as a skip, never as permission to delete.
+        """
+        data = await self._request_json(
+            "GET",
+            f"api/me/progress/{podcast_id}/{episode_id}",
+            max_response_bytes=MAX_PODCAST_RESPONSE_BYTES,
+        )
+        if not isinstance(data, dict):
+            raise ABSResponseError(_UNEXPECTED)
         return data
 
     async def _find_duplicate_feed(
@@ -1497,6 +1651,64 @@ class PodcastClient(ABSClient):
             removed.add(target)
         return deleted, failed_episode_id, error
 
+    async def _delete_finished_episode_batch(
+        self,
+        podcast_id: str,
+        targets: list[str],
+        baseline: Mapping[str, Any],
+        snapshots: Mapping[str, tuple[Any, ...]],
+        item_snapshot: tuple[object, object],
+    ) -> tuple[list[str], list[dict[str, str]], str | None, str | None]:
+        """Delete targets whose finished status survives a fresh recheck.
+
+        The shared per-DELETE fence runs first and is unchanged. A fresh
+        per-episode progress read then decides: a missing record or a record
+        that is no longer strictly finished skips only that target and the batch
+        continues, because the safety condition was never met for it. Any other
+        failure — including the fence, the progress read, or the DELETE — stops
+        the batch with the honest partial count; nothing is retried.
+        """
+        deleted: list[str] = []
+        skipped: list[dict[str, str]] = []
+        removed: set[str] = set()
+        failed_episode_id: str | None = None
+        error: str | None = None
+        for target in targets:
+            try:
+                await self._require_delete_ready(
+                    podcast_id,
+                    baseline,
+                    removed,
+                    target,
+                    snapshots[target],
+                    item_snapshot,
+                )
+            except ABSClientError as exc:
+                failed_episode_id = target
+                error = str(exc)
+                break
+            try:
+                record = await self._fetch_episode_progress(podcast_id, target)
+            except ABSNotFound:
+                skipped.append({"id": target, "reason": _PROGRESS_RECORD_MISSING})
+                continue
+            except ABSClientError as exc:
+                failed_episode_id = target
+                error = str(exc)
+                break
+            if record.get("isFinished") is not True:
+                skipped.append({"id": target, "reason": _FINISHED_FLAG_CLEARED})
+                continue
+            try:
+                await self._delete_episode(podcast_id, target)
+            except ABSClientError as exc:
+                failed_episode_id = target
+                error = str(exc)
+                break
+            deleted.append(target)
+            removed.add(target)
+        return deleted, skipped, failed_episode_id, error
+
     async def _require_delete_ready(
         self,
         podcast_id: str,
@@ -1667,6 +1879,48 @@ def _order_downloaded_views(
     )
     undated.sort(key=lambda entry: entry["id"], reverse=reverse)
     return [entry["view"] for entry in dated + undated]
+
+
+def _order_episodes_oldest(
+    episodes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Order raw native episodes oldest first; undated entries always last."""
+    dated: list[tuple[int, str, dict[str, Any]]] = []
+    undated: list[tuple[str, dict[str, Any]]] = []
+    for episode in episodes:
+        published_ms = _epoch_ms(episode.get("publishedAt"))
+        if published_ms is None:
+            undated.append((episode["id"], episode))
+        else:
+            dated.append((published_ms, episode["id"], episode))
+    dated.sort(key=lambda entry: (entry[0], entry[1]))
+    undated.sort(key=lambda entry: entry[0])
+    return [entry[2] for entry in dated] + [entry[1] for entry in undated]
+
+
+def _is_finished(record: Mapping[str, Any] | None) -> bool:
+    """Return whether a validated progress record is strictly finished."""
+    return isinstance(record, dict) and record.get("isFinished") is True
+
+
+def _listening_status(record: Mapping[str, Any] | None) -> str:
+    """Project one validated progress record into a fixed listening status.
+
+    Only a strict ``True`` counts as finished; a record counts as in progress
+    only when ``currentTime`` is a non-boolean number greater than zero.
+    """
+    if record is None:
+        return "not_started"
+    if record.get("isFinished") is True:
+        return "finished"
+    current_time = record.get("currentTime")
+    if (
+        isinstance(current_time, (int, float))
+        and not isinstance(current_time, bool)
+        and current_time > 0
+    ):
+        return "in_progress"
+    return "not_started"
 
 
 def _feed_selector(podcast_id: str, candidate: Mapping[str, Any]) -> str:
@@ -1909,6 +2163,51 @@ def _deletion_result(
             "not verified. A failed delete request may already have been "
             "applied and is not retried."
         ),
+    }
+    if failed_episode_id is not None:
+        result["failed_episode_id"] = failed_episode_id
+        result["error"] = error
+    return result
+
+
+def _finished_deletion_result(
+    podcast_id: str,
+    requested: list[str],
+    deleted: list[str],
+    skipped: list[dict[str, str]],
+    failed_episode_id: str | None,
+    error: str | None,
+    finished_episode_count: int,
+    limit: int,
+) -> dict[str, Any]:
+    """Project a finished-episode delete with honest snapshot counts."""
+    note = (
+        "Acknowledged Audiobookshelf deletes only; filesystem removal is not "
+        "verified. A failed delete request may already have been applied and "
+        "is not retried. Progress can change between the finished-status "
+        "recheck and the DELETE, so remaining_finished_count is a snapshot "
+        "estimate."
+    )
+    if finished_episode_count > len(requested):
+        note += (
+            " More finished episodes remain than this call's limit; check "
+            "remaining_finished_count and call again."
+        )
+    result: dict[str, Any] = {
+        "podcast_id": podcast_id,
+        "status": "partial" if failed_episode_id is not None else "completed",
+        "requested_count": len(requested),
+        "deleted_count": len(deleted),
+        "deleted_episode_ids": list(deleted),
+        "skipped_episode_ids": [entry["id"] for entry in skipped],
+        "skipped": list(skipped),
+        "finished_episode_count": finished_episode_count,
+        "remaining_finished_count": (
+            finished_episode_count - len(deleted) - len(skipped)
+        ),
+        "limit": limit,
+        "filesystem_removal": "not_verified",
+        "note": note,
     }
     if failed_episode_id is not None:
         result["failed_episode_id"] = failed_episode_id
