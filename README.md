@@ -11,6 +11,7 @@ A self-hosted AI chat interface with extended capabilities, powered by [Open Web
 | **searxng** | Privacy-respecting search engine | 8081 |
 | **research-search** | Web search + URL fetch via the Mistral "Web Scout" agent | internal |
 | **tika** | Document extraction & preprocessing | internal |
+| **audiobookshelf-mcp** | Audiobookshelf podcast connector (authenticated MCP for Open WebUI) | internal |
 
 Voice chat (TTS/STT) and RAG embeddings are **not** separate services: they
 route through litellm to Mistral (Voxtral TTS + transcription, Mistral Embed).
@@ -92,6 +93,29 @@ starts/recreates the stack. Do not edit the generated secret config directly.
 ### SearXNG (`searxng/`)
 
 Privacy-respecting metasearch engine. Configuration is in [`searxng/config/settings.yml`](searxng/config/settings.yml ).
+
+### Audiobookshelf MCP (`audiobookshelf-mcp/`)
+
+Authenticated Streamable-HTTP MCP connector for Audiobookshelf podcast
+management, built from [`audiobookshelf-mcp/`](audiobookshelf-mcp/) and mounted
+into Open WebUI as a private tool server. Full tool, safety, and configuration
+documentation: [`audiobookshelf-mcp/README.md`](audiobookshelf-mcp/README.md).
+
+The Compose service starts with the stack, so a fresh deployment needs these
+prerequisites first:
+
+- the external network `audiobookshelf_default` (the network of an existing
+  Audiobookshelf Compose deployment; adjust `compose.yml` if yours differs),
+- secret files `/opt/secrets/audiobookshelf-mcp/abs_api_key` and
+  `/opt/secrets/audiobookshelf-mcp/mcp_token`,
+- `ABS_ALLOWED_LIBRARY_IDS` set to your podcast library ID(s) in the local,
+  gitignored `.env` (see `.env.example`; the service refuses to start with it
+  unset).
+
+The repository's `compose.yml` enables podcast write tools for this service;
+make sure that is intended before deploying. Register the MCP endpoint
+(`http://audiobookshelf-mcp:8000/mcp`) as a private tool-server connection in
+Open WebUI, restricted to the intended account.
 
 ### Web search & page fetching (`research-search/`)
 
@@ -332,6 +356,11 @@ Other services run internally and are not exposed.
 ├── research-search/         # Web search + URL fetch via the Mistral "Web Scout" agent
 │   ├── app.py               # stdlib HTTP adapter (search + fetch contracts)
 │   ├── test_app.py          # unit tests for the parsing helpers
+│   ├── Dockerfile
+│   └── README.md
+├── audiobookshelf-mcp/      # Audiobookshelf podcast MCP connector (17 tools, writes opt-in)
+│   ├── src/audiobookshelf_mcp/
+│   ├── tests/
 │   ├── Dockerfile
 │   └── README.md
 ├── workflows/               # ComfyUI API workflows for Open WebUI (Qwen-Image-2.1)
