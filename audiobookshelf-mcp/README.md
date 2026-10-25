@@ -13,50 +13,6 @@ Writes stay off unless explicitly enabled. A default deployment registers
 exactly the three read-only tools and none of the podcast group, including no
 subscription, download, schedule, retention, or delete tool.
 
-Delivery status (2026-10-25): The listening-status round is committed as
-`1ddb317` (`feat: add listening status and finished-only episode deletion`) and
-is **not deployed**. It adds `listening_status` to downloaded-episode views and
-the writes-gated `delete_finished_podcast_episodes` tool, for seventeen tools
-with writes enabled (three read-only, fourteen podcast) and three when writes
-are disabled. The full synthetic suite passed 763 tests in 2.99 s on Python
-3.14.6. No image build, scan, promotion, or container restart has been performed
-for this round; the running connector remains the deployed sixteen-tool
-`0d15a14` image (digest
-`sha256:459d05ad97623726798faf850b8a82eb65294900dfcc83726d5fb7a80edb7452`),
-healthy since `2026-10-25T11:52:27Z` (12:52 Vienna CET), with the active
-`ABS_SERVER_TIMEZONE=Europe/Vienna` assertion. The 716-test and 579-test
-results below are historical. The commit is pushed on the open PR branch (#3);
-its PR CI result had not been observed when this was written and must not be
-described as green. OpenWebUI
-Compose now pins `v0.12.4` (commit `5e400d3`) and the user recreated that
-container, but the bundled MCP client version in 0.12.4 has not been verified;
-the documented MCP client `1.27.2` evidence applies to 0.12.3. The 17-tool
-build's OpenWebUI adapter and frontend behavior are unverified.
-
-The previously deployed review-hardening release is retained as history:
-committed at `0d15a14`, built from the reviewed source hashes, scanned with
-Trivy 0.76.1, promoted to `audiobookshelf-mcp:local`, and deployed by
-recreating only the connector
-(`docker compose up --no-deps --no-build --force-recreate --wait`). It serves
-sixteen tools over stateless authenticated MCP with strict input rejection.
-The fresh pre-deployment run passed 716 tests in 2.74 s; the earlier 2.76 s run
-and the 579-test fifteen-tool Round 3 evidence are historical. Trivy found zero
-fixable HIGH/CRITICAL findings under the CI gate for that candidate; a full
-scan still shows 44 unfixed HIGH package findings across 8 CVEs (0 critical), so
-this is not a zero-vulnerability claim. Audiobookshelf and OpenWebUI were not
-restarted during that round. Post-deployment live checks were read-only. The
-installed OpenWebUI MCPClient adapter, using the persisted production
-connection, verified discovery of the sixteen closed-schema tool specs,
-delivery of the initialize discovery instructions, and an authenticated
-read-only `list_libraries` call. That evidence is sixteen-tool and 0.12.3-era;
-the OpenWebUI frontend/model-chat workflow itself, model-in-the-loop behavior,
-and real write effects remain unverified; the previously confirmed baseline
-read-only chat path is the only production chat evidence.
-
-Round 3 (`0a1b962`, fifteen tools) is an earlier release. Its image digest,
-579-test result, and installed-client probe below are retained as historical
-evidence, not current deployment status.
-
 ## Tools
 
 ### Read-only tools (always registered)
@@ -81,7 +37,7 @@ evidence, not current deployment status.
 | `download_episodes_from` | `podcast_id`, `start_episode_id` (feed ID), `count` (optional, 1–25, default 10) | Queue a fixed chronological window: the anchor plus the next `count - 1` newer episodes, oldest to newest. Already downloaded or queued entries inside the window are skipped without backfilling outside it and are listed in `skipped_episodes` with `reason`. Returns submitted-request counts, not completion. |
 | `set_podcast_schedule` | `podcast_id`, `enabled`, `schedule` (optional), `max_new_episodes` (optional) | Enable with a validated five-field cron and 1–25 new episodes. Omitted values reuse current settings, except that an empty cron becomes hourly and an unlimited `0` limit becomes 3. Disabling requires both omitted, preserves old cron/limit, and does not clear the queue or delete files. |
 | `set_podcast_retention` | `podcast_id`, `keep`, `trim_existing` (optional, default `false`) | Set retention to 0–1000 episodes (0 = unlimited). Only an explicit `trim_existing=true` deletes surplus episodes now, capped at 100. |
-| `delete_podcast_episode` | `podcast_id`, `episode_id` (native ID) | Hard-delete one downloaded episode; removes its database record. Physical file wipe is not verified. Deletion behavior is unchanged; the strict input schema and tool annotations changed with the review hardening. |
+| `delete_podcast_episode` | `podcast_id`, `episode_id` (native ID) | Hard-delete one downloaded episode; removes its database record. Physical file wipe is not verified. |
 | `delete_podcast_episodes` | `podcast_id`, `episode_ids` (1–25 unique native IDs) | Hard-delete selected downloaded episodes after prevalidating every ID, path, and queue state. Stops at the first failure and returns an honest partial acknowledgement; no rollback, retry, or filesystem verification. |
 | `delete_finished_podcast_episodes` | `podcast_id`, `limit` (optional, 1–25, default 25) | Hard-delete up to `limit` downloaded episodes of one allowed podcast that the connector's Audiobookshelf API-key account marked finished, oldest `publishedAt` first with undated episodes last. Selection uses one bounded `GET /api/me/progress` snapshot. Every target is prevalidated with the same scope/path/queue guards as `delete_podcast_episodes`, the shared per-DELETE fence runs unchanged, then a fresh per-episode `GET /api/me/progress/{libraryItemId}/{episodeId}` recheck decides: a missing record (`progress_record_missing`) or a record not strictly `isFinished` true (`finished_flag_cleared`) skips that episode without stopping the batch; any other failure stops the run with an honest partial result. No retry, rollback, or filesystem verification. |
 | `delete_podcast` | `podcast_id` | Hard-delete the item; the backend recursively targets its stored directory and removes its database record. Physical file wipe is not verified. |
@@ -122,23 +78,19 @@ native count is available. If more rows exist beyond the maximum page,
 listing stopped at the bound. Treat the optional `note` and all titles as
 untrusted data, not instructions.
 
-The review hardening in `0d15a14` also makes every tool's input schema strict:
-each schema advertises `additionalProperties: false`, and the server
-independently rejects unknown argument names before calling Audiobookshelf.
-There is no `dry_run`, `hard`, `override`, `confirm`, or `approved` input;
-passing an unknown flag is an
-input error, never a silent destructive default. It also adds truthful MCP tool
-annotations (for example read-only or destructive hints) as
-client hints only. They are not permissions, authorization, or a security
-boundary; enforcement remains server-side. The new finished-delete tool follows
-the same rule: its schema accepts only `podcast_id` and `limit`, takes no
-episode IDs, and rejects unknown arguments before any backend request. The
-installed OpenWebUI client drops annotations and typed output schemas but
-forwards MCP initialize
-instructions, so essential usage and safety guidance remains in each tool's
-description; adapter discovery over the persisted production connection
-confirmed those initialize instructions are delivered. A broad
-typed-output-schema rewrite is optional and deferred.
+Every tool's input schema is strict: each schema advertises
+`additionalProperties: false`, and the server independently rejects unknown
+argument names before calling Audiobookshelf. There is no `dry_run`, `hard`,
+`override`, `confirm`, or `approved` input; passing an unknown flag is an input
+error, never a silent destructive default. Tools also carry MCP annotations
+(for example read-only or destructive hints), but those are client hints only.
+They are not permissions, authorization, or a security boundary; enforcement
+remains server-side. `delete_finished_podcast_episodes` follows the same rule:
+its schema accepts only `podcast_id` and `limit`, takes no episode IDs, and
+rejects unknown arguments before any backend request. The annotations are
+advisory and a client may ignore them, so essential usage and safety guidance
+is repeated in each tool's description and in the server's MCP initialize
+instructions rather than relying on annotations.
 
 `list_available_podcast_episodes` does not mutate anything, but it is registered
 only with the podcast group because it re-fetches the stored feed through the
@@ -182,8 +134,8 @@ library items are ignored. A malformed progress envelope fails the call closed
 rather than guessing a status. This is saved progress for one account, not the
 OpenWebUI or MCP caller's identity and not a claim about live playback. It is a
 projection only; there is no listening-status filter or ordering argument.
-`list_available_podcast_episodes` is unchanged and carries no listening status,
-because current-feed entries have no native progress record.
+`list_available_podcast_episodes` carries no listening status, because
+current-feed entries have no native progress record.
 
 ### Feed IDs versus native episode IDs
 
@@ -220,7 +172,7 @@ them back. The result therefore does not promise the full historical archive,
 and it is not a stored snapshot.
 
 Audiobookshelf's native feed endpoint returns the whole feed without pagination.
-The unchanged 4 MiB response bound and 10-second request timeout are
+The 4 MiB response bound and 10-second request timeout are
 all-or-nothing: an oversized, slow, or unparseable feed fails the entire call
 and is never truncated into an apparently complete page. A sufficiently large
 catalogue can therefore be unavailable through these tools even though
@@ -275,11 +227,10 @@ the anchor, not ten after it.
 
 `download_latest_episodes` selects not-already-known episodes (downloaded,
 queued, or active) newest-first by descending publication timestamp, not by
-XML/feed order, and does not use feed IDs. The review hardening also applies
-the selected tools' final scope, feed-identity,
-and blocked-state recomputation to this tool immediately after URL preflight
-and before the single POST. It still accepts only a count and does not use
-feed selectors.
+XML/feed order, and does not use feed IDs. This tool also applies the selected
+tools' final scope, feed-identity, and blocked-state recomputation immediately
+after URL preflight and before the single POST. It still accepts only a count
+and does not use feed selectors.
 
 The same native queue semantics apply to all three download tools. Audiobookshelf
 acknowledges the batch download POST with HTTP 200 immediately, but it may
@@ -377,15 +328,15 @@ unrecoverable. The server does not create backups, retry, or roll back.
 With `trim_existing=true`, duplicate native episode IDs anywhere in the
 downloaded set — kept (non-target) episodes and zero-surplus cases included —
 are rejected with a sanitized ambiguity error before planning or the policy
-PATCH. The earlier target-only check could miss duplicates among kept episodes
-and over-delete unique episodes; selected-batch deletion keeps target-only
-duplicate semantics, and policy-only retention is unchanged. The
-retention-trim hardening also prevalidates every target episode's scope, path,
-podcast/library identity, and queue state before its own policy PATCH. Each
-deletion step then rechecks those guards and accounts separately for the policy
-write and its acknowledged deletions. A trim stops at the first failure and
-reports `deleted_count`, `deleted_episode_ids`, `failed_episode_id` when a
-failed target is known, `status`, read-back `state`, and `error` on failure.
+PATCH, because checking only the planned targets could miss duplicates among
+kept episodes and over-delete unique episodes; selected-batch deletion keeps
+target-only duplicate semantics, and policy-only retention is unchanged. A trim
+also prevalidates every target episode's scope, path, podcast/library identity,
+and queue state before its own policy PATCH. Each deletion step then rechecks
+those guards and accounts separately for the policy write and its acknowledged
+deletions. A trim stops at the first failure and reports `deleted_count`,
+`deleted_episode_ids`, `failed_episode_id` when a failed target is known,
+`status`, read-back `state`, and `error` on failure.
 A read-back-only failure can report partial with all DELETE acknowledgements
 and no failed ID. The policy PATCH can succeed even when zero deletions follow,
 so policy application and deletion
@@ -407,7 +358,7 @@ failure. Its result has status `completed` or `partial` and reports
 `requested_count`, `deleted_count`, `deleted_episode_ids`, and, on failure,
 `failed_episode_id`. A failed ID with an ambiguous transport outcome may already
 have been applied; the server neither retries it nor rolls the batch back. The
-single-episode `delete_podcast_episode` behavior is unchanged.
+single-episode `delete_podcast_episode` performs one such delete.
 
 `delete_finished_podcast_episodes` selects from downloaded episodes whose
 progress record is strictly `isFinished` true in one bounded
@@ -468,8 +419,8 @@ enabled. Policy and delete writes re-read their target under a process-local
 mutation lock and abort if the state changed, but there is no atomic
 compare-and-swap with Audiobookshelf: an administrator, the native scheduler,
 or another server process can still race between the final check and the
-PATCH/DELETE. The retention hardening's per-step guards reduce that window but
-do not make a batch atomic.
+PATCH/DELETE. The per-step guards reduce that window but do not make a batch
+atomic.
 
 ## Scheduling and retention semantics
 
@@ -484,11 +435,10 @@ do not make a batch atomic.
   `ABS_SERVER_TIMEZONE` setting and `get_podcast_settings.server_timezone` are
   an operator assertion for reporting only, not backend discovery; if unset,
   the value is `null`/unknown and the connector must not infer the container
-  or system zone. The connector's Compose service sets `Europe/Vienna`, matching
-  the verified native Audiobookshelf zone. That assertion is active in the
-  running deployment: a read-only production `get_podcast_settings` call
-  reported `Europe/Vienna`. It does not discover or change the backend zone.
-  Timezone interpretation and DST behavior were not exercised live.
+  or system zone. Set it to the zone your own Audiobookshelf server is
+  configured with; the example Compose service sets `Europe/Vienna`. It does
+  not discover or change the backend zone, and timezone interpretation and DST
+  behavior are not exercised by the tests.
 - `max_new_episodes` is 1–25 when supplied. On enable, omitted `schedule` or
   `max_new_episodes` reuse current values, with two bounded exceptions: an empty
   schedule becomes hourly `0 * * * *`, and an unlimited current `0` limit
@@ -511,7 +461,7 @@ do not make a batch atomic.
 
 ## Bounded responses and remote URLs
 
-The read-only GET cap remains 1 MiB. Podcast and feed operations use a separate
+The read-only GET cap is 1 MiB. Podcast and feed operations use a separate
 4 MiB response cap; an oversized response fails safely rather than being
 truncated. This applies to the current-feed fetch behind
 `list_available_podcast_episodes`, `download_podcast_episodes`, and
@@ -549,20 +499,18 @@ This URL preflight is defense in depth, not a complete SSRF control: it makes
 no HTTP request, follows no redirect, and does not prevent DNS rebinding or
 DNS changes between the check and the real fetch. Audiobookshelf's native SSRF
 filter and network egress controls are required for the actual feed fetch,
-enclosure download, redirect target, and scheduled future fetch. Read-only
-inspection of the running Audiobookshelf 2.37.2 configuration found
-`DISABLE_SSRF_REQUEST_FILTER`, `EXP_PROXY_SUPPORT`, and
-`SSRF_REQUEST_FILTER_WHITELIST` unset, with the native SSRF filter active. That
-verifies configuration only, not a public redirect, a proxy bypass, or full
-SSRF safety. Native axios may honor `HTTP(S)_PROXY`, so before enabling writes
-the operator must verify a trusted proxy and egress path and restrict outbound
-access. No generic proxy, arbitrary-HTTP, user-administration, or filesystem
-tools are exposed.
+enclosure download, redirect target, and scheduled future fetch. Before
+enabling writes, confirm in your own Audiobookshelf configuration that its
+native request filter is enabled. Native axios may honor `HTTP(S)_PROXY`, so
+also verify a trusted proxy and egress path and restrict outbound access. Such
+a configuration inspection is not proof against a public redirect, a proxy
+bypass, or full SSRF safety. No generic proxy, arbitrary-HTTP,
+user-administration, or filesystem tools are exposed.
 
 ## Requirements
 
-- Python 3.14 (the repository requires `>=3.14`; local tests use uv-managed
-  3.14.6, and the runtime image uses Python 3.14.9).
+- Python 3.14 (the repository requires `>=3.14`; the runtime image uses
+  Python 3.14.9).
 - [uv](https://docs.astral.sh/uv/) for locking, syncing, and running.
 - Audiobookshelf. The request shapes were verified against Audiobookshelf
   `2.37.2` source. The read-only endpoints are:
@@ -576,18 +524,17 @@ tools are exposed.
   `POST /api/podcasts`, `POST /api/podcasts/{id}/download-episodes`,
   `PATCH /api/items/{id}/media`,
   `DELETE /api/podcasts/{id}/episode/{episodeId}?hard=1`, and
-  `DELETE /api/items/{id}?hard=1`. The listening-status round uses two
-  read-only progress routes for `list_podcast_episodes` and
-  `delete_finished_podcast_episodes`: `GET /api/me/progress` (one bounded
-  snapshot) and `GET /api/me/progress/{libraryItemId}/{episodeId}` (the fresh
-  per-target recheck). Both read the connector's own API-key account progress;
-  no route writes or edits progress, and only synthetic tests have exercised
-  them. The episode-selection extension adds no
-  additional backend route: it re-fetches the stored feed through
-  `POST /api/podcasts/feed` and reuses the batch download and hard-delete
-  routes above. The review hardening's `list_podcasts` reuses
-  `GET /api/libraries/{id}/items` with native page/limit and minified reads; it
-  adds no generic API, search-query fallback, or feed-URL route.
+  `DELETE /api/items/{id}?hard=1`. `list_podcast_episodes` and
+  `delete_finished_podcast_episodes` also use two read-only progress routes:
+  `GET /api/me/progress` (one bounded snapshot) and
+  `GET /api/me/progress/{libraryItemId}/{episodeId}` (the fresh per-target
+  recheck). Both read the connector's own API-key account progress, and no
+  route writes or edits progress. The episode-selection tools add no
+  additional backend route: they re-fetch the stored feed through
+  `POST /api/podcasts/feed` and reuse the batch download and hard-delete
+  routes above. `list_podcasts` reuses `GET /api/libraries/{id}/items` with
+  native page/limit and minified reads; it adds no generic API, search-query
+  fallback, or feed-URL route.
 
   Other Audiobookshelf GET routes include mutating operations (for example
   check-for-new-episodes and clear-queue), so they are deliberately absent.
@@ -616,10 +563,10 @@ invalid `ABS_SERVER_TIMEZONE`. Secret contents are never logged or included in
 error messages. `ABS_SERVER_TIMEZONE` is an operator assertion, not backend
 autodiscovery: when it is unset, `server_timezone` is `null` and the connector
 does not infer the Audiobookshelf, connector-container, or host system zone.
-The Compose service sets `Europe/Vienna`, matching the verified native
-Audiobookshelf zone; that setting is committed in `0d15a14` and active in the
-running connector. It remains reporting metadata only: it does not change the
-Audiobookshelf zone, and unset still means `null`/unknown.
+The example Compose service sets `Europe/Vienna`; set it to the zone your own
+Audiobookshelf server is configured with. It remains reporting metadata only:
+it does not change the Audiobookshelf zone, and unset still means
+`null`/unknown.
 
 The root Compose service reads `ABS_ALLOWED_LIBRARY_IDS` from the local,
 gitignored `.env` and fails configuration validation when it is empty or unset.
@@ -637,33 +584,28 @@ own key.
 
 Podcast add, download, schedule, retention, and delete APIs are also admin-only
 in Audiobookshelf 2.37.2, as is the feed re-fetch endpoint used to list available
-episodes. Write mode therefore requires an admin-owned key, and the user accepts
-that risk. This is also why `list_available_podcast_episodes` is grouped with the
-podcast tools rather than exposed in the three-tool read-only mode. Keep that key
-exclusively in this connector in a narrow, read-only `/opt/secrets` mount, and
-give OpenWebUI a distinct MCP bearer token. The admin credential is still
-instance-wide: if stolen, it can affect all books, users, and settings. Library
-allowlists and tool scoping constrain this server's behavior, but they do not
-scope the underlying key. Do not reuse the MCP bearer token as the Audiobookshelf
-key. The connector's Compose service already exists from the Round 2 rollout;
-the selection extension adds no new root Compose or `start.sh` change. The
-review hardening adds only the optional `ABS_SERVER_TIMEZONE` line to that
-existing service; it is committed and active, and no root Compose restructuring
-occurred.
+episodes. Write mode therefore requires an admin-owned key, and enabling writes
+means the operator accepts that risk. This is also why
+`list_available_podcast_episodes` is grouped with the podcast tools rather than
+exposed in the three-tool read-only mode. Keep that key exclusively in this
+connector in a narrow, read-only `/opt/secrets` mount, and give OpenWebUI a
+distinct MCP bearer token. The admin credential is still instance-wide: if
+stolen, it can affect all books, users, and settings. Library allowlists and
+tool scoping constrain this server's behavior, but they do not scope the
+underlying key. Do not reuse the MCP bearer token as the Audiobookshelf key.
 
-The operator rotated the connector's Audiobookshelf API key to the account they
-actually listen with. `listening_status` and `delete_finished_podcast_episodes`
-therefore describe that single account's saved progress, not any OpenWebUI or
-MCP user and not a separate dedicated listening profile. The account identity
-and key are private configuration and are not documented here. This does not
-change the permission model: the key remains an admin-owned, instance-wide
-credential, and the connector has no per-user progress view.
+Because `listening_status` and `delete_finished_podcast_episodes` read
+`/api/me/progress`, point the connector's key at the single Audiobookshelf
+account whose saved progress those tools should report. Their results describe
+that one account's saved progress, not any OpenWebUI or MCP user and not a
+separate per-user progress view. The account identity and key are private
+configuration and are not documented here. This does not change the permission
+model: the key remains an admin-owned, instance-wide credential.
 
-The current private connection is registered through OpenWebUI's application
-database and restricted to the owner's account by OpenWebUI application-level
-ACL checks (server-side access-grant checks with administrator override). This is
-not a multi-user isolation boundary, and the shared MCP bearer token is not
-per-user authentication; it remains the server-side authentication boundary.
+A chat client may restrict an MCP connection to particular accounts through its
+own application-level access checks, but that is not a multi-user isolation
+boundary for this connector. The shared MCP bearer token is not per-user
+authentication; it remains the server-side authentication boundary.
 
 ## Run locally
 
@@ -736,8 +678,8 @@ read key with the admin-owned key described above and adds the write flag:
 ```
 
 Use that variant only after completing the credential, egress, and
-Audiobookshelf SSRF checks and establishing backups. It is documentation of the
-opt-in, not an approval to deploy.
+Audiobookshelf SSRF checks and establishing backups. It documents the opt-in,
+not a recommendation to enable it.
 
 The mounted files must be readable by the effective runtime UID/GID and should
 be readable only by that identity. The `docker run` example above keeps the
@@ -766,259 +708,69 @@ Host/Origin and request-body limits, the MCP tool lifecycle, library/search/
 item scoping, bounded responses, redirects, timeouts, backend error-body
 redaction, podcast reads, feed duplicate and download deduplication, cron and
 remote-URL guards, retention/trim calculation, queue-active refusal, and
-partial-failure reporting. The committed Round 3 baseline passed the full suite
-with verified extension coverage for title filtering/ordering, paging beyond 50,
+partial-failure reporting.
+
+Podcast coverage also includes title filtering and ordering, paging beyond 50,
 total/offset/limit/next-offset fields, undated ordering, the 4 MiB feed bound,
-opaque/stale/podcast-scoped feed IDs, quoted and unquoted enclosure URL matching,
-native-versus-feed ID rejection, membership resolution and URL preflight before
-a single download POST, submitted-request queue counts, skipped selections and
-windows without backfill, bulk-delete prevalidation and partial results, the
-full-item DELETE reply exceeding the cap after application, and single delete.
-
-The committed baseline `c58b107` passed 510 tests. Round 3, committed as
-`0a1b962`, passed 579 tests in 2.30 s on Python 3.14.6, including 123
-podcast-client and 64 protocol tests; no new dependencies or lockfile changes
-were introduced, and locked `pip-audit` reported no known vulnerabilities.
-Those historical results cover the previous fifteen-tool release; they do not
-revalidate the sixteen-tool build or the seventeen-tool round.
-
-The listening-status round, committed as `1ddb317`, passed 763 tests in 2.99 s
-on Python 3.14.6 via `uv run --frozen pytest`. New coverage includes progress
+opaque/stale/podcast-scoped feed IDs, quoted and unquoted enclosure URL
+matching, native-versus-feed ID rejection, membership resolution and URL
+preflight before a single download POST, submitted-request queue counts,
+skipped selections and windows without backfill, bulk-delete prevalidation and
+partial results, the full-item DELETE reply exceeding the cap after
+application, and single delete. Listening-status coverage includes progress
 joins for all three statuses (with typed `currentTime` variants), malformed
 progress envelopes failing closed, strict finished-only selection, oldest-first
-ordering with undated episodes last, 1–25 limit bounds, a zero-finished result
-that sends no DELETE, per-target recheck request ordering, both skip reasons
-continuing the batch, hard-failure partial accounting, queue-active and stale
-fingerprint refusals before any progress read, writes-disabled refusal, 17/3
-tool registration, closed schemas, and unknown-argument rejection with zero
-backend requests. These are synthetic tests; the round is not deployed.
+ordering with undated episodes last, the 1–25 limit bounds, a zero-finished
+result that sends no DELETE, per-target recheck request ordering, both skip
+reasons continuing the batch, hard-failure partial accounting, queue-active and
+stale-fingerprint refusals before any progress read, writes-disabled refusal,
+17/3 tool registration, closed schemas, and unknown-argument rejection with
+zero backend requests.
 
-Historical — the review hardening's final synthetic suite passed 716 tests in
-2.76 s on Python 3.14.6 via `uv run --frozen pytest` (218 podcast, 73 server,
-112 config, and 313 unchanged client/guard tests). A fresh pre-deployment run
-passed 716 tests in 2.74 s; the diff check and Compose configuration check were
-quiet and
-passed, with only pre-existing TRAIN-LOGS warnings. The review suite's
-independent oracles passed: retention trim after one ACK followed by combined
-or separate scope/path/queue drift performs
-exactly one DELETE and reports partial with one deletion; a latest-download
-scope change during enclosure preflight sends zero queue POSTs; and `dry_run`,
-`hard`, `confirm`, `only_listened`, and `fingerprint` each cause zero backend
-requests of any kind. A 17,280-case sample of connector-accepted cron
-expressions (10 minute forms × 8 hour × 6 day × 6 month × 6 weekday) also
-passed the installed native pure validator. A fresh `pip-audit` 2.10.1 run reported no
-known vulnerabilities with no dependency changes. Config independent review
-found one LOW-severity sanitized I/O gap (`OSError`), now fixed, with 112
-config tests verified. The independent server review passed with no severity
-findings (the 73 server tests plus raw-HTTP and direct unknown-key,
-strict boolean/numeric, auth-bound, fingerprinted-state, and cron/note/
-annotation probes). The independent client review passed except one LOW
-duplicate-kept-prefix ambiguity, reproduced by primary and fixed; the review's
-F1 follow-up is closed with no new findings or policy-only regression
-(218 podcast tests pass), and a primary rerun of the duplicate probe with
-`keep` 2 and 5 returned
-a sanitized ambiguity error with zero mutations and unchanged policy.
-Primary review also fixed malformed post-PATCH/final-state partial accounting,
-safe immediate-deletion notes, an omitted schedule instruction, and impossible
-list-page totals.
+The suite holds 763 tests at the time of writing. These are synthetic
+unit/protocol tests: native queue FIFO and dedupe behavior is source-verified,
+not exercised against a live queue. No model-in-the-loop evaluation, frontend
+mutation test, or real Audiobookshelf download/delete/policy/subscription call
+is part of the suite. The tests do not prove LLM behavior, download
+completion, recursive filesystem deletion, NFS or symlink behavior, or
+physical file removal.
 
-All required client, server, and config reviews are complete with findings
-fixed and none blocking; the safety reviews are closed.
+## Continuous integration
 
-The optional installed-client HTTP compatibility check is complete. The
-installed OpenWebUI MCP client 1.27.2 (Python 3.11.17) ran inside the existing
-open-webui container via `docker exec` stdin (a bare MCP SDK client, not the
-application chat) against a temporary gateway of the new candidate source
-(Python 3.14.6, `mcp` 1.30.0, uvicorn 0.54.0) on random ports bound to
-`172.31.0.1` only — no `0.0.0.0`, no published ports — with the backend fully
-`httpx.MockTransport` synthetic (25 requests to `abs.synthetic.invalid` plus
-DNS stubs; not real Audiobookshelf). All 114/114 client and 25/25 host checks
-passed (artifact `/tmp/opencode/abs-followup-integration/probe-result.json`,
-log `probe-run.log`): 16 tools with closed schemas and no session, minified
-`list_podcasts` paging (counts 1/2), an oldest-first feed query, an inclusive
-window of 4 with 2 queued and 2 skipped for exact reasons and no backfill,
-settings showing `queued` 3 and `active` 0 with `Europe/Vienna` reported while
-the connector ran UTC and made zero settings/status backend lookups (operator
-assertion proven), a synthetic schedule PATCH with read-back, downloaded native
-IDs, a selected synthetic DELETE keeping one episode
-(`filesystem_removal: not_verified`), and `delete_podcast` with `dry_run=true`
-rejected as an input error with zero additional backend requests (counter 25
-before, 25 after). Primary independently verified the artifact and cleanup:
-both listeners closed, no runtime fake secret dirs, source hashes unchanged
-at probe time, and the temporary candidate stopped. That probe itself performed
-no image build, scan, promotion, restart, or real media write. The later
-pre-deployment build/scan/promotion and targeted connector recreation are
-recorded under Deployment notes. That bare-SDK probe is not the OpenWebUI
-application adapter: the adapter-level production verification covers only
-sixteen-tool discovery with closed schemas, the initialize instructions, and an
-authenticated read-only `list_libraries`, so the frontend chat and
-model-in-the-loop behavior remain unverified. This probe predates the
-listening-status round; it did not exercise the seventeenth tool or
-`listening_status`.
+`.github/workflows/audiobookshelf-mcp.yml` runs the locked test suite, audits
+the locked runtime dependencies with pinned `pip-audit`, and builds the image
+to scan it with Trivy, failing only on fixable HIGH/CRITICAL findings; unfixed
+base-image findings are excluded from that gate and triaged separately. The
+workflow publishes nothing and uses no repository secrets. Dependabot opens
+weekly update PRs for `uv.lock`, the Dockerfile base image, and GitHub Actions;
+they are reviewed manually.
 
-These are synthetic unit/protocol tests: native queue FIFO and dedupe behavior
-is source-verified, not exercised against a live queue. No actual
-model-in-the-loop evaluation, frontend mutation
-test, or real Audiobookshelf download/delete/policy/subscription call has been
-run. The suite does not prove LLM behavior, download completion, recursive
-filesystem deletion, NFS or symlink behavior, or physical file removal. A
-review-era bind-mounted-new-source smoke on the exact Python 3.14.9 runtime
-(offline, ephemeral network-none, read-only, non-root, `cap-drop` container,
-removed afterwards) passed imports, the Vienna assertion, 3/16-tool
-registration with closed strict schemas, and unknown-argument rejection with
-zero backend requests. After the build, the actual candidate image was
-smoke-tested the same way and passed the same checks. Both are smoke evidence
-only, not HTTP, frontend/model-chat, or live-write validation, and neither
-covers the 17-tool build; no container smoke has been run for `1ddb317`.
+## Deployment
 
-## Deployment notes
+The Compose service `audiobookshelf-mcp` builds this directory's Dockerfile and
+mounts the Audiobookshelf API key and the MCP bearer token as read-only files
+from `/opt/secrets/audiobookshelf-mcp/` (see `compose.yml`). Podcast writes stay
+off unless `ABS_ENABLE_PODCAST_WRITES=true` is set explicitly; the `compose.yml`
+in this repository sets it for its own service, so confirm that the value is
+deliberate before deploying. Keep the service on a private network with no
+published host port, and give it only narrow, read-only secret mounts.
 
-- OpenWebUI `0.12.3` bundles MCP client `1.27.2`. The user has confirmed the
-  three-tool read-only connection works through that installed frontend over
-  live HTTP (protocol `2025-11-25`, no session ID). Compose now pins
-  `ghcr.io/open-webui/open-webui:v0.12.4` (commit `5e400d3`), and the user
-  recreated the OpenWebUI container on that image, but the MCP client version
-  bundled in 0.12.4 has **not** been verified. Keep every `1.27.2` claim tied
-  to 0.12.3 and do not extend it to the new image. The running local connector
-  serves the deployed sixteen-tool build from `0d15a14` (three read-only,
-  thirteen podcast), and Compose sets `ABS_ENABLE_PODCAST_WRITES=true`. The
-  seventeen-tool listening-status round committed at `1ddb317` is not
-  deployed. The private MCP connection was registered
-  through OpenWebUI's application database and limited to the owner's account
-  by application-level ACL checks (server-side access grants, with
-  administrator override). That client has known security advisories: do not
-  downgrade this server to match it; upgrade the client where possible. The
-  server uses patched `mcp` `1.30.0` with an explicit 1 MiB request-body limit.
-- New round committed, not deployed (2026-10-25): `1ddb317` adds
-  `listening_status` and `delete_finished_podcast_episodes`. No build, scan,
-  promotion, or container restart was performed for it. The running connector
-  remains the healthy sixteen-tool `0d15a14` image, and the new tool has not
-  been exercised through the OpenWebUI adapter, the frontend, or a live
-  Audiobookshelf write. The 763-test suite and 17/3 registration checks are
-  synthetic. The commit is pushed on the open PR branch (#3); its PR CI result
-  was not observed when this was written and must not be described as green.
-- The `0d15a14` candidate was built from the reviewed source hashes (abbreviated:
-  `config.py` `4c785bf9…b0b092`, `podcasts.py` `894d8ba1…98a4a2`, `server.py`
-  `37f5ecfd…a5bf05b`, matching the finalized code), scanned (see below), and
-  promoted to `audiobookshelf-mcp:local` (image digest
-  `sha256:459d05ad97623726798faf850b8a82eb65294900dfcc83726d5fb7a80edb7452`).
-  Only `audiobookshelf-mcp` was recreated
-  (`docker compose up --no-deps --no-build --force-recreate --wait`); it is
-  healthy, started `2026-10-25T11:52:27Z` (12:52 Vienna CET). Audiobookshelf and
-  OpenWebUI were not restarted: their start times remained
-  `2026-10-24T08:51:54Z` and `2026-10-25T03:00:20Z`. Rollback tag
-  `audiobookshelf-mcp:before-review-0a1b962` preserves the old fifteen-tool
-  image; the earlier `audiobookshelf-mcp:before-selected-c58b107` tag is also
-  retained. Runtime verification confirmed UID `1000:1000`, read-only root and
-  secret mounts, `cap_drop: ALL` with `no-new-privileges`, no privileged mode,
-  and no published ports.
-- Historical — Round 3 (earlier release): committed `0a1b962`, fifteen tools
-  (three read-only, twelve podcast). It was source-hashed (`podcasts.py`
-  `69c933caacee2236ba0cb6f35bf1ee00aafcf4fda7d82b0703b908392191cdaf`,
-  `server.py`
-  `af0437b03f44966607eee87ffbcb6f4de23b7dda817319ba28c6692cf67c7003`) and
-  promoted from image digest
-  `sha256:6047bdadf7d1f9489d1dfa8bbc16dc66204670d9c60d3470c34104951dc67b1d`
-  on 2026-10-24 22:03. These hashes and checks do not describe the sixteen-tool
-  or seventeen-tool images.
-- Historical — the installed OpenWebUI MCP `1.27.2` client exercised the
-  Round 3 candidate over real HTTP against a temporary synthetic backend: 15-tool
-  discovery, paging beyond 50, selected old episodes `5`/`7`, an inclusive
-  anchor-9 window of 10 with downloaded episodes `10`/`11` skipped (8 submitted,
-  2 skipped), no backfill, partial-delete reporting, and error redaction. All
-  mutating checks were synthetic; the probe was removed automatically. No real
-  download, delete, policy, or subscription call was made. This evidence does
-  not validate the sixteen-tool release, annotations, `skipped_episodes`,
-  retention rework, settings fields, or the later listening-status round.
-- Deployed release status (2026-10-25): `0d15a14` is committed, built, scanned,
-  promoted, and deployed as the live sixteen-tool connector (three tools with
-  writes disabled). The required client, server, and config reviews are
-  complete with findings fixed and none blocking; its final
-  synthetic suite passed 716 tests (fresh pre-deployment run 2.74 s), and the
-  optional installed-client HTTP compatibility check passed against a synthetic
-  backend. Deployment was limited to the connector; no media was written. This
-  status describes `0d15a14` only; `1ddb317` is committed and undeployed.
-- Deployed-release live verification through the installed OpenWebUI adapter
-  (read-only, after the `0d15a14` deployment, 0.12.3 era): the OpenWebUI
-  application's MCPClient adapter, using the
-  persisted production connection, discovered sixteen tool specs with closed
-  `additionalProperties: false` schemas, received the MCP initialize discovery
-  instructions, and completed an authenticated read-only `list_libraries` call.
-  That adapter was used for discovery and `list_libraries` only, and the check
-  did not cover the seventeen-tool build.
-- Deployed-release live verification of the connector itself (read-only, after
-  deployment): sixteen tools are exposed with `additionalProperties: false` on
-  every input, stateless authenticated MCP is enforced, and the connector is
-  healthy. Connector-local authenticated reads — direct to the connector, not
-  through the OpenWebUI adapter — were `list_libraries` → `list_podcasts`
-  (`limit` 1, `page` 0), which returned 1 of 8 podcasts, then
-  `get_podcast_settings` on the first podcast, which reported `server_timezone`
-  `Europe/Vienna` with integer queued/active counts. No fingerprint field, media
-  write, feed fetch, download, or policy change was performed. This evidence
-  covers the sixteen-tool build, not `listening_status` or
-  `delete_finished_podcast_episodes`.
-- Historical — pre-deployment live harmless reads through the persisted
-  connection (previous fifteen-tool release): `list_libraries`,
-  `search_library` for `UFO CLUB`, an available-feed oldest-first page of two
-  episodes (`offset` 0, `limit` 2; `total` 554, earliest 2015-10-08), a feed
-  title query, and an oldest-first downloaded page of two episodes (`offset` 0,
-  `limit` 2; `total` 10). No live offset-50 page was tested; the downloaded
-  podcast has only 10 episodes, and paging beyond 50 is covered only by
-  synthetic tests. Resolver discovery then showed exactly 15 tools;
-  owner-only nested `config.access_grants` remained intact, an unrelated regular
-  user was denied, and administrator override remained.
-- Not yet verified: the `1ddb317` build's OpenWebUI adapter discovery and
-  frontend behavior, the OpenWebUI frontend/model-chat workflow for the
-  deployed release, model-in-the-loop behavior, real download completion, and
-  real write effects such as physical file removal. The adapter-level
-  production check covers discovery, initialize instructions, and
-  `list_libraries` only — not a chat
-  turn, tool selection, or podcast listing/settings read through the frontend —
-  and the synthetic compatibility check used a bare MCP SDK client from the
-  OpenWebUI container, not the application chat. The protocol client
-  verification is separate from frontend mutation E2E; the previously confirmed
-  baseline chat reads do not cover the new selection workflow. No live write
-  operation has been performed by this release, and `delete_finished_podcast_episodes`
-  has never run against a live Audiobookshelf instance.
-- Keep the MCP connection private to the intended owner. The shared backend API
-  key is not per-user authentication, and tool results may be sent to an
-  external model provider by the chat client.
-- Once enabled, schedules and automatic retention run inside Audiobookshelf,
-  independently of OpenWebUI, the model, or an active chat. Disabling a chat or
-  the MCP server does not stop them.
-- The SSRF flag check was a read-only inspection of the running Audiobookshelf
-  2.37.2 configuration. No live feed redirect, proxy bypass, or timezone/DST
-  behavior has been tested. `ABS_SERVER_TIMEZONE=Europe/Vienna` is an operator
-  assertion matching the verified native Audiobookshelf zone; it is active in
-  the running connector and reported by live `get_podcast_settings`, but it does
-  not discover or change that zone. The SSRF, NFS/symlink path, 4 MiB response,
-  and 10-second timeout caveats remain.
-- Writes remain off by default. This private deployment explicitly enables them
-  after the user-confirmed read-only verification; enabling them requires the
-  admin-key risk acceptance described above. A compromise of OpenWebUI or the
-  MCP bearer token can invoke destructive tools without a human confirmation
-  step. The server creates no backups and cannot verify or restore deleted
-  physical files; a successful delete may be unrecoverable.
-- This documentation update changes no service, credential, or media state.
-  Implementation commit `0d15a14`, the candidate build/scan/promotion, and the
-  targeted connector recreation were authorized and are complete; the live
-  connector serves sixteen tools. `0d15a14`, the `5e400d3` Compose pin, and the
-  newer `1ddb317` commit are pushed on the open PR branch (#3). The `1ddb317`
-  round is not deployed, and its PR CI result was not observed when this was
-  written. Broader deployment requires separate, explicit
-  authorization that has not been granted. Any future restart and any media
-  mutation likewise require
-  separate authorization. The optional installed-client HTTP compatibility
-  check validates sixteen-tool protocol integration against a synthetic backend
-  only; the separate adapter-level production check covers discovery, initialize
-  instructions, and `list_libraries` only.
-- The runtime base is digest-pinned `python:3.14.9-slim`. Trivy 0.76.1 scanned
-  the fresh `0d15a14` candidate: the CI gate (`--ignore-unfixed`) reported 0
-  fixable HIGH/CRITICAL findings. A full same-base/dependency scan reports 44
-  unfixed HIGH package findings across 8 CVEs, 0 critical — the same known base
-  issues, not a zero-vulnerability claim. These results describe `0d15a14`;
-  no scan has been run for `1ddb317`. Reports are
-  `/tmp/opencode/abs-review-scan.json` and
-  `/tmp/opencode/abs-review-scan-full.json`; the earlier Round 3 scan reports
-  remain historical. Re-scan weekly and upgrade the digest when Debian
-  publishes fixes; do not suppress the gate.
+Keep the MCP connection private to the intended owner. The shared backend API
+key is not per-user authentication, and tool results may be sent to an external
+model provider by the chat client.
+
+Once enabled, schedules and automatic retention run inside Audiobookshelf,
+independently of OpenWebUI, the model, or an active chat. Disabling a chat or
+the MCP server does not stop them. A compromise of OpenWebUI or the MCP bearer
+token can invoke destructive tools without a human confirmation step. The
+server creates no backups and cannot verify or restore deleted physical files;
+a successful delete may be unrecoverable.
+
+Before enabling writes, complete the credential, egress, and Audiobookshelf
+SSRF checks described above and establish backups. Verify MCP client
+compatibility against your own OpenWebUI version rather than assuming it: the
+connector depends only on standard MCP discovery, initialize instructions, and
+tool calls over authenticated Streamable HTTP, and tool annotations are
+advisory. The image base is digest-pinned to `python:3.14.9-slim`; re-scan
+regularly and upgrade the digest when base-image fixes are published rather
+than suppressing the gate.

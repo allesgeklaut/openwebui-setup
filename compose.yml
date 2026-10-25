@@ -234,7 +234,7 @@ services:
     image: audiobookshelf-mcp:local
     container_name: audiobookshelf-mcp
     restart: unless-stopped
-    # Run as the host user (johannes, 1000:1000) so user-owned secret files
+    # Run as the host user (1000:1000) so user-owned secret files
     # can be 0600 instead of world-readable. The image's own default remains
     # 10001:10001 in audiobookshelf-mcp/Dockerfile.
     user: "1000:1000"
