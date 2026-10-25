@@ -249,6 +249,10 @@ services:
       - ABS_API_KEY_FILE=/run/secrets/abs_api_key
       - MCP_AUTH_TOKEN_FILE=/run/secrets/mcp_token
       - ABS_ENABLE_PODCAST_WRITES=true
+      # Operator assertion only: must match Audiobookshelf's own configured
+      # server time zone (verified natively in the ABS container). This is not
+      # the connector container's local zone, and it does not change ABS.
+      - ABS_SERVER_TIMEZONE=Europe/Vienna
     volumes:
       - /opt/secrets/audiobookshelf-mcp/abs_api_key:/run/secrets/abs_api_key:ro
       - /opt/secrets/audiobookshelf-mcp/mcp_token:/run/secrets/mcp_token:ro

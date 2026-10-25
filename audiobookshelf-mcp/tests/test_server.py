@@ -13,11 +13,14 @@ import httpx
 import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.server.fastmcp.exceptions import ToolError
 
 from audiobookshelf_mcp.client import MAX_RESPONSE_BYTES
 from audiobookshelf_mcp.config import Config
 from audiobookshelf_mcp.server import (
+    MAX_PODCAST_PAGE,
     MAX_REQUEST_BODY_BYTES,
+    UNKNOWN_ARGUMENT_ERROR,
     SharedBearerVerifier,
     create_server,
 )
@@ -565,6 +568,7 @@ FEED_EPISODE_URLS = tuple(
 )
 READ_TOOL_NAMES = {"list_libraries", "search_library", "get_item"}
 WRITE_TOOL_NAMES = {
+    "list_podcasts",
     "get_podcast_settings",
     "list_podcast_episodes",
     "list_available_podcast_episodes",
@@ -695,8 +699,10 @@ class _PodcastBackend(httpx.MockTransport):
         keep_episodes: int = 0,
         episodes: list[dict[str, Any]] | None = None,
         feed_episodes: list[dict[str, Any]] | None = None,
+        record_downloads: bool = False,
     ) -> None:
         self.requests: list[httpx.Request] = []
+        self.record_downloads = record_downloads
         self.items: dict[str, dict[str, Any]] = {
             "pod1": _podcast_item(
                 keep_episodes=keep_episodes, episodes=episodes
@@ -765,6 +771,16 @@ class _PodcastBackend(httpx.MockTransport):
 
         if method == "GET" and path.startswith("/api/items/"):
             return self._read_item(path.rsplit("/", 1)[-1])
+        if method == "GET" and path == "/api/libraries":
+            return httpx.Response(
+                200,
+                json={
+                    "libraries": [
+                        {"id": "lib1", "name": "Podcasts", "mediaType": "podcast"},
+                        {"id": "lib3", "name": "Hidden", "mediaType": "podcast"},
+                    ]
+                },
+            )
         if method == "GET" and path == "/api/libraries/lib1":
             return httpx.Response(
                 200,
@@ -776,10 +792,13 @@ class _PodcastBackend(httpx.MockTransport):
                 },
             )
         if method == "GET" and path == "/api/libraries/lib1/items":
+            limit = int(request.url.params.get("limit", "100"))
+            page = int(request.url.params.get("page", "0"))
+            start = page * limit
             return httpx.Response(
                 200,
                 json={
-                    "results": self.library_items,
+                    "results": self.library_items[start : start + limit],
                     "total": len(self.library_items),
                 },
             )
@@ -822,6 +841,18 @@ class _PodcastBackend(httpx.MockTransport):
         if method == "POST" and path == "/api/podcasts/pod1/download-episodes":
             if self.fail_download_post:
                 return self._backend_error()
+            if self.record_downloads:
+                submitted = json.loads(request.content or b"[]")
+                queued = self.items["pod1"].setdefault(
+                    "episodeDownloadsQueued", []
+                )
+                queued.extend(
+                    {
+                        "guid": episode["guid"],
+                        "url": episode["enclosure"]["url"],
+                    }
+                    for episode in submitted
+                )
             return httpx.Response(200)
         if method == "DELETE" and path.startswith("/api/podcasts/pod1/episode/"):
             self.episode_delete_calls += 1
@@ -889,20 +920,79 @@ async def test_write_mode_registers_exactly_read_and_podcast_tools(
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
 
     assert set(tools) == READ_TOOL_NAMES | WRITE_TOOL_NAMES
-    assert len(tools) == 15
-    for name in WRITE_TOOL_NAMES:
-        properties = tools[name].inputSchema["properties"]
+    assert len(tools) == 16
+    for name, tool in tools.items():
+        assert tool.inputSchema["additionalProperties"] is False, name
+        properties = tool.inputSchema["properties"]
         assert not {
             "ctx",
             "approved",
             "confirm",
             "confirmation",
+            "dry_run",
             "fingerprint",
             "expected_fingerprint",
         } & set(properties)
-        serialized = json.dumps(tools[name].inputSchema)
+        serialized = json.dumps(tool.inputSchema)
         for forbidden in ("approved", "confirm", "fingerprint"):
             assert forbidden not in serialized
+
+    list_podcasts = tools["list_podcasts"].inputSchema
+    assert set(list_podcasts["properties"]) == {"library_id", "limit", "page"}
+    assert list_podcasts["properties"]["limit"]["minimum"] == 1
+    assert list_podcasts["properties"]["limit"]["maximum"] == 50
+    assert list_podcasts["properties"]["limit"]["default"] == 25
+    assert list_podcasts["properties"]["page"]["minimum"] == 0
+    assert list_podcasts["properties"]["page"]["maximum"] == MAX_PODCAST_PAGE
+    assert list_podcasts["properties"]["page"]["default"] == 0
+    for field_name in ("library_id", "limit", "page"):
+        assert list_podcasts["properties"][field_name]["description"]
+
+    feed_ids = tools["download_podcast_episodes"].inputSchema["properties"][
+        "episode_ids"
+    ]
+    assert feed_ids["items"]["pattern"] == "^feed_[0-9a-f]{64}$"
+    assert "feed_" in feed_ids["items"]["description"]
+    native_ids = tools["delete_podcast_episodes"].inputSchema["properties"][
+        "episode_ids"
+    ]
+    assert native_ids["items"]["pattern"] == "^[A-Za-z0-9_-]+$"
+    assert "Native" in native_ids["items"]["description"]
+    assert native_ids["items"]["pattern"] != feed_ids["items"]["pattern"]
+
+    for name in ("list_libraries", "search_library", "get_item", "list_podcasts",
+                 "get_podcast_settings", "list_podcast_episodes"):
+        annotation = tools[name].annotations
+        assert annotation is not None, name
+        assert annotation.readOnlyHint is True, name
+        assert annotation.destructiveHint is False, name
+        assert annotation.openWorldHint is False, name
+
+    assert tools["list_available_podcast_episodes"].annotations.openWorldHint is True
+    for name in (
+        "add_podcast",
+        "download_latest_episodes",
+        "download_podcast_episodes",
+        "download_episodes_from",
+    ):
+        annotation = tools[name].annotations
+        assert annotation is not None, name
+        assert annotation.readOnlyHint is False, name
+        assert annotation.destructiveHint is False, name
+        assert annotation.idempotentHint is False, name
+        assert annotation.openWorldHint is True, name
+    for name in (
+        "delete_podcast",
+        "delete_podcast_episode",
+        "delete_podcast_episodes",
+        "set_podcast_retention",
+        "set_podcast_schedule",
+    ):
+        annotation = tools[name].annotations
+        assert annotation is not None, name
+        assert annotation.readOnlyHint is False, name
+        assert annotation.destructiveHint is True, name
+        assert annotation.idempotentHint is False, name
 
     for name in ("list_podcast_episodes", "list_available_podcast_episodes"):
         properties = tools[name].inputSchema["properties"]
@@ -1060,6 +1150,13 @@ async def test_get_podcast_settings_projects_safe_state(
     config_factory: Callable[..., Config],
 ) -> None:
     backend = _PodcastBackend(keep_episodes=5)
+    backend.items["pod1"]["episodeDownloadsQueued"] = [
+        {"guid": "queued-1", "url": "https://93.184.216.34/q1.mp3"},
+        {"guid": "queued-2", "url": "https://93.184.216.34/q2.mp3"},
+    ]
+    backend.items["pod1"]["episodesDownloading"] = [
+        {"guid": "active-1", "url": "https://93.184.216.34/a1.mp3"}
+    ]
 
     async with _mcp_session(
         config_factory(podcast_writes_enabled=True), backend
@@ -1077,8 +1174,13 @@ async def test_get_podcast_settings_projects_safe_state(
     assert payload["max_new_episodes"] == 0
     assert payload["keep_episodes"] == 5
     assert payload["downloaded_count"] == 3
+    assert payload["queued_download_count"] == 2
+    assert payload["active_download_count"] == 1
+    assert payload["server_timezone"] is None
+    assert "unknown" in payload["notes"].lower()
     assert "local timezone" in payload["notes"]
     assert "does not trim" in payload["notes"]
+    assert "not proof of completion" in payload["notes"]
 
     serialized = json.dumps(payload)
     assert "fingerprint" not in serialized
@@ -1553,12 +1655,28 @@ async def test_download_selected_episodes_skips_known_and_rejects_stale_ids(
     assert all_known_payload["selected_count"] == 2
     assert all_known_payload["queued_count"] == 0
     assert all_known_payload["skipped_count"] == 2
+    assert [episode["title"] for episode in all_known_payload["episodes"]] == []
+    assert {
+        (episode["title"], episode["reason"])
+        for episode in all_known_payload["skipped_episodes"]
+    } == {
+        ("Feed Episode 2", "already_downloaded"),
+        ("Feed Episode 4", "already_queued"),
+    }
+    assert all(
+        set(episode) == {"id", "title", "published_at", "reason"}
+        for episode in all_known_payload["skipped_episodes"]
+    )
 
     partly_known_payload = _tool_payload(partly_known)
     assert partly_known_payload["status"] == "queued"
     assert partly_known_payload["selected_count"] == 2
     assert partly_known_payload["queued_count"] == 1
     assert partly_known_payload["skipped_count"] == 1
+    assert [
+        (episode["title"], episode["reason"])
+        for episode in partly_known_payload["skipped_episodes"]
+    ] == [("Feed Episode 2", "already_downloaded")]
 
     downloads = [
         json.loads(request.content)
@@ -1701,6 +1819,29 @@ async def test_download_episodes_from_skips_known_without_backfill(
     assert payload["selected_count"] == 10
     assert payload["queued_count"] == 9
     assert payload["skipped_count"] == 1
+    assert [
+        {
+            "title": episode["title"],
+            "published_at": episode["published_at"],
+            "reason": episode["reason"],
+        }
+        for episode in payload["skipped_episodes"]
+    ] == [
+        {
+            "title": "Feed Episode 7",
+            "published_at": "1970-01-01T00:00:07+00:00",
+            "reason": "already_downloaded",
+        }
+    ]
+    assert set(payload["skipped_episodes"][0]) == {
+        "id",
+        "title",
+        "published_at",
+        "reason",
+    }
+    assert [episode["title"] for episode in payload["episodes"]] == [
+        f"Feed Episode {index}" for index in range(5, 15) if index != 7
+    ]
 
     downloads = [
         json.loads(request.content)
@@ -2245,6 +2386,8 @@ async def test_set_podcast_retention_trim_deletes_oldest_surplus(
     config_factory: Callable[..., Config],
 ) -> None:
     backend = _PodcastBackend()
+    backend.items["pod1"]["media"]["autoDownloadEpisodes"] = True
+    backend.items["pod1"]["media"]["maxEpisodesToKeep"] = 5
 
     async with _mcp_session(
         config_factory(podcast_writes_enabled=True), backend
@@ -2260,8 +2403,15 @@ async def test_set_podcast_retention_trim_deletes_oldest_surplus(
     assert payload["trim_existing"] is True
     assert payload["deleted_count"] == 2
     assert payload["status"] == "completed"
-    assert payload["state"]["downloaded_count"] == 1
-    assert payload["state"]["keep_episodes"] == 1
+    nested = payload["state"]
+    assert nested["auto_download"] is True
+    assert nested["downloaded_count"] == 1
+    assert nested["keep_episodes"] == 1
+    assert nested["queued_download_count"] == 0
+    assert nested["active_download_count"] == 0
+    assert "future automatic" in nested["notes"]
+    assert "did not delete anything" not in nested["notes"]
+    assert "No episode" not in nested["notes"]
     assert "fingerprint" not in json.dumps(payload)
 
     assert next(
@@ -2448,7 +2598,7 @@ async def test_invalid_episode_ids_never_mutate(
         )
 
     assert malformed.isError is True
-    assert "Invalid episode ID" in _error_text(malformed)
+    assert "episode_id" in _error_text(malformed)
     assert not_member.isError is True
     assert "Podcast episode not found" in _error_text(not_member)
     assert not any(
@@ -2481,6 +2631,16 @@ async def test_write_tool_argument_bounds_are_strict_and_never_reach_backend(
 ) -> None:
     backend = _PodcastBackend()
     invalid_calls = (
+        ("list_podcasts", {"library_id": "lib1", "limit": 0}),
+        ("list_podcasts", {"library_id": "lib1", "limit": 51}),
+        ("list_podcasts", {"library_id": "lib1", "limit": True}),
+        ("list_podcasts", {"library_id": "lib1", "limit": 1.0}),
+        ("list_podcasts", {"library_id": "lib1", "page": -1}),
+        ("list_podcasts", {"library_id": "lib1", "page": MAX_PODCAST_PAGE + 1}),
+        ("list_podcasts", {"library_id": "lib1", "page": True}),
+        ("list_podcasts", {"library_id": "lib1", "page": 1.0}),
+        ("list_podcasts", {"library_id": "bad/id"}),
+        ("list_podcasts", {"library_id": "lib1", "offset": 1}),
         ("list_podcast_episodes", {"podcast_id": "pod1", "limit": 0}),
         ("list_podcast_episodes", {"podcast_id": "pod1", "limit": 51}),
         ("list_podcast_episodes", {"podcast_id": "pod1", "limit": True}),
@@ -2640,3 +2800,465 @@ async def test_write_tool_argument_bounds_are_strict_and_never_reach_backend(
             assert result.isError is True, (tool_name, arguments)
 
     assert backend.requests == []
+
+
+# --- Closed input schemas and unknown-argument rejection -----------------
+
+
+def _library_podcast(
+    podcast_id: str, title: str, downloaded_count: int | None
+) -> dict[str, Any]:
+    media: dict[str, Any] = {
+        "metadata": {
+            "title": title,
+            "feedUrl": f"https://93.184.216.34/{podcast_id}.xml",
+        }
+    }
+    media["numEpisodes"] = downloaded_count
+    if downloaded_count is not None:
+        media["episodes"] = [
+            {"id": f"{podcast_id}ep{index}"}
+            for index in range(1, downloaded_count + 1)
+        ]
+    return {
+        "id": podcast_id,
+        "libraryId": "lib1",
+        "mediaType": "podcast",
+        "media": media,
+    }
+
+
+async def test_list_podcasts_lists_subscriptions_with_native_paging(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+    backend.library_items = [
+        _library_podcast("pod3", "Third Podcast", 3),
+        _library_podcast("pod2", "Second Podcast", 0),
+        _library_podcast("pod1b", "Unknown Count Podcast", None),
+    ]
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        first = await session.call_tool(
+            "list_podcasts", {"library_id": "lib1", "limit": 2}
+        )
+        second = await session.call_tool(
+            "list_podcasts", {"library_id": "lib1", "limit": 2, "page": 1}
+        )
+
+    assert first.isError is not True
+    first_payload = _tool_payload(first)
+    assert first_payload["library_id"] == "lib1"
+    assert first_payload["count"] == 2
+    assert first_payload["total"] == 3
+    assert first_payload["page"] == 0
+    assert first_payload["limit"] == 2
+    assert first_payload["has_more"] is True
+    assert first_payload["next_page"] == 1
+    assert {podcast["id"] for podcast in first_payload["podcasts"]} == {
+        "pod3",
+        "pod2",
+    }
+    counts = {
+        podcast["id"]: podcast["downloaded_count"]
+        for podcast in first_payload["podcasts"]
+    }
+    assert counts["pod3"] == 3
+    assert counts["pod2"] == 0
+    for podcast in first_payload["podcasts"]:
+        assert set(podcast) == {"id", "title", "downloaded_count"}
+
+    assert second.isError is not True
+    second_payload = _tool_payload(second)
+    assert second_payload["count"] == 1
+    assert second_payload["total"] == 3
+    assert second_payload["page"] == 1
+    assert second_payload["limit"] == 2
+    assert second_payload["has_more"] is False
+    assert second_payload["next_page"] is None
+    assert second_payload["podcasts"][0]["id"] == "pod1b"
+    assert second_payload["podcasts"][0]["downloaded_count"] is None
+
+    serialized = json.dumps(first_payload) + json.dumps(second_payload)
+    for forbidden in ("http", ".xml", "feedUrl", "/podcasts"):
+        assert forbidden not in serialized
+
+    item_requests = [
+        request
+        for request in backend.requests
+        if request.url.path == "/api/libraries/lib1/items"
+    ]
+    assert item_requests
+    assert all(request.url.params["minified"] == "1" for request in item_requests)
+    assert [request.url.params["page"] for request in item_requests] == [
+        "0",
+        "1",
+    ]
+    assert all("offset" not in request.url.params for request in item_requests)
+
+
+async def test_configured_server_timezone_is_exposed_in_settings_and_nested_state(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend(keep_episodes=5)
+    backend.items["pod1"]["episodeDownloadsQueued"] = [
+        {"guid": "queued-1", "url": "https://93.184.216.34/q1.mp3"}
+    ]
+    backend.items["pod1"]["episodesDownloading"] = [
+        {"guid": "active-1", "url": "https://93.184.216.34/a1.mp3"}
+    ]
+    config = config_factory(
+        podcast_writes_enabled=True, abs_server_timezone="Europe/Vienna"
+    )
+
+    async with _mcp_session(config, backend) as session:
+        settings = await session.call_tool(
+            "get_podcast_settings", {"podcast_id": "pod1"}
+        )
+        retention = await session.call_tool(
+            "set_podcast_retention", {"podcast_id": "pod1", "keep": 1}
+        )
+        schedule = await session.call_tool(
+            "set_podcast_schedule",
+            {"podcast_id": "pod1", "enabled": True, "max_new_episodes": 1},
+        )
+
+    settings_payload = _tool_payload(settings)
+    assert settings_payload["server_timezone"] == "Europe/Vienna"
+    assert "Europe/Vienna" in settings_payload["notes"]
+    assert "unknown" not in settings_payload["notes"].lower()
+    assert settings_payload["queued_download_count"] == 1
+    assert settings_payload["active_download_count"] == 1
+
+    retention_payload = _tool_payload(retention)
+    nested = retention_payload["state"]
+    assert nested["server_timezone"] == "Europe/Vienna"
+    assert nested["queued_download_count"] == 1
+    assert nested["active_download_count"] == 1
+    assert "fingerprint" not in json.dumps(retention_payload)
+
+    schedule_payload = _tool_payload(schedule)
+    assert schedule_payload["server_timezone"] == "Europe/Vienna"
+    assert schedule_payload["queued_download_count"] == 1
+    assert schedule_payload["active_download_count"] == 1
+    assert schedule_payload["auto_download"] is True
+    assert "Europe/Vienna" in schedule_payload["notes"]
+    assert "future automatic" in schedule_payload["notes"]
+    assert "listened state" in schedule_payload["notes"]
+    assert "fingerprint" not in json.dumps(schedule_payload)
+
+
+async def test_schedule_contract_accepts_weekday_list_and_rejects_range(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend(keep_episodes=5)
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+        description = tools["set_podcast_schedule"].description
+        assert "five fields" in description
+        assert "0 is Sunday" in description
+        assert "15 minutes" in description
+        assert "0 8 * * 1,2,3,4,5" in description
+        schedule_schema = tools["set_podcast_schedule"].inputSchema[
+            "properties"
+        ]["schedule"]["anyOf"][0]
+        assert "bare integer values" in schedule_schema["description"]
+
+        accepted = await session.call_tool(
+            "set_podcast_schedule",
+            {
+                "podcast_id": "pod1",
+                "enabled": True,
+                "schedule": "0 8 * * 1,2,3,4,5",
+                "max_new_episodes": 1,
+            },
+        )
+        extent = await session.call_tool(
+            "set_podcast_schedule",
+            {
+                "podcast_id": "pod1",
+                "enabled": True,
+                "schedule": "0 8 * * 1-5",
+            },
+        )
+        names = await session.call_tool(
+            "set_podcast_schedule",
+            {
+                "podcast_id": "pod1",
+                "enabled": True,
+                "schedule": "0 8 * * MON-FRI",
+            },
+        )
+        too_frequent = await session.call_tool(
+            "set_podcast_schedule",
+            {
+                "podcast_id": "pod1",
+                "enabled": True,
+                "schedule": "*/5 * * * *",
+            },
+        )
+
+    assert accepted.isError is not True
+    accepted_payload = _tool_payload(accepted)
+    assert accepted_payload["schedule"] == "0 8 * * 1,2,3,4,5"
+    assert accepted_payload["auto_download"] is True
+    assert "future automatic" in accepted_payload["notes"]
+    patches = [
+        json.loads(request.content)
+        for request in backend.requests
+        if request.method == "PATCH"
+    ]
+    assert patches == [
+        {
+            "autoDownloadEpisodes": True,
+            "autoDownloadSchedule": "0 8 * * 1,2,3,4,5",
+            "maxNewEpisodesToDownload": 1,
+        }
+    ]
+
+    for rejected in (extent, names, too_frequent):
+        assert rejected.isError is True
+        assert "schedule" in _error_text(rejected).lower()
+
+
+async def test_write_instructions_preserve_omitted_schedule_semantics(
+    config_factory: Callable[..., Config],
+) -> None:
+    async with _serve(
+        config_factory(podcast_writes_enabled=True), _PodcastBackend()
+    ) as http:
+        response = await http.post(
+            "/mcp", json=INITIALIZE_REQUEST, headers=_headers()
+        )
+
+    assert response.status_code == 200
+    instructions = _rpc_payload(response)["result"]["instructions"]
+    assert "An omitted schedule keeps the current native cron" in instructions
+    assert "empty effective schedule (current or provided) becomes hourly" in (
+        instructions
+    )
+    assert "An omitted or empty schedule defaults" not in instructions
+
+
+async def test_unknown_arguments_are_rejected_for_every_registered_tool(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        tools = (await session.list_tools()).tools
+        assert len(tools) == 16
+        for tool in tools:
+            assert tool.inputSchema["additionalProperties"] is False, tool.name
+            result = await session.call_tool(
+                tool.name, {"unexpected_argument": True}
+            )
+            assert result.isError is True, tool.name
+            text = _error_text(result)
+            assert UNKNOWN_ARGUMENT_ERROR in text, tool.name
+            assert "unexpected_argument" not in text, tool.name
+
+    assert backend.requests == []
+
+
+async def test_unknown_safety_flags_cannot_delete_or_trim_before_backend(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+
+    cases = (
+        ("delete_podcast", {"podcast_id": "pod1", "dry_run": True}),
+        ("delete_podcast", {"podcast_id": "pod1", "hard": False}),
+        ("delete_podcast", {"podcast_id": "pod1", "confirm": False}),
+        ("delete_podcast", {"podcast_id": "pod1", "fingerprint": "fence"}),
+        (
+            "delete_podcast",
+            {"podcast_id": "pod1", "expected_fingerprint": "fence"},
+        ),
+        (
+            "set_podcast_retention",
+            {"podcast_id": "pod1", "keep": 1, "trim_exisiting": True},
+        ),
+        (
+            "delete_podcast_episodes",
+            {"podcast_id": "pod1", "episode_ids": ["ep1"], "only_listened": True},
+        ),
+        (
+            "delete_podcast_episode",
+            {"podcast_id": "pod1", "episode_id": "ep1", "only_listened": True},
+        ),
+    )
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        for tool_name, arguments in cases:
+            result = await session.call_tool(tool_name, arguments)
+            assert result.isError is True, (tool_name, arguments)
+            text = _error_text(result)
+            assert UNKNOWN_ARGUMENT_ERROR in text, (tool_name, arguments)
+            for key in arguments:
+                if key in {"podcast_id", "episode_id", "episode_ids", "keep"}:
+                    continue
+                assert key not in text, (tool_name, key)
+
+    assert backend.deleted is False
+    assert backend.episode_delete_calls == 0
+    assert backend.requests == []
+
+
+async def test_unknown_argument_guard_applies_to_direct_and_raw_calls(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+    config = config_factory(podcast_writes_enabled=True)
+
+    server = create_server(config, transport=backend)
+    with pytest.raises(ToolError) as exc_info:
+        await server.call_tool(
+            "delete_podcast", {"podcast_id": "pod1", "dry_run": True}
+        )
+    assert str(exc_info.value) == UNKNOWN_ARGUMENT_ERROR
+    assert backend.requests == []
+
+    async with _serve(config, backend) as http:
+        initialized = await http.post(
+            "/mcp", json=INITIALIZE_REQUEST, headers=_headers()
+        )
+        called = await http.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "delete_podcast",
+                    "arguments": {"podcast_id": "pod1", "hard": False},
+                },
+            },
+            headers=_headers(),
+        )
+
+    assert initialized.status_code == 200
+    assert called.status_code == 200
+    payload = _rpc_payload(called)
+    assert payload["result"]["isError"] is True
+    assert UNKNOWN_ARGUMENT_ERROR in json.dumps(payload["result"])
+    assert "hard" not in json.dumps(payload["result"])
+    assert backend.deleted is False
+    assert backend.requests == []
+
+
+async def test_default_mode_also_closes_schemas_and_rejects_unknown_arguments(
+    config_factory: Callable[..., Config],
+) -> None:
+    requests: list[httpx.Request] = []
+    backend = httpx.MockTransport(
+        lambda request: requests.append(request) or httpx.Response(200, json={})
+    )
+
+    async with _mcp_session(config_factory(), backend) as session:
+        tools = (await session.list_tools()).tools
+        assert len(tools) == 3
+        for tool in tools:
+            assert tool.inputSchema["additionalProperties"] is False, tool.name
+            result = await session.call_tool(tool.name, {"dry_run": True})
+            assert result.isError is True, tool.name
+            assert UNKNOWN_ARGUMENT_ERROR in _error_text(result), tool.name
+            assert "dry_run" not in _error_text(result), tool.name
+
+    assert requests == []
+
+
+async def test_synthetic_full_podcast_workflow(
+    config_factory: Callable[..., Config],
+) -> None:
+    """Synthetic backend workflow only; not a model-in-the-loop evaluation."""
+    backend = _PodcastBackend(feed_episodes=_large_feed(5), record_downloads=True)
+    backend.library_items = [_library_podcast("pod1", "Test Podcast", 3)]
+
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        libraries = _tool_payload(
+            await session.call_tool("list_libraries", {})
+        )
+        assert libraries["count"] == 1
+        assert libraries["libraries"][0]["media_type"] == "podcast"
+
+        listed = _tool_payload(
+            await session.call_tool(
+                "list_podcasts", {"library_id": "lib1"}
+            )
+        )
+        assert [podcast["id"] for podcast in listed["podcasts"]] == ["pod1"]
+
+        available = _tool_payload(
+            await session.call_tool(
+                "list_available_podcast_episodes",
+                {"podcast_id": "pod1", "query": "Feed Episode 3"},
+            )
+        )
+        assert available["count"] == 1
+        anchor = available["episodes"][0]["id"]
+        assert FEED_ID_RE.fullmatch(anchor)
+
+        queued = _tool_payload(
+            await session.call_tool(
+                "download_episodes_from",
+                {
+                    "podcast_id": "pod1",
+                    "start_episode_id": anchor,
+                    "count": 2,
+                },
+            )
+        )
+        assert queued["status"] == "queued"
+        assert queued["queued_count"] == 2
+        assert queued["skipped_episodes"] == []
+
+        status = _tool_payload(
+            await session.call_tool(
+                "get_podcast_settings", {"podcast_id": "pod1"}
+            )
+        )
+        assert status["queued_download_count"] == 2
+        assert status["active_download_count"] == 0
+
+        # Simulate the asynchronous queue finishing so the delete tools are
+        # not blocked by the synthetic backend's active-queue guard.
+        backend.items["pod1"]["episodeDownloadsQueued"] = []
+
+        downloaded = _tool_payload(
+            await session.call_tool(
+                "list_podcast_episodes", {"podcast_id": "pod1"}
+            )
+        )
+        native_ids = [episode["id"] for episode in downloaded["episodes"]]
+        assert native_ids
+        assert not any(FEED_ID_RE.fullmatch(episode_id) for episode_id in native_ids)
+
+        deleted = _tool_payload(
+            await session.call_tool(
+                "delete_podcast_episodes",
+                {"podcast_id": "pod1", "episode_ids": [native_ids[0]]},
+            )
+        )
+        assert deleted["status"] == "completed"
+        assert deleted["deleted_count"] == 1
+
+    deletes = [
+        (request.url.path, request.url.params["hard"])
+        for request in backend.requests
+        if request.method == "DELETE"
+    ]
+    assert deletes == [
+        (f"/api/podcasts/pod1/episode/{native_ids[0]}", "1")
+    ]

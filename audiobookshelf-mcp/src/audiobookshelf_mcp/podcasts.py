@@ -57,16 +57,25 @@ Feed catalogue selectors are opaque hashes of
 ``(podcast_id, guid, enclosure URL, publication ms)``. They are not cached
 authority: every selector-based download (``download_podcast_episodes`` and
 ``download_episodes_from``) reloads the allowed podcast, refetches its stored
-feed, and resolves each selector against the current catalogue. After the
+feed, and resolves each selector against the current catalogue. After every
 enclosure URL preflight, the item is reloaded once more to confirm the same
 podcast, folder, item path, and stored feed URL and to drop entries that became
-downloaded or queued meanwhile. That final read is followed by the native POST,
-so an external writer can still race the request; no atomic compare-and-swap
-exists. The latest-episode tool picks its own candidates instead of resolving
-caller selectors, so this extra late fence applies only to selector-based
-downloads. Multi-delete re-reads before every DELETE and compares the target
-episode's identity and file metadata with the prevalidated snapshot because the
-state fingerprint does not cover paths or enclosure metadata.
+downloaded or queued meanwhile; the latest-episode tool shares that late fence.
+Entries dropped there are reported as skipped, never backfilled. That final
+read is followed by the native POST, so an external writer can still race the
+request; no atomic compare-and-swap exists. Multi-delete and retention trims
+re-read before every DELETE and compare the target episode's identity and file
+metadata with the prevalidated snapshot because the state fingerprint does not
+cover paths or enclosure metadata. A retention trim additionally requires the
+post-PATCH read-back to equal the pre-PATCH baseline plus this call's own
+``maxEpisodesToKeep`` value, with no active queue, before the first DELETE.
+
+Browsing podcast items (``list_podcasts``) requests one minified native items
+page from an allowlisted library whose native media type is podcast. It returns
+only native item IDs, sanitized titles, and the native episode count when that
+count is a valid non-negative integer; it never returns URLs, paths, or media
+details and makes no remote media request. The backend page cursor is bounded;
+this is the current upstream snapshot, not a complete archive.
 """
 
 from __future__ import annotations
@@ -97,6 +106,8 @@ from .config import is_valid_resource_id
 from .podcast_guards import ensure_public_url, validate_schedule
 
 MAX_PODCAST_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_PODCAST_PAGE = 1000
+MAX_PODCAST_LIST_LIMIT = 50
 MAX_EPISODE_LIST_LIMIT = 50
 DEFAULT_EPISODE_LIST_LIMIT = 25
 MAX_EPISODE_OFFSET = 100000
@@ -164,6 +175,117 @@ class PodcastClient(ABSClient):
         """Return safe podcast policy/download state plus a stale-check digest."""
         item = await self._load_podcast(podcast_id)
         return self._state(item)
+
+    async def list_podcasts(
+        self, library_id: str, limit: int = 25, *, page: int = 0
+    ) -> dict[str, Any]:
+        """Return one bounded page of podcasts from an allowed podcast library.
+
+        The library must be allowlisted and natively typed ``podcast``. Exactly
+        one native minified ``items`` page is requested; no caller-supplied
+        filter, URL, remote media fetch, or follow-up page loop is involved.
+        Only native item IDs, sanitized titles, and ``media.numEpisodes`` when
+        that is a valid non-negative integer (otherwise ``null``) are returned.
+        ``total`` is the backend's current count for the current upstream
+        snapshot, not a promise of a complete archive. The native page cursor
+        is bounded to ``MAX_PODCAST_PAGE``; if more rows exist at that bound,
+        ``has_more`` is false, ``next_page`` is null, and ``note`` says the
+        listing stopped at the bound instead of returning an unusable cursor.
+        """
+        if type(limit) is not int or not 1 <= limit <= MAX_PODCAST_LIST_LIMIT:
+            raise ABSInvalidRequest(
+                f"Limit must be an integer between 1 and {MAX_PODCAST_LIST_LIMIT}."
+            )
+        if type(page) is not int or not 0 <= page <= MAX_PODCAST_PAGE:
+            raise ABSInvalidRequest(
+                f"Page must be an integer between 0 and {MAX_PODCAST_PAGE}."
+            )
+        self._require_library(library_id)
+        await self._get_podcast_library(library_id)
+
+        data = await self._request_json(
+            "GET",
+            f"api/libraries/{library_id}/items",
+            params={
+                "minified": "1",
+                "limit": str(limit),
+                "page": str(page),
+            },
+            max_response_bytes=MAX_PODCAST_RESPONSE_BYTES,
+        )
+        if not isinstance(data, dict):
+            raise ABSResponseError(_UNEXPECTED)
+        results = data.get("results")
+        total = data.get("total")
+        # One page plus a consistent count only: a non-empty page must start
+        # before ``total``, a page starting before ``total`` must not be
+        # silently empty, and a page may never carry rows beyond the remaining
+        # total. Anything else would make the advertised cursor lie.
+        if (
+            not isinstance(results, list)
+            or type(total) is not int
+            or total < 0
+            or len(results) > limit
+            or len(results) > max(total - page * limit, 0)
+            or bool(results) != (page * limit < total)
+        ):
+            raise ABSResponseError(_UNEXPECTED)
+
+        podcasts: list[dict[str, Any]] = []
+        for raw in results:
+            if not isinstance(raw, dict):
+                raise ABSResponseError(_UNEXPECTED)
+            item_id = raw.get("id")
+            media = raw.get("media")
+            if (
+                not is_valid_resource_id(item_id)
+                or raw.get("libraryId") != library_id
+                or raw.get("mediaType") != "podcast"
+                or not isinstance(media, dict)
+            ):
+                raise ABSResponseError(_UNEXPECTED)
+            metadata = media.get("metadata")
+            if not isinstance(metadata, dict):
+                raise ABSResponseError(_UNEXPECTED)
+            podcasts.append(
+                {
+                    "id": item_id,
+                    "title": _sanitize_text(
+                        metadata.get("title"), MAX_PODCAST_TITLE_LENGTH
+                    ),
+                    "downloaded_count": _native_episode_count(
+                        media.get("numEpisodes")
+                    ),
+                }
+            )
+
+        has_more = page * limit + len(podcasts) < total
+        next_page: int | None = None
+        note: str | None = None
+        if has_more:
+            if page + 1 <= MAX_PODCAST_PAGE:
+                next_page = page + 1
+            else:
+                has_more = False
+                note = (
+                    "More podcasts exist beyond the maximum supported page; "
+                    "this listing is the current upstream snapshot, not a "
+                    "complete archive."
+                )
+
+        result: dict[str, Any] = {
+            "library_id": library_id,
+            "podcasts": podcasts,
+            "count": len(podcasts),
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "has_more": has_more,
+            "next_page": next_page,
+        }
+        if note is not None:
+            result["note"] = note
+        return result
 
     async def list_podcast_episodes(
         self,
@@ -357,8 +479,13 @@ class PodcastClient(ABSClient):
     ) -> dict[str, Any]:
         """Queue up to ``count`` recent, not-already-known episodes for download.
 
-        The status is ``queued``, never ``completed``: Audiobookshelf downloads
-        asynchronously. No feed URL, enclosure URL, or file path is returned.
+        Selection scans the current feed newest first, skipping entries already
+        downloaded or queued. After every enclosure is validated, the podcast is
+        reloaded once and the same identity/folder/path/feed fence used by the
+        selector downloads is applied; entries that became known meanwhile are
+        dropped without backfilling. The status is ``queued``, never
+        ``completed``: Audiobookshelf downloads asynchronously. No feed URL,
+        enclosure URL, or file path is returned.
         """
         self._require_writes_enabled()
         if type(count) is not int or not 1 <= count <= MAX_DOWNLOAD_COUNT:
@@ -384,27 +511,29 @@ class PodcastClient(ABSClient):
                     break
 
             if not selected:
-                return {
-                    "podcast_id": podcast_id,
-                    "status": "nothing_new",
-                    "queued_count": 0,
-                    "episodes": [],
-                }
+                return _nothing_new_result(podcast_id)
 
-            # Validate every enclosure before sending any download request.
-            typed_episodes = await self._queue_candidates(
-                podcast_id, selected
+            # Validate every enclosure, then apply the shared late fence once
+            # before the single native request. Late-known entries are dropped
+            # without backfilling, so the batch may be smaller or empty.
+            queued, typed_episodes, _late_skipped = (
+                await self._finalize_download_batch(
+                    podcast_id, item, selected
+                )
             )
+            await self._post_downloads(podcast_id, typed_episodes)
+            if not queued:
+                return _nothing_new_result(podcast_id)
             return {
                 "podcast_id": podcast_id,
                 "status": "queued",
-                "queued_count": len(typed_episodes),
+                "queued_count": len(queued),
                 "episodes": [
                     {
                         "title": episode["title"],
-                        "published_at": _iso_timestamp(episode["publishedAt"]),
+                        "published_at": _iso_timestamp(episode["published"]),
                     }
-                    for episode in typed_episodes
+                    for episode in queued
                 ],
             }
 
@@ -416,8 +545,10 @@ class PodcastClient(ABSClient):
         Every selector is resolved against a freshly reloaded podcast and feed
         under the mutation lock; one unknown or stale selector rejects the
         whole selection before any download is queued. Already downloaded or
-        queued episodes are skipped without backfilling. ``queued`` means
-        submitted to the asynchronous native queue, never completed.
+        queued episodes are skipped without backfilling and reported in
+        ``skipped_episodes``; ``episodes`` lists only submitted entries.
+        ``queued`` means submitted to the asynchronous native queue, never
+        completed.
         """
         self._require_writes_enabled()
         selectors = _require_feed_selectors(episode_ids)
@@ -435,11 +566,11 @@ class PodcastClient(ABSClient):
                     raise ABSInvalidRequest(_UNKNOWN_EPISODE_SELECTION)
                 selected.append(entry)
 
-            queued = await self._queue_selected_episodes(
+            queued, skipped = await self._queue_selected_episodes(
                 podcast_id, selected, item
             )
             return _queue_result(
-                podcast_id, len(selected), queued, len(selected) - len(queued)
+                podcast_id, len(selected), queued, skipped
             )
 
     async def download_episodes_from(
@@ -451,11 +582,11 @@ class PodcastClient(ABSClient):
         episodes in publication order (ascending, opaque ID tie-break), so the
         anchor is the oldest entry in the window. The window is fixed before
         skipping: already downloaded or queued entries inside it are skipped
-        without backfilling, and a window near the end of the feed may contain
-        fewer than ``count`` entries. An anchor that is not in the freshly
-        fetched feed is rejected; there is no fallback or latest-episode
-        guess. ``queued`` means submitted to the asynchronous native queue,
-        never completed.
+        without backfilling and reported in ``skipped_episodes``, and a window
+        near the end of the feed may contain fewer than ``count`` entries. An
+        anchor that is not in the freshly fetched feed is rejected; there is no
+        fallback or latest-episode guess. ``queued`` means submitted to the
+        asynchronous native queue, never completed.
         """
         self._require_writes_enabled()
         if type(count) is not int or not 1 <= count <= MAX_SELECTED_EPISODES:
@@ -481,11 +612,11 @@ class PodcastClient(ABSClient):
                 raise ABSInvalidRequest(_UNKNOWN_EPISODE_SELECTION)
 
             window = chronological[start : start + count]
-            queued = await self._queue_selected_episodes(
+            queued, skipped = await self._queue_selected_episodes(
                 podcast_id, window, item
             )
             return _queue_result(
-                podcast_id, len(window), queued, len(window) - len(queued)
+                podcast_id, len(window), queued, skipped
             )
 
     async def set_podcast_schedule(
@@ -572,9 +703,20 @@ class PodcastClient(ABSClient):
         The server applies this immediately when the tool is called; there is no
         approval or elicitation flow here. The fingerprint is only a state fence
         against a stale instant read. A trim is bounded to 100 deletions per call
-        and is refused before the policy PATCH if it would need more. Deletion
-        stops at the first failure and reports the honest partial count; there
-        is no rollback or retry.
+        and is refused before the policy PATCH if it would need more. Duplicate
+        native episode IDs anywhere in the downloaded set are rejected before
+        the PATCH, and all targets and paths are prevalidated; duplicates are
+        never guessed at or deduplicated. After the PATCH the item is re-read
+        and must match the pre-PATCH baseline plus this call's own
+        ``maxEpisodesToKeep`` value with no active queue; each DELETE then
+        re-reads the same fence, the library folder, and the target identity. A
+        failure stops at once with the honest partial count; for
+        ``trim_existing`` a malformed read-back or final state projection is
+        reported as partial with ``state`` null rather than raised, while a
+        policy-only update keeps its ``updated`` status and returns ``state``
+        null; there is no rollback and no retry, the policy PATCH may already
+        have been applied even when no episode DELETE is acknowledged, and
+        filesystem removal is not verified.
         """
         self._require_writes_enabled()
         if type(keep) is not int or not 0 <= keep <= MAX_KEEP_EPISODES:
@@ -594,12 +736,25 @@ class PodcastClient(ABSClient):
             current = self._state(item)
             _require_unchanged(current, expected)
 
-            plan: list[str] = []
-            plan_episodes: list[dict[str, Any]] = []
+            targets: list[str] = []
+            snapshots: dict[str, tuple[Any, ...]] = {}
+            item_snapshot: tuple[object, object] = (
+                item.get("path"),
+                item.get("folderId"),
+            )
             if trim_existing:
                 if self._queue_entries(item):
                     raise ABSResponseError(_DOWNLOADS_ACTIVE)
                 downloaded = self._downloaded_episodes(item)
+                # Retention slices by position, so a duplicate ID in the kept
+                # prefix still consumes ``keep`` budget while a hard delete
+                # removes every row sharing an ID. Never guess which duplicate
+                # identity to keep or delete: reject before planning the trim.
+                if any(
+                    count > 1
+                    for count in _episode_row_counts(downloaded).values()
+                ):
+                    raise ABSResponseError(_AMBIGUOUS_EPISODE_ROWS)
                 newest_first = sorted(
                     downloaded,
                     key=lambda episode: (
@@ -616,14 +771,14 @@ class PodcastClient(ABSClient):
                         f"{MAX_TRIM_DELETIONS} episodes; narrow the policy or "
                         "run it again with a smaller trim."
                     )
-                if plan_episodes:
-                    library = await self._get_podcast_library(
-                        current["library_id"]
+                targets = [episode["id"] for episode in plan_episodes]
+                if targets:
+                    # Full prevalidation before the policy write: a refused
+                    # path or duplicate native row must not leave a changed
+                    # policy behind.
+                    snapshots, item_snapshot = (
+                        await self._prevalidate_delete_targets(item, targets)
                     )
-                    item_parts = _validate_podcast_item_path(item, library)
-                    for episode in plan_episodes:
-                        _validate_episode_path(episode, item_parts)
-                    plan = [episode["id"] for episode in plan_episodes]
 
             await self._request_json(
                 "PATCH",
@@ -633,50 +788,106 @@ class PodcastClient(ABSClient):
                 allow_empty=True,
             )
 
-            deleted_count = 0
-            status = "updated"
+            deleted: list[str] = []
+            failed_episode_id: str | None = None
             error: str | None = None
+            status = "updated"
             if trim_existing:
                 status = "completed"
-                for episode_id in plan:
+                try:
+                    post = await self._load_podcast(podcast_id)
+                except ABSClientError as exc:
+                    # The PATCH answered, so the policy may already be applied.
+                    post = None
+                    status = "partial"
+                    failed_episode_id = targets[0] if targets else None
+                    error = str(exc)
+                if post is not None:
                     try:
-                        await self._delete_episode(podcast_id, episode_id)
+                        error = self._retention_baseline_error(
+                            post, item, keep, item_snapshot
+                        )
                     except ABSClientError as exc:
-                        status = "partial"
+                        # The policy PATCH already answered. A malformed or
+                        # drifted read-back is a late verification failure and
+                        # must return the honest partial outcome, not escape.
                         error = str(exc)
-                        break
-                    deleted_count += 1
+                    if error is None and targets:
+                        try:
+                            library = await self._get_podcast_library(
+                                post["libraryId"]
+                            )
+                        except ABSClientError as exc:
+                            error = str(exc)
+                        else:
+                            try:
+                                _validate_podcast_item_path(post, library)
+                            except ABSResponseError:
+                                # The policy was already written, so this is a
+                                # late refusal, not a "nothing changed" case.
+                                error = _UNSAFE_DURING_DELETE
+                    if error is None:
+                        deleted, failed, delete_error = (
+                            await self._delete_episode_batch(
+                                podcast_id,
+                                targets,
+                                post,
+                                snapshots,
+                                item_snapshot,
+                            )
+                        )
+                        if failed is not None:
+                            failed_episode_id = failed
+                            error = delete_error
+                    if error is not None:
+                        status = "partial"
+                        if failed_episode_id is None and targets:
+                            failed_episode_id = targets[0]
+
+            # The final read-back is advisory: the policy PATCH and any DELETE
+            # acknowledgements already happened. A malformed native payload or
+            # an unprojectable state must not raise past the honest outcome.
+            final_state: dict[str, Any] | None = None
+            try:
+                final_item = await self._load_podcast(podcast_id)
+                final_state = self._state(final_item)
+            except ABSClientError as exc:
+                if trim_existing:
+                    status = "partial"
+                    if error is None:
+                        # Every acknowledgement stands; only the read-back
+                        # failed, so do not invent a failed episode target.
+                        error = str(exc)
 
             outcome: dict[str, Any] = {
                 "podcast_id": podcast_id,
                 "library_id": current["library_id"],
                 "keep_episodes": keep,
                 "trim_existing": trim_existing,
-                "deleted_count": deleted_count,
+                "deleted_count": len(deleted),
                 "status": status,
             }
             if trim_existing:
+                outcome["deleted_episode_ids"] = list(deleted)
                 outcome["filesystem_removal"] = "not_verified"
                 outcome["note"] = (
-                    "Deleted counts are acknowledged Audiobookshelf "
-                    "operations; filesystem removal is not verified."
+                    "The maxEpisodesToKeep policy may already have been applied "
+                    "even when no episode DELETE was acknowledged. Deleted "
+                    "counts are acknowledged Audiobookshelf operations; "
+                    "filesystem removal is not verified. A failed delete "
+                    "request may already have been applied and is not retried."
                 )
+                if failed_episode_id is not None:
+                    outcome["failed_episode_id"] = failed_episode_id
             else:
                 outcome["note"] = (
                     "Existing episodes are not removed immediately. "
                     "Audiobookshelf applies this limit during future automatic "
                     "downloads; it does not reduce an existing over-limit backlog."
                 )
+            outcome["state"] = final_state
             if error is not None:
                 outcome["error"] = error
-
-            try:
-                updated = await self._load_podcast(podcast_id)
-            except ABSClientError:
-                # The policy write may have succeeded; do not retry, and do not
-                # hide the count from a read-back failure.
-                updated = None
-            outcome["state"] = self._state(updated) if updated is not None else None
             return outcome
 
     async def delete_podcast_episode(
@@ -758,50 +969,12 @@ class PodcastClient(ABSClient):
             if self._queue_entries(item):
                 raise ABSResponseError(_DOWNLOADS_ACTIVE)
 
-            episodes = self._downloaded_episodes(item)
-            by_id = {episode["id"]: episode for episode in episodes}
-            if any(target not in by_id for target in targets):
-                raise ABSNotFound("Podcast episode not found.")
-            row_counts: dict[str, int] = {}
-            for episode in episodes:
-                row_counts[episode["id"]] = (
-                    row_counts.get(episode["id"], 0) + 1
-                )
-            if any(row_counts.get(target, 0) > 1 for target in targets):
-                # The native hard delete removes every row sharing this ID.
-                raise ABSResponseError(_AMBIGUOUS_EPISODE_ROWS)
-
-            library = await self._get_podcast_library(item["libraryId"])
-            item_parts = _validate_podcast_item_path(item, library)
-            snapshots: dict[str, tuple[Any, ...]] = {}
-            for target in targets:
-                episode = by_id[target]
-                _validate_episode_path(episode, item_parts)
-                snapshots[target] = _episode_identity(episode)
-            item_snapshot = (item.get("path"), item.get("folderId"))
-
-            deleted: list[str] = []
-            removed: set[str] = set()
-            failed_episode_id: str | None = None
-            error: str | None = None
-            for target in targets:
-                try:
-                    await self._require_delete_ready(
-                        podcast_id,
-                        item,
-                        removed,
-                        target,
-                        snapshots[target],
-                        item_snapshot,
-                    )
-                    await self._delete_episode(podcast_id, target)
-                except ABSClientError as exc:
-                    failed_episode_id = target
-                    error = str(exc)
-                    break
-                deleted.append(target)
-                removed.add(target)
-
+            snapshots, item_snapshot = await self._prevalidate_delete_targets(
+                item, targets
+            )
+            deleted, failed_episode_id, error = await self._delete_episode_batch(
+                podcast_id, targets, item, snapshots, item_snapshot
+            )
             return _deletion_result(
                 podcast_id, targets, deleted, failed_episode_id, error
             )
@@ -997,7 +1170,9 @@ class PodcastClient(ABSClient):
         downloaded_ids = sorted(
             episode["id"] for episode in self._downloaded_episodes(item)
         )
-        queue_entries = self._queue_entries(item)
+        queued_entries = self._queue_field(item, "episodeDownloadsQueued")
+        active_entries = self._queue_field(item, "episodesDownloading")
+        queue_entries = queued_entries + active_entries
         queue_keys = sorted(
             key
             for entry in queue_entries
@@ -1037,6 +1212,8 @@ class PodcastClient(ABSClient):
             "max_new_episodes": max_new,
             "keep_episodes": keep,
             "downloaded_count": len(downloaded_ids),
+            "queued_download_count": len(queued_entries),
+            "active_download_count": len(active_entries),
             "fingerprint": digest,
         }
 
@@ -1059,29 +1236,45 @@ class PodcastClient(ABSClient):
             downloaded.append(episode)
         return downloaded
 
-    def _queue_entries(self, item: Mapping[str, Any]) -> list[dict[str, Any]]:
-        """Return validated queued/current download entries; never their URLs."""
+    def _queue_field(
+        self, item: Mapping[str, Any], field: str
+    ) -> list[dict[str, Any]]:
+        """Return one validated native download queue; never its URLs."""
+        value = item.get(field)
+        if value is None:
+            # Both native queue arrays are absent or empty when idle.
+            return []
+        if not isinstance(value, list):
+            raise ABSResponseError(_UNEXPECTED)
         entries: list[dict[str, Any]] = []
-        for field in ("episodeDownloadsQueued", "episodesDownloading"):
-            value = item.get(field)
-            if value is None:
-                continue
-            if not isinstance(value, list):
+        for entry in value:
+            if not isinstance(entry, dict):
                 raise ABSResponseError(_UNEXPECTED)
-            for entry in value:
-                if not isinstance(entry, dict):
-                    raise ABSResponseError(_UNEXPECTED)
-                entries.append(entry)
+            entries.append(entry)
         return entries
 
-    def _blocked_episode_keys(self, item: Mapping[str, Any]) -> set[str]:
-        keys: set[str] = set()
+    def _queue_entries(self, item: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Return validated queued plus active entries; never their URLs."""
+        return self._queue_field(
+            item, "episodeDownloadsQueued"
+        ) + self._queue_field(item, "episodesDownloading")
+
+    def _known_key_sets(
+        self, item: Mapping[str, Any]
+    ) -> tuple[set[str], set[str]]:
+        """Return the GUID/URL keys of downloaded and queued episodes."""
+        downloaded: set[str] = set()
         for episode in self._downloaded_episodes(item):
-            keys.update(
-                _episode_keys(episode.get("guid"), _episode_enclosure_url(episode))
+            downloaded.update(
+                _episode_keys(
+                    episode.get("guid"), _episode_enclosure_url(episode)
+                )
             )
-        keys.update(_queue_keys(self._queue_entries(item)))
-        return keys
+        return downloaded, _queue_keys(self._queue_entries(item))
+
+    def _blocked_episode_keys(self, item: Mapping[str, Any]) -> set[str]:
+        downloaded, queued = self._known_key_sets(item)
+        return downloaded | queued
 
     async def _fetch_stored_feed(
         self, item: Mapping[str, Any]
@@ -1089,17 +1282,6 @@ class PodcastClient(ABSClient):
         """Fetch the item's stored feed URL after the public-URL guard."""
         feed_url = await ensure_public_url(_stored_feed_url(item))
         return await self._fetch_podcast(feed_url)
-
-    def _split_known_episodes(
-        self, item: Mapping[str, Any], entries: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """Drop already downloaded or queued entries, preserving order."""
-        blocked = self._blocked_episode_keys(item)
-        return [
-            entry
-            for entry in entries
-            if not (_episode_keys(entry["guid"], entry["url"]) & blocked)
-        ]
 
     async def _typed_candidates(
         self, candidates: list[dict[str, Any]]
@@ -1137,47 +1319,101 @@ class PodcastClient(ABSClient):
             allow_empty=True,
         )
 
-    async def _queue_candidates(
-        self, podcast_id: str, candidates: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """Validate every enclosure, then submit one native queue request."""
-        typed_episodes = await self._typed_candidates(candidates)
-        await self._post_downloads(podcast_id, typed_episodes)
-        return typed_episodes
-
     async def _queue_selected_episodes(
         self,
         podcast_id: str,
         selected: list[dict[str, Any]],
         item: Mapping[str, Any],
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Queue a fixed selection after preflight, re-reading just before POST.
 
-        Process-local locking cannot stop an external Audiobookshelf writer.
-        The re-read narrows the window in which the stored feed URL or the
-        podcast identity can change, and drops entries that became downloaded
-        or queued during URL preflight without backfilling. A final
+        Returns the submitted entries and the projected skipped entries.
+        Already known entries are skipped during selection, then every
+        remaining enclosure is validated before the shared late fence. Entries
+        that became downloaded or queued during that preflight are skipped
+        afterwards without backfilling. Process-local locking cannot stop an
+        external Audiobookshelf writer; the re-read narrows the window in which
+        the stored feed URL or the podcast identity can change, and a final
         read-then-write race remains because the native API offers no
         compare-and-swap.
         """
-        to_queue = self._split_known_episodes(item, selected)
+        downloaded, queued = self._known_key_sets(item)
+        skipped: list[dict[str, Any]] = []
+        to_queue: list[dict[str, Any]] = []
+        for entry in selected:
+            reason = _skip_reason(entry, downloaded, queued)
+            if reason is None:
+                to_queue.append(entry)
+            else:
+                skipped.append(_skipped_episode(entry, reason))
         if not to_queue:
-            return []
-        typed_episodes = await self._typed_candidates(to_queue)
+            return [], skipped
 
+        kept, typed_entries, late_skipped = await self._finalize_download_batch(
+            podcast_id, item, to_queue
+        )
+        skipped.extend(
+            _skipped_episode(entry, reason) for entry, reason in late_skipped
+        )
+        await self._post_downloads(podcast_id, typed_entries)
+        return kept, skipped
+
+    async def _finalize_download_batch(
+        self,
+        podcast_id: str,
+        item: Mapping[str, Any],
+        entries: list[dict[str, Any]],
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[tuple[dict[str, Any], str]],
+    ]:
+        """Validate every enclosure, then apply the shared late fence once.
+
+        All public-URL and native encoding checks happen before the final read,
+        so a refused enclosure never reaches the native POST. The re-read
+        confirms that the podcast, folder, item path, and stored feed still
+        match and recomputes the downloaded/queued keys. Entries known at that
+        point are returned with their skip reason, are never submitted, and are
+        not backfilled. A final read-then-write race remains.
+        """
+        typed_entries = await self._typed_candidates(entries)
         probe = await self._load_podcast(podcast_id)
         self._require_download_identity(probe, item)
-        blocked = self._blocked_episode_keys(probe)
+        downloaded, queued = self._known_key_sets(probe)
 
-        queued: list[dict[str, Any]] = []
-        typed_queued: list[dict[str, Any]] = []
-        for entry, typed in zip(to_queue, typed_episodes, strict=True):
-            if _episode_keys(entry["guid"], entry["url"]) & blocked:
+        kept: list[dict[str, Any]] = []
+        kept_typed: list[dict[str, Any]] = []
+        skipped: list[tuple[dict[str, Any], str]] = []
+        for entry, typed in zip(entries, typed_entries, strict=True):
+            reason = _skip_reason(entry, downloaded, queued)
+            if reason is not None:
+                skipped.append((entry, reason))
                 continue
-            queued.append(entry)
-            typed_queued.append(typed)
-        await self._post_downloads(podcast_id, typed_queued)
-        return queued
+            kept.append(entry)
+            kept_typed.append(typed)
+        return kept, kept_typed, skipped
+
+    def _retention_baseline_error(
+        self,
+        probe: Mapping[str, Any],
+        baseline: Mapping[str, Any],
+        keep: int,
+        item_snapshot: tuple[object, object],
+    ) -> str | None:
+        """Return a fixed error when the post-PATCH read is not our baseline.
+
+        Only this call's own policy value may differ from the pre-PATCH item.
+        Accepting a blind fresh read-back would let an external policy, feed,
+        library, or queue change pass as if it were ours.
+        """
+        if self._queue_entries(probe):
+            return _DOWNLOADS_ACTIVE
+        if self._state(probe) != self._state_with_policy(baseline, keep):
+            return _CHANGED_DURING_DELETE
+        if (probe.get("path"), probe.get("folderId")) != item_snapshot:
+            return _CHANGED_DURING_DELETE
+        return None
 
     def _require_download_identity(
         self, probe: Mapping[str, Any], item: Mapping[str, Any]
@@ -1192,6 +1428,75 @@ class PodcastClient(ABSClient):
         ):
             raise ABSResponseError(_CHANGED_BEFORE_DOWNLOAD)
 
+    async def _prevalidate_delete_targets(
+        self, item: Mapping[str, Any], targets: list[str]
+    ) -> tuple[dict[str, tuple[Any, ...]], tuple[object, object]]:
+        """Fully prevalidate one bounded delete batch before any mutation.
+
+        Every target must be a current downloaded episode with exactly one
+        native row (the hard delete removes every row sharing the ID), and both
+        the item directory and every episode file must be safe. Returns the
+        per-target identity snapshots and the item path/folder snapshot used by
+        the per-DELETE fence.
+        """
+        episodes = self._downloaded_episodes(item)
+        by_id = {episode["id"]: episode for episode in episodes}
+        if any(target not in by_id for target in targets):
+            raise ABSNotFound("Podcast episode not found.")
+        row_counts = _episode_row_counts(episodes)
+        if any(row_counts.get(target, 0) > 1 for target in targets):
+            # The native hard delete removes every row sharing this ID.
+            raise ABSResponseError(_AMBIGUOUS_EPISODE_ROWS)
+
+        library = await self._get_podcast_library(item["libraryId"])
+        item_parts = _validate_podcast_item_path(item, library)
+        snapshots: dict[str, tuple[Any, ...]] = {}
+        for target in targets:
+            episode = by_id[target]
+            _validate_episode_path(episode, item_parts)
+            snapshots[target] = _episode_identity(episode)
+        return snapshots, (item.get("path"), item.get("folderId"))
+
+    async def _delete_episode_batch(
+        self,
+        podcast_id: str,
+        targets: list[str],
+        baseline: Mapping[str, Any],
+        snapshots: Mapping[str, tuple[Any, ...]],
+        item_snapshot: tuple[object, object],
+    ) -> tuple[list[str], str | None, str | None]:
+        """Delete prevalidated targets one at a time, fenced before each DELETE.
+
+        ``baseline`` is the item as it should look before any of these
+        deletions; for a retention trim that is the post-PATCH read-back, so
+        only this call's own policy change is part of the expectation. The
+        expected state for an iteration is that baseline minus only the
+        deletions acknowledged here. The first failure stops the batch with the
+        honest partial count; nothing is retried or rolled back.
+        """
+        deleted: list[str] = []
+        removed: set[str] = set()
+        failed_episode_id: str | None = None
+        error: str | None = None
+        for target in targets:
+            try:
+                await self._require_delete_ready(
+                    podcast_id,
+                    baseline,
+                    removed,
+                    target,
+                    snapshots[target],
+                    item_snapshot,
+                )
+                await self._delete_episode(podcast_id, target)
+            except ABSClientError as exc:
+                failed_episode_id = target
+                error = str(exc)
+                break
+            deleted.append(target)
+            removed.add(target)
+        return deleted, failed_episode_id, error
+
     async def _require_delete_ready(
         self,
         podcast_id: str,
@@ -1203,11 +1508,11 @@ class PodcastClient(ABSClient):
     ) -> None:
         """Fail closed unless one delete target still matches its fence.
 
-        The expected state is the initial item minus only the episodes this
+        The expected state is the baseline item minus only the episodes this
         call has already deleted. The target episode must still carry the same
-        identity and file metadata as when it was prevalidated. Paths are
-        revalidated on every iteration because the state fingerprint does not
-        cover them.
+        identity and file metadata as when it was prevalidated. Scope, queue,
+        and paths are revalidated on every iteration because the state
+        fingerprint does not cover them.
         """
         probe = await self._load_podcast(podcast_id)
         if self._queue_entries(probe):
@@ -1254,6 +1559,17 @@ class PodcastClient(ABSClient):
                     if episode.get("id") not in removed
                 ],
             },
+        }
+        return self._state(expected)
+
+    def _state_with_policy(
+        self, item: Mapping[str, Any], keep: int
+    ) -> dict[str, Any]:
+        """Project state as if only this call's ``maxEpisodesToKeep`` changed."""
+        media = item["media"]
+        expected = {
+            **item,
+            "media": {**media, "maxEpisodesToKeep": keep},
         }
         return self._state(expected)
 
@@ -1434,6 +1750,17 @@ def _queue_keys(entries: list[dict[str, Any]]) -> set[str]:
     return keys
 
 
+def _episode_row_counts(
+    episodes: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Count native rows per episode ID; a hard delete removes every row."""
+    counts: dict[str, int] = {}
+    for episode in episodes:
+        episode_id = episode["id"]
+        counts[episode_id] = counts.get(episode_id, 0) + 1
+    return counts
+
+
 def _episode_identity(episode: Mapping[str, Any]) -> tuple[object, ...]:
     """Return identity and file fields that must not drift before a delete."""
     audio_file = episode.get("audioFile")
@@ -1493,15 +1820,19 @@ def _queue_result(
     podcast_id: str,
     selected_count: int,
     queued_entries: list[dict[str, Any]],
-    skipped_count: int,
+    skipped_episodes: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Project one heterogeneous, asynchronous queue submission."""
+    """Project one heterogeneous, asynchronous queue submission.
+
+    ``episodes`` lists only submitted entries; every target skipped as already
+    downloaded or queued is reported separately with feed-safe metadata.
+    """
     return {
         "podcast_id": podcast_id,
         "status": "queued" if queued_entries else "nothing_new",
         "selected_count": selected_count,
         "queued_count": len(queued_entries),
-        "skipped_count": skipped_count,
+        "skipped_count": len(skipped_episodes),
         "episodes": [
             {
                 "id": entry["id"],
@@ -1510,11 +1841,51 @@ def _queue_result(
             }
             for entry in queued_entries
         ],
+        "skipped_episodes": skipped_episodes,
         "note": (
             "Queued counts download requests submitted by this call, not "
             "completed downloads; Audiobookshelf downloads asynchronously "
             "and may deduplicate requests."
         ),
+    }
+
+
+def _nothing_new_result(podcast_id: str) -> dict[str, Any]:
+    """Return the stable latest-episode result when nothing can be queued."""
+    return {
+        "podcast_id": podcast_id,
+        "status": "nothing_new",
+        "queued_count": 0,
+        "episodes": [],
+    }
+
+
+def _skip_reason(
+    entry: Mapping[str, Any],
+    downloaded_keys: set[str],
+    queued_keys: set[str],
+) -> str | None:
+    """Return the fixed skip reason for a feed entry, or None if unknown.
+
+    A downloaded match wins over a queued match when both are present.
+    """
+    keys = _episode_keys(entry["guid"], entry["url"])
+    if keys & downloaded_keys:
+        return "already_downloaded"
+    if keys & queued_keys:
+        return "already_queued"
+    return None
+
+
+def _skipped_episode(
+    entry: Mapping[str, Any], reason: str
+) -> dict[str, Any]:
+    """Project one skipped feed target without URLs, GUIDs, or native IDs."""
+    return {
+        "id": entry["id"],
+        "title": entry["title"],
+        "published_at": _iso_timestamp(entry["published"]),
+        "reason": reason,
     }
 
 
@@ -1834,6 +2205,13 @@ def _policy_int(value: object) -> int:
     if type(value) is int and 0 <= value <= 1_000_000:
         return value
     return 0
+
+
+def _native_episode_count(value: object) -> int | None:
+    """Return a native non-negative episode count, or None when not valid."""
+    if type(value) is int and value >= 0:
+        return value
+    return None
 
 
 def _require_fingerprint(value: object) -> str:

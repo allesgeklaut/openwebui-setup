@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import traceback
 from pathlib import Path
+from zoneinfo import ZoneInfoNotFoundError
 
 import pytest
 
 from audiobookshelf_mcp.config import (
     DEFAULT_ALLOWED_HOSTS,
+    MAX_TIMEZONE_NAME_LENGTH,
     MIN_MCP_TOKEN_LENGTH,
     Config,
     ConfigError,
@@ -45,6 +48,7 @@ def test_loads_valid_config_and_defaults(tmp_path: Path) -> None:
     assert config.port == 8000
     assert config.allowed_hosts == DEFAULT_ALLOWED_HOSTS
     assert config.allowed_origins == ()
+    assert config.abs_server_timezone is None
 
     rendered = repr(config)
     assert "backend-key" not in rendered
@@ -278,6 +282,7 @@ def test_config_constructed_directly_defaults_to_read_only() -> None:
     )
 
     assert config.podcast_writes_enabled is False
+    assert config.abs_server_timezone is None
 
 
 @pytest.mark.parametrize(
@@ -341,3 +346,134 @@ def test_invalid_podcast_writes_value_is_not_echoed(tmp_path: Path) -> None:
         load_config(env)
 
     assert raw not in str(raised.value)
+
+
+def test_server_timezone_defaults_to_none(tmp_path: Path) -> None:
+    assert load_config(_valid_env(tmp_path)).abs_server_timezone is None
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "\t\n"])
+def test_blank_server_timezone_is_none(tmp_path: Path, raw: str) -> None:
+    env = _valid_env(tmp_path)
+    env["ABS_SERVER_TIMEZONE"] = raw
+
+    assert load_config(env).abs_server_timezone is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("UTC", "UTC"),
+        ("Europe/Vienna", "Europe/Vienna"),
+        ("America/Argentina/Buenos_Aires", "America/Argentina/Buenos_Aires"),
+        ("  Europe/Vienna  ", "Europe/Vienna"),
+        ("\tUTC\n", "UTC"),
+    ],
+)
+def test_valid_server_timezone_is_trimmed_and_accepted(
+    tmp_path: Path, raw: str, expected: str
+) -> None:
+    env = _valid_env(tmp_path)
+    env["ABS_SERVER_TIMEZONE"] = raw
+
+    assert load_config(env).abs_server_timezone == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "Mars/Olympus_Mons",
+        "localtime",
+        "posixrules",
+        "posix/UTC",
+        "right/UTC",
+        "/etc/localtime",
+        "../etc/passwd",
+        "Europe/../etc/passwd",
+        "Europe/Vienna/../../etc/passwd",
+        "Europe//Vienna",
+        "Europe/Vienna/",
+        "Europe/Vienna\x00",
+        "Europe/Vienna\tBerlin",
+        "Europe/Vienna Berlin",
+        "A" * (MAX_TIMEZONE_NAME_LENGTH + 1),
+    ],
+)
+def test_invalid_server_timezone_is_rejected_without_echo(
+    tmp_path: Path, raw: str
+) -> None:
+    env = _valid_env(tmp_path)
+    env["ABS_SERVER_TIMEZONE"] = raw
+
+    with pytest.raises(ConfigError, match="ABS_SERVER_TIMEZONE") as raised:
+        load_config(env)
+
+    assert raw.strip() not in str(raised.value)
+
+
+def test_too_long_server_timezone_uses_the_length_message(tmp_path: Path) -> None:
+    env = _valid_env(tmp_path)
+    env["ABS_SERVER_TIMEZONE"] = "A" * (MAX_TIMEZONE_NAME_LENGTH + 1)
+
+    with pytest.raises(ConfigError, match="at most 100 characters"):
+        load_config(env)
+
+
+@pytest.mark.parametrize(
+    "error_type", [ZoneInfoNotFoundError, ValueError, TypeError]
+)
+def test_unavailable_server_timezone_is_a_sanitized_config_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    def _reject(_key: str) -> None:
+        raise error_type("no time zone data")
+
+    monkeypatch.setattr("audiobookshelf_mcp.config.ZoneInfo", _reject)
+    env = _valid_env(tmp_path)
+    env["ABS_SERVER_TIMEZONE"] = "Europe/Vienna"
+
+    with pytest.raises(ConfigError, match="valid IANA time zone") as raised:
+        load_config(env)
+
+    assert "Europe/Vienna" not in str(raised.value)
+
+
+@pytest.mark.parametrize("error_type", [PermissionError, OSError])
+def test_zoneinfo_oserror_is_a_sanitized_config_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[OSError],
+) -> None:
+    private_path = str(tmp_path / "private-tzdata" / "Europe" / "Vienna")
+
+    def _reject(_key: str) -> None:
+        raise error_type(13, "permission denied", private_path)
+
+    monkeypatch.setattr("audiobookshelf_mcp.config.ZoneInfo", _reject)
+    env = _valid_env(tmp_path)
+    env["ABS_SERVER_TIMEZONE"] = "Europe/Vienna"
+
+    with pytest.raises(ConfigError, match="valid IANA time zone") as raised:
+        load_config(env)
+
+    assert private_path not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
+    formatted = "".join(traceback.format_exception(raised.value))
+    assert private_path not in formatted
+    assert error_type.__name__ not in formatted
+
+
+@pytest.mark.parametrize("raw", [123, b"Europe/Vienna", ["UTC"]])
+def test_non_string_server_timezone_is_rejected_without_echo(
+    tmp_path: Path, raw: object
+) -> None:
+    env = _valid_env(tmp_path)
+    env["ABS_SERVER_TIMEZONE"] = raw  # type: ignore[assignment]
+
+    with pytest.raises(ConfigError, match="ABS_SERVER_TIMEZONE") as raised:
+        load_config(env)
+
+    assert repr(raw) not in str(raised.value)

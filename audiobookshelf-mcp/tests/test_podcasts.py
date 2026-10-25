@@ -214,6 +214,63 @@ def _method_paths(requests: list[httpx.Request]) -> list[tuple[str, str]]:
     return [(request.method, request.url.path) for request in requests]
 
 
+def _delete_handler(
+    item: dict[str, Any],
+    *,
+    fail: dict[str, httpx.Response] | None = None,
+    after: Callable[[str], None] | None = None,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Apply native row removal so fixtures match backend state."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        episode_id = request.url.path.rsplit("/", 1)[-1]
+        if fail is not None and episode_id in fail:
+            return fail[episode_id]
+        item["media"]["episodes"] = [
+            episode
+            for episode in item["media"]["episodes"]
+            if episode["id"] != episode_id
+        ]
+        if after is not None:
+            after(episode_id)
+        return httpx.Response(204)
+
+    return handler
+
+
+def _retention_routes(
+    item: dict[str, Any],
+    *,
+    fail: dict[str, httpx.Response] | None = None,
+    after_delete: Callable[[str], None] | None = None,
+    library_route: Callable[[httpx.Request], httpx.Response] | None = None,
+    podcast_id: str = "pod1",
+    library_id: str = "lib1",
+) -> Routes:
+    """Native-like retention fixture: the PATCH applies and DELETEs drop rows."""
+    handler = _delete_handler(item, fail=fail, after=after_delete)
+
+    def patch(request: httpx.Request) -> httpx.Response:
+        item["media"].update(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    def default_library(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_podcast_library(library_id))
+
+    routes: Routes = {
+        ("GET", f"/api/items/{podcast_id}"): lambda request: httpx.Response(
+            200, json=item
+        ),
+        ("GET", f"/api/libraries/{library_id}"): library_route or default_library,
+        ("PATCH", f"/api/items/{podcast_id}/media"): patch,
+    }
+    for episode in list(item["media"]["episodes"]):
+        routes[
+            ("DELETE", f"/api/podcasts/{podcast_id}/episode/{episode['id']}")
+        ] = handler
+    return routes
+
+
 async def test_mutations_reject_when_writes_flag_disabled(podcast_factory: Any) -> None:
     transport, requests = _make_transport({})
     client = podcast_factory(transport, writes=False)
@@ -752,6 +809,193 @@ async def test_download_revalidates_feed_url_before_feed_fetch(
     assert _method_paths(requests) == [("GET", "/api/items/pod1")]
 
 
+async def test_download_latest_rereads_and_skips_newly_known(
+    podcast_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _podcast()
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): lambda request: httpx.Response(
+            200, json=item
+        ),
+        ("POST", "/api/podcasts/feed"): _feed(*_series_feed(3)),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    mutated: set[str] = set()
+
+    async def guard(url: str) -> str:
+        # Enclosure preflight happens after the feed fetch and before the
+        # shared late re-read; mutate there to simulate an external writer.
+        if "3.mp3" in url and "queue" not in mutated:
+            mutated.add("queue")
+            item["episodeDownloadsQueued"] = [
+                _queue_entry("g3", "https://cdn.example/3.mp3")
+            ]
+        if "2.mp3" in url and "downloaded" not in mutated:
+            mutated.add("downloaded")
+            item["media"]["episodes"] = [
+                _episode(
+                    "epLate",
+                    2000,
+                    guid="g2",
+                    url="https://cdn.example/2.mp3",
+                )
+            ]
+        return url
+
+    monkeypatch.setattr(podcasts, "ensure_public_url", guard)
+
+    result = await client.download_latest_episodes("pod1", 3)
+
+    assert result["status"] == "queued"
+    assert result["queued_count"] == 1
+    assert [episode["title"] for episode in result["episodes"]] == [
+        "Episode 1"
+    ]
+    posts = _posts(requests, "/api/podcasts/pod1/download-episodes")
+    assert len(posts) == 1
+    sent = json.loads(posts[0].content)
+    assert [episode["guid"] for episode in sent] == ["g1"]
+    assert [episode["guid"] for episode in sent].count("g2") == 0
+    item_reads = [
+        request
+        for request in requests
+        if request.method == "GET" and request.url.path == "/api/items/pod1"
+    ]
+    assert len(item_reads) == 2
+
+
+async def test_download_latest_fixed_batch_is_not_backfilled_after_late_skip(
+    podcast_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _podcast()
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): item,
+        ("POST", "/api/podcasts/feed"): _feed(*_series_feed(5)),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+
+    async def guard(url: str) -> str:
+        if "5.mp3" in url:
+            item["episodeDownloadsQueued"] = [
+                _queue_entry("g5", "https://cdn.example/5.mp3")
+            ]
+        return url
+
+    monkeypatch.setattr(podcasts, "ensure_public_url", guard)
+
+    result = await client.download_latest_episodes("pod1", 2)
+
+    assert result["queued_count"] == 1
+    posts = _posts(requests, "/api/podcasts/pod1/download-episodes")
+    assert [episode["guid"] for episode in json.loads(posts[0].content)] == [
+        "g4"
+    ]
+    assert result["episodes"] == [
+        {"title": "Episode 4", "published_at": "1970-01-01T00:00:04+00:00"}
+    ]
+
+
+async def test_download_latest_all_late_known_returns_nothing_new(
+    podcast_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _podcast()
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): item,
+        ("POST", "/api/podcasts/feed"): _feed(*_series_feed(2)),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+
+    async def guard(url: str) -> str:
+        item["episodesDownloading"] = [
+            _queue_entry("g1", "https://cdn.example/1.mp3"),
+            _queue_entry("g2", "https://cdn.example/2.mp3"),
+        ]
+        return url
+
+    monkeypatch.setattr(podcasts, "ensure_public_url", guard)
+
+    result = await client.download_latest_episodes("pod1", 2)
+
+    assert result == {
+        "podcast_id": "pod1",
+        "status": "nothing_new",
+        "queued_count": 0,
+        "episodes": [],
+    }
+    assert _posts(requests, "/api/podcasts/pod1/download-episodes") == []
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_error", "message"),
+    [
+        ("feed", ABSResponseError, "changed before download"),
+        ("library", ABSResponseError, "changed before download"),
+        ("path", ABSResponseError, "changed before download"),
+        ("folder", ABSResponseError, "changed before download"),
+        ("media_type", ABSNotAllowed, "not found or not permitted"),
+        ("media_missing", ABSNotAllowed, "not found or not permitted"),
+        ("out_of_scope", ABSNotAllowed, "not found or not permitted"),
+    ],
+)
+async def test_download_latest_fails_closed_when_scope_changes_late(
+    podcast_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    expected_error: type[Exception],
+    message: str,
+) -> None:
+    item = _podcast()
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): lambda request: httpx.Response(
+            200, json=item
+        ),
+        ("POST", "/api/podcasts/feed"): _feed(*_series_feed(1)),
+        ("POST", "/api/podcasts/pod1/download-episodes"): httpx.Response(
+            200, text="OK"
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+
+    async def guard(url: str) -> str:
+        if case == "feed":
+            item["media"]["metadata"]["feedUrl"] = (
+                "https://feeds.example/changed.xml"
+            )
+        elif case == "library":
+            item["libraryId"] = "lib2"
+        elif case == "path":
+            item["path"] = "/podcasts/other"
+        elif case == "folder":
+            item["folderId"] = "folder2"
+        elif case == "media_type":
+            item["mediaType"] = "book"
+        elif case == "media_missing":
+            item["media"] = None
+        else:
+            item["libraryId"] = "lib3"
+        return url
+
+    monkeypatch.setattr(podcasts, "ensure_public_url", guard)
+
+    with pytest.raises(expected_error, match=message):
+        await client.download_latest_episodes("pod1", 1)
+
+    assert _posts(requests, "/api/podcasts/pod1/download-episodes") == []
+
+
 async def test_disable_patches_only_the_flag_and_preserves_zero_limit(
     podcast_factory: Any,
 ) -> None:
@@ -925,10 +1169,7 @@ async def test_retention_policy_only_never_deletes_and_reports_note(
             _episode("ep3", published=3000),
         ]
     )
-    routes: Routes = {
-        ("GET", "/api/items/pod1"): item,
-        ("PATCH", "/api/items/pod1/media"): {"updated": True},
-    }
+    routes: Routes = _retention_routes(item)
     transport, requests = _make_transport(routes)
     client = podcast_factory(transport)
     fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
@@ -945,6 +1186,9 @@ async def test_retention_policy_only_never_deletes_and_reports_note(
     assert result["status"] == "updated"
     assert result["deleted_count"] == 0
     assert "not removed immediately" in result["note"]
+    assert result["state"]["keep_episodes"] == 1
+    assert result["state"]["queued_download_count"] == 0
+    assert result["state"]["active_download_count"] == 0
 
 
 async def test_retention_trim_deletes_oldest_exact_episode_ids(
@@ -957,14 +1201,7 @@ async def test_retention_trim_deletes_oldest_exact_episode_ids(
             _episode("ep3", published=3000),
         ]
     )
-    routes: Routes = {
-        ("GET", "/api/items/pod1"): item,
-        ("GET", "/api/libraries/lib1"): _podcast_library("lib1"),
-        ("PATCH", "/api/items/pod1/media"): {"updated": True},
-        ("DELETE", "/api/podcasts/pod1/episode/ep1"): httpx.Response(200, text="OK"),
-        ("DELETE", "/api/podcasts/pod1/episode/ep2"): httpx.Response(200, text="OK"),
-        ("DELETE", "/api/podcasts/pod1/episode/ep3"): httpx.Response(200, text="OK"),
-    }
+    routes: Routes = _retention_routes(item)
     transport, requests = _make_transport(routes)
     client = podcast_factory(transport)
     fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
@@ -984,7 +1221,11 @@ async def test_retention_trim_deletes_oldest_exact_episode_ids(
     ]
     assert result["status"] == "completed"
     assert result["deleted_count"] == 2
-    assert result["state"]["downloaded_count"] == 3
+    assert result["deleted_episode_ids"] == ["ep1", "ep2"]
+    assert result["state"]["downloaded_count"] == 1
+    assert result["state"]["keep_episodes"] == 1
+    assert "may already have been applied" in result["note"]
+    assert "not retried" in result["note"]
 
 
 async def test_retention_trim_aborts_before_patch_over_100_deletions(
@@ -1024,14 +1265,9 @@ async def test_retention_partial_failure_reports_honest_count_and_stops(
     def fail_ep2(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text=BACKEND_SECRET)
 
-    routes: Routes = {
-        ("GET", "/api/items/pod1"): item,
-        ("GET", "/api/libraries/lib1"): _podcast_library("lib1"),
-        ("PATCH", "/api/items/pod1/media"): {"updated": True},
-        ("DELETE", "/api/podcasts/pod1/episode/ep1"): httpx.Response(200, text="OK"),
-        ("DELETE", "/api/podcasts/pod1/episode/ep2"): fail_ep2,
-        ("DELETE", "/api/podcasts/pod1/episode/ep3"): httpx.Response(200, text="OK"),
-    }
+    routes: Routes = _retention_routes(
+        item, fail={"ep2": httpx.Response(500, text=BACKEND_SECRET)}
+    )
     transport, requests = _make_transport(routes)
     client = podcast_factory(transport)
     fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
@@ -1049,7 +1285,10 @@ async def test_retention_partial_failure_reports_honest_count_and_stops(
     ]
     assert result["status"] == "partial"
     assert result["deleted_count"] == 1
+    assert result["deleted_episode_ids"] == ["ep1"]
+    assert result["failed_episode_id"] == "ep2"
     assert "unavailable" in result["error"]
+    assert result["state"]["downloaded_count"] == 2
     assert BACKEND_SECRET not in json.dumps(result)
 
 
@@ -1065,10 +1304,7 @@ async def test_retention_trim_refused_while_downloads_active_but_policy_allowed(
     item["episodeDownloadsQueued"] = [
         _queue_entry("queued", "https://cdn.example/queued.mp3")
     ]
-    routes: Routes = {
-        ("GET", "/api/items/pod1"): item,
-        ("PATCH", "/api/items/pod1/media"): {"updated": True},
-    }
+    routes: Routes = _retention_routes(item)
     transport, requests = _make_transport(routes)
     client = podcast_factory(transport)
     fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
@@ -1083,6 +1319,8 @@ async def test_retention_trim_refused_while_downloads_active_but_policy_allowed(
         "pod1", 1, False, expected_fingerprint=fingerprint
     )
     assert result["status"] == "updated"
+    assert result["state"]["queued_download_count"] == 1
+    assert result["state"]["active_download_count"] == 0
 
 
 async def test_retention_typed_inputs_and_stale_fingerprint_never_patch(
@@ -1125,6 +1363,605 @@ async def test_retention_typed_inputs_and_stale_fingerprint_never_patch(
     assert not any(request.method in {"PATCH", "DELETE"} for request in requests)
 
 
+def _retention_drift(
+    item: dict[str, Any],
+    library_holder: dict[str, Any],
+    case: str,
+) -> None:
+    """Apply one external change immediately after an acknowledged DELETE."""
+    if case == "library-type":
+        library_holder["payload"]["mediaType"] = "book"
+    elif case == "library-folder":
+        library_holder["payload"]["folders"] = [
+            {"id": "folder1", "fullPath": "/different-root", "libraryId": "lib1"}
+        ]
+    elif case == "item-path":
+        item["path"] = "/podcasts/other"
+    elif case == "folder-id":
+        item["folderId"] = "folder2"
+    elif case == "feed":
+        item["media"]["metadata"]["feedUrl"] = "https://feeds.example/changed.xml"
+    elif case == "policy":
+        item["media"]["maxEpisodesToKeep"] = 5
+    elif case == "queue":
+        item["episodesDownloading"] = [
+            _queue_entry("gx", "https://cdn.example/x.mp3")
+        ]
+    elif case == "media-type":
+        item["mediaType"] = "book"
+    elif case == "library-id":
+        item["libraryId"] = "lib2"
+    elif case == "target-removed":
+        item["media"]["episodes"] = [
+            episode
+            for episode in item["media"]["episodes"]
+            if episode["id"] != "ep2"
+        ]
+    elif case == "episode-outside":
+        _episode_by_id(item, "ep2")["audioFile"] = {
+            "metadata": {"path": "/elsewhere/ep2.mp3"}
+        }
+    elif case == "episode-renamed":
+        _episode_by_id(item, "ep2")["audioFile"] = {
+            "metadata": {"path": "/podcasts/pod1/renamed.mp3"}
+        }
+    elif case == "extra-downloaded":
+        item["media"]["episodes"].append(_episode("epX", 500))
+    else:  # pragma: no cover - parametrization is explicit
+        raise AssertionError(case)
+
+
+def _break_podcast_state(item: dict[str, Any], field: str) -> None:
+    """Replace one native field with a value the client must reject."""
+    if field == "episodes":
+        item["media"]["episodes"] = "bad"
+    else:
+        item[field] = "bad"
+
+
+def _episode_by_id(item: dict[str, Any], episode_id: str) -> dict[str, Any]:
+    return next(
+        episode
+        for episode in item["media"]["episodes"]
+        if episode["id"] == episode_id
+    )
+
+
+async def test_retention_trim_reproducer_combined_drift_after_first_ack(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("ep1", published=1000),
+            _episode("ep2", published=2000),
+            _episode("ep3", published=3000),
+        ]
+    )
+    library_holder: dict[str, Any] = {"payload": _podcast_library("lib1")}
+
+    def after_delete(episode_id: str) -> None:
+        if episode_id != "ep1":
+            return
+        _retention_drift(item, library_holder, "library-type")
+        _retention_drift(item, library_holder, "episode-outside")
+        _retention_drift(item, library_holder, "queue")
+
+    routes = _retention_routes(
+        item,
+        after_delete=after_delete,
+        library_route=lambda request: httpx.Response(
+            200, json=library_holder["payload"]
+        ),
+    )
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.set_podcast_retention(
+        "pod1", 1, True, expected_fingerprint=fingerprint
+    )
+
+    deletes = [request.url.path for request in requests if request.method == "DELETE"]
+    assert deletes == ["/api/podcasts/pod1/episode/ep1"]
+    assert result["status"] == "partial"
+    assert result["deleted_count"] == 1
+    assert result["deleted_episode_ids"] == ["ep1"]
+    assert result["failed_episode_id"] == "ep2"
+    assert "queued or active" in result["error"]
+    assert "no files were changed" not in result["error"]
+    assert "may already have been applied" in result["note"]
+    assert "not retried" in result["note"]
+    # The policy was written exactly once; no rollback or retry.
+    patches = [request for request in requests if request.method == "PATCH"]
+    assert len(patches) == 1
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("library-type", "Podcast library not found"),
+        ("library-folder", "this target was not deleted"),
+        ("item-path", "changed during deletion"),
+        ("folder-id", "changed during deletion"),
+        ("feed", "changed during deletion"),
+        ("policy", "changed during deletion"),
+        ("queue", "queued or active"),
+        ("media-type", "not found or not permitted"),
+        ("library-id", "changed during deletion"),
+        ("target-removed", "changed during deletion"),
+        ("episode-outside", "changed during deletion"),
+        ("episode-renamed", "changed during deletion"),
+        ("extra-downloaded", "changed during deletion"),
+    ],
+)
+async def test_retention_trim_stops_on_late_drift_with_honest_count(
+    podcast_factory: Any, case: str, message: str
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("ep1", published=1000),
+            _episode("ep2", published=2000),
+            _episode("ep3", published=3000),
+        ]
+    )
+    library_holder: dict[str, Any] = {"payload": _podcast_library("lib1")}
+
+    def after_delete(episode_id: str) -> None:
+        if episode_id == "ep1":
+            _retention_drift(item, library_holder, case)
+
+    routes = _retention_routes(
+        item,
+        after_delete=after_delete,
+        library_route=lambda request: httpx.Response(
+            200, json=library_holder["payload"]
+        ),
+    )
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.set_podcast_retention(
+        "pod1", 1, True, expected_fingerprint=fingerprint
+    )
+
+    deletes = [request.url.path for request in requests if request.method == "DELETE"]
+    assert deletes == ["/api/podcasts/pod1/episode/ep1"]
+    assert result["status"] == "partial"
+    assert result["deleted_count"] == 1
+    assert result["deleted_episode_ids"] == ["ep1"]
+    assert result["failed_episode_id"] == "ep2"
+    assert message in result["error"]
+    assert "no files were changed" not in result["error"]
+    assert result["filesystem_removal"] == "not_verified"
+    assert len([r for r in requests if r.method == "PATCH"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("policy", "changed during deletion"),
+        ("feed", "changed during deletion"),
+        ("queue", "queued or active"),
+        ("path", "changed during deletion"),
+        ("folder", "changed during deletion"),
+        ("target-identity", "changed during deletion"),
+        ("library-folder", "this target was not deleted"),
+        ("library-type", "Podcast library not found"),
+    ],
+)
+async def test_retention_trim_post_patch_drift_stops_before_first_delete(
+    podcast_factory: Any, case: str, message: str
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("ep1", published=1000),
+            _episode("ep2", published=2000),
+            _episode("ep3", published=3000),
+        ]
+    )
+    library_holder: dict[str, Any] = {"payload": _podcast_library("lib1")}
+    routes = _retention_routes(
+        item,
+        library_route=lambda request: httpx.Response(
+            200, json=library_holder["payload"]
+        ),
+    )
+
+    def patch(request: httpx.Request) -> httpx.Response:
+        item["media"].update(json.loads(request.content))
+        # An external change lands after our own PATCH answered but before
+        # the read-back and the first DELETE.
+        if case == "policy":
+            item["media"]["maxEpisodesToKeep"] = 5
+        elif case == "feed":
+            item["media"]["metadata"]["feedUrl"] = (
+                "https://feeds.example/changed.xml"
+            )
+        elif case == "queue":
+            item["episodesDownloading"] = [
+                _queue_entry("gx", "https://cdn.example/x.mp3")
+            ]
+        elif case == "path":
+            item["path"] = "/podcasts/other"
+        elif case == "folder":
+            item["folderId"] = "folder2"
+        elif case == "target-identity":
+            _episode_by_id(item, "ep1")["audioFile"] = {
+                "metadata": {"path": "/podcasts/pod1/renamed.mp3"}
+            }
+        elif case == "library-folder":
+            library_holder["payload"]["folders"] = [
+                {
+                    "id": "folder1",
+                    "fullPath": "/different-root",
+                    "libraryId": "lib1",
+                }
+            ]
+        else:
+            library_holder["payload"]["mediaType"] = "book"
+        return httpx.Response(200, json={})
+
+    routes[("PATCH", "/api/items/pod1/media")] = patch
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.set_podcast_retention(
+        "pod1", 1, True, expected_fingerprint=fingerprint
+    )
+
+    assert not any(request.method == "DELETE" for request in requests)
+    assert result["status"] == "partial"
+    assert result["deleted_count"] == 0
+    assert result["deleted_episode_ids"] == []
+    assert result["failed_episode_id"] == "ep1"
+    assert message in result["error"]
+    assert "no files were changed" not in result["error"]
+    assert "may already have been applied" in result["note"]
+    assert len([r for r in requests if r.method == "PATCH"]) == 1
+
+
+async def test_retention_trim_post_patch_read_failure_is_not_retried(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[_episode("ep1", published=1000), _episode("ep2", published=2000)]
+    )
+    routes = _retention_routes(item)
+    reads = {"count": 0}
+
+    def failing_item_route(request: httpx.Request) -> httpx.Response:
+        reads["count"] += 1
+        # First read is the caller's fingerprint; second is the pre-PATCH
+        # baseline. The post-PATCH read-back fails.
+        if reads["count"] <= 2:
+            return httpx.Response(200, json=item)
+        return httpx.Response(500, text=BACKEND_SECRET)
+
+    routes[("GET", "/api/items/pod1")] = failing_item_route
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.set_podcast_retention(
+        "pod1", 1, True, expected_fingerprint=fingerprint
+    )
+
+    assert len([r for r in requests if r.method == "PATCH"]) == 1
+    assert not any(request.method == "DELETE" for request in requests)
+    assert result["status"] == "partial"
+    assert result["deleted_count"] == 0
+    assert result["deleted_episode_ids"] == []
+    assert result["failed_episode_id"] == "ep1"
+    assert "unavailable" in result["error"]
+    assert result["state"] is None
+    assert BACKEND_SECRET not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["episodeDownloadsQueued", "episodesDownloading", "episodes"],
+)
+async def test_retention_trim_post_patch_malformed_state_returns_partial_before_delete(
+    podcast_factory: Any, field: str
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("ep1", published=1000),
+            _episode("ep2", published=2000),
+            _episode("ep3", published=3000),
+        ]
+    )
+    routes = _retention_routes(item)
+
+    def patch(request: httpx.Request) -> httpx.Response:
+        item["media"].update(json.loads(request.content))
+        _break_podcast_state(item, field)
+        return httpx.Response(200, json={})
+
+    routes[("PATCH", "/api/items/pod1/media")] = patch
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.set_podcast_retention(
+        "pod1", 1, True, expected_fingerprint=fingerprint
+    )
+
+    assert not any(request.method == "DELETE" for request in requests)
+    assert [
+        json.loads(request.content)
+        for request in requests
+        if request.method == "PATCH"
+    ] == [{"maxEpisodesToKeep": 1}]
+    assert result["status"] == "partial"
+    assert result["deleted_count"] == 0
+    assert result["deleted_episode_ids"] == []
+    assert result["failed_episode_id"] == "ep1"
+    assert "unexpected response" in result["error"]
+    assert "no files were changed" not in result["error"]
+    assert "unchanged" not in result["error"].lower()
+    assert "may already have been applied" in result["note"]
+    assert "not retried" in result["note"]
+    assert result["state"] is None
+
+
+async def test_retention_trim_readback_failure_after_all_acks_keeps_deletes(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("ep1", published=1000),
+            _episode("ep2", published=2000),
+            _episode("ep3", published=3000),
+        ]
+    )
+
+    def after_delete(episode_id: str) -> None:
+        if episode_id == "ep2":
+            _break_podcast_state(item, "episodeDownloadsQueued")
+
+    routes = _retention_routes(item, after_delete=after_delete)
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.set_podcast_retention(
+        "pod1", 1, True, expected_fingerprint=fingerprint
+    )
+
+    assert [
+        request.url.path for request in requests if request.method == "DELETE"
+    ] == [
+        "/api/podcasts/pod1/episode/ep1",
+        "/api/podcasts/pod1/episode/ep2",
+    ]
+    assert len([request for request in requests if request.method == "PATCH"]) == 1
+    assert result["status"] == "partial"
+    assert result["deleted_count"] == 2
+    assert result["deleted_episode_ids"] == ["ep1", "ep2"]
+    assert "failed_episode_id" not in result
+    assert "unexpected response" in result["error"]
+    assert "no files were changed" not in result["error"]
+    assert "unchanged" not in result["error"].lower()
+    assert "may already have been applied" in result["note"]
+    assert "not retried" in result["note"]
+    assert result["state"] is None
+
+
+async def test_retention_trim_readback_failure_after_first_ack_keeps_delete(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("ep1", published=1000),
+            _episode("ep2", published=2000),
+            _episode("ep3", published=3000),
+        ]
+    )
+
+    def after_delete(episode_id: str) -> None:
+        if episode_id == "ep1":
+            _break_podcast_state(item, "episodes")
+
+    routes = _retention_routes(item, after_delete=after_delete)
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.set_podcast_retention(
+        "pod1", 2, True, expected_fingerprint=fingerprint
+    )
+
+    assert [
+        request.url.path for request in requests if request.method == "DELETE"
+    ] == ["/api/podcasts/pod1/episode/ep1"]
+    assert len([request for request in requests if request.method == "PATCH"]) == 1
+    assert result["status"] == "partial"
+    assert result["deleted_count"] == 1
+    assert result["deleted_episode_ids"] == ["ep1"]
+    assert "failed_episode_id" not in result
+    assert "unexpected response" in result["error"]
+    assert "no files were changed" not in result["error"]
+    assert "unchanged" not in result["error"].lower()
+    assert "may already have been applied" in result["note"]
+    assert "not retried" in result["note"]
+    assert result["state"] is None
+
+
+async def test_retention_trim_malformed_state_after_first_ack_stops_second_delete(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("ep1", published=1000),
+            _episode("ep2", published=2000),
+            _episode("ep3", published=3000),
+        ]
+    )
+
+    def after_delete(episode_id: str) -> None:
+        if episode_id == "ep1":
+            _break_podcast_state(item, "episodesDownloading")
+
+    routes = _retention_routes(item, after_delete=after_delete)
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.set_podcast_retention(
+        "pod1", 1, True, expected_fingerprint=fingerprint
+    )
+
+    assert [
+        request.url.path for request in requests if request.method == "DELETE"
+    ] == ["/api/podcasts/pod1/episode/ep1"]
+    assert len([request for request in requests if request.method == "PATCH"]) == 1
+    assert result["status"] == "partial"
+    assert result["deleted_count"] == 1
+    assert result["deleted_episode_ids"] == ["ep1"]
+    assert result["failed_episode_id"] == "ep2"
+    assert "unexpected response" in result["error"]
+    assert "no files were changed" not in result["error"]
+    assert "may already have been applied" in result["note"]
+    assert "not retried" in result["note"]
+    assert result["state"] is None
+
+
+async def test_retention_policy_only_malformed_readback_returns_updated_without_state(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(episodes=[_episode("ep1", published=1000)])
+    routes = _retention_routes(item)
+
+    def patch(request: httpx.Request) -> httpx.Response:
+        item["media"].update(json.loads(request.content))
+        _break_podcast_state(item, "episodes")
+        return httpx.Response(200, json={})
+
+    routes[("PATCH", "/api/items/pod1/media")] = patch
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.set_podcast_retention(
+        "pod1", 5, False, expected_fingerprint=fingerprint
+    )
+
+    assert not any(request.method == "DELETE" for request in requests)
+    assert len([request for request in requests if request.method == "PATCH"]) == 1
+    assert result["status"] == "updated"
+    assert result["deleted_count"] == 0
+    assert result["state"] is None
+    assert "Existing episodes are not removed immediately" in result["note"]
+
+
+async def test_retention_trim_rejects_duplicate_rows_before_patch(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("ep1", published=1000),
+            _episode("ep1", published=2000),
+            _episode("ep2", published=3000),
+        ]
+    )
+    routes = _retention_routes(item)
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    with pytest.raises(ABSResponseError, match="ambiguous"):
+        await client.set_podcast_retention(
+            "pod1", 1, True, expected_fingerprint=fingerprint
+        )
+
+    assert not any(
+        request.method in {"PATCH", "DELETE"} for request in requests
+    )
+
+
+async def test_retention_trim_rejects_duplicate_kept_prefix_before_patch(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("epA", published=4000),
+            _episode("epA", published=3500),
+            _episode("epB", published=3000),
+            _episode("epC", published=2000),
+        ]
+    )
+    routes = _retention_routes(item)
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    # Without the whole-set duplicate check, epC and epB would be deleted
+    # while the duplicated epA rows consume the keep budget.
+    with pytest.raises(ABSResponseError, match="ambiguous"):
+        await client.set_podcast_retention(
+            "pod1", 2, True, expected_fingerprint=fingerprint
+        )
+
+    assert not any(
+        request.method in {"PATCH", "DELETE"} for request in requests
+    )
+
+
+async def test_retention_trim_rejects_duplicate_rows_without_surplus(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode("epA", published=4000),
+            _episode("epA", published=3500),
+        ]
+    )
+    routes = _retention_routes(item)
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    with pytest.raises(ABSResponseError, match="ambiguous"):
+        await client.set_podcast_retention(
+            "pod1", 5, True, expected_fingerprint=fingerprint
+        )
+
+    assert not any(
+        request.method in {"PATCH", "DELETE"} for request in requests
+    )
+
+
+async def test_retention_trim_with_no_surplus_keeps_policy_note(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[_episode("ep1", published=1000), _episode("ep2", published=2000)]
+    )
+    routes = _retention_routes(item)
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+
+    result = await client.set_podcast_retention(
+        "pod1", 5, True, expected_fingerprint=fingerprint
+    )
+
+    assert [json.loads(request.content) for request in requests if request.method == "PATCH"] == [
+        {"maxEpisodesToKeep": 5}
+    ]
+    assert not any(request.method == "DELETE" for request in requests)
+    assert result["status"] == "completed"
+    assert result["deleted_count"] == 0
+    assert result["deleted_episode_ids"] == []
+    assert "failed_episode_id" not in result
+    assert "may already have been applied" in result["note"]
+    assert result["state"]["keep_episodes"] == 5
+    assert result["state"]["downloaded_count"] == 2
+
+
 async def test_state_is_safe_and_fingerprint_tracks_feed_and_queue(
     podcast_factory: Any,
 ) -> None:
@@ -1154,9 +1991,13 @@ async def test_state_is_safe_and_fingerprint_tracks_feed_and_queue(
         "max_new_episodes",
         "keep_episodes",
         "downloaded_count",
+        "queued_download_count",
+        "active_download_count",
         "fingerprint",
     }
     assert state["downloaded_count"] == 2
+    assert state["queued_download_count"] == 0
+    assert state["active_download_count"] == 0
     assert len(state["fingerprint"]) == 64
     assert requests[0].url.params["include"] == "downloads"
 
@@ -1183,9 +2024,50 @@ async def test_state_is_safe_and_fingerprint_tracks_feed_and_queue(
     queued["episodeDownloadsQueued"] = [
         _queue_entry("g9", "https://cdn.example/queued.mp3")
     ]
+    queued["episodesDownloading"] = [
+        _queue_entry("g10", "https://cdn.example/active1.mp3"),
+        _queue_entry("g11", "https://cdn.example/active2.mp3"),
+    ]
     route_holder["item"] = queued
     with_queue = await client.get_podcast_state("pod1")
     assert with_queue["fingerprint"] != state["fingerprint"]
+    assert with_queue["queued_download_count"] == 1
+    assert with_queue["active_download_count"] == 2
+    queue_rendered = json.dumps(with_queue)
+    for forbidden in (
+        "cdn.example",
+        "queue-g9",
+        "queue-g10",
+        "queue-g11",
+        "https",
+    ):
+        assert forbidden not in queue_rendered
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("episodeDownloadsQueued", {}),
+        ("episodeDownloadsQueued", [1]),
+        ("episodesDownloading", "nope"),
+        ("episodesDownloading", [None]),
+    ],
+)
+async def test_state_fails_closed_on_malformed_queue_fields(
+    podcast_factory: Any, field: str, value: object
+) -> None:
+    item = _podcast()
+    item[field] = value
+    transport, requests = _make_transport({("GET", "/api/items/pod1"): item})
+    client = podcast_factory(transport)
+
+    with pytest.raises(
+        ABSResponseError,
+        match="Audiobookshelf returned an unexpected response",
+    ):
+        await client.get_podcast_state("pod1")
+
+    assert len(requests) == 1
 
 
 async def test_list_episodes_sorted_newest_first_nulls_last_and_safe(
@@ -1236,6 +2118,341 @@ async def test_list_episode_limit_rejects_typed_values_before_backend(
     with pytest.raises(ABSInvalidRequest):
         await client.list_podcast_episodes("pod1", limit)  # type: ignore[arg-type]
     assert requests == []
+
+
+# --- Podcast library listing ---------------------------------------------
+
+
+def _library_podcast(
+    podcast_id: str,
+    *,
+    library_id: str = "lib2",
+    title: str = "Show",
+    num_episodes: object = 3,
+) -> dict[str, Any]:
+    return {
+        "id": podcast_id,
+        "libraryId": library_id,
+        "mediaType": "podcast",
+        "media": {
+            "metadata": {
+                "title": title,
+                "feedUrl": "https://feeds.example/private.xml",
+                "imageUrl": "https://images.example/private.jpg",
+                "description": "private description",
+            },
+            "numEpisodes": num_episodes,
+            "episodes": [{"id": "leaky-episode-id"}],
+            "duration": 1234,
+        },
+        "path": "/podcasts/private-id",
+        "folderId": "folder1",
+    }
+
+
+def _list_routes(results: object, total: object) -> Routes:
+    return {
+        ("GET", "/api/libraries/lib2"): _podcast_library("lib2"),
+        ("GET", "/api/libraries/lib2/items"): {
+            "results": results,
+            "total": total,
+        },
+    }
+
+
+async def test_list_podcasts_returns_bounded_safe_page(
+    podcast_factory: Any,
+) -> None:
+    long_title = "x" * 305
+    results = [
+        _library_podcast("podA", title="  My\u0000Show  ", num_episodes=4),
+        _library_podcast("podB", title=long_title, num_episodes=None),
+        _library_podcast("podC", title="No Count"),
+        _library_podcast("podD", title="Negative", num_episodes=-1),
+        _library_podcast("podE", title="Boolean", num_episodes=True),
+        _library_podcast("podF", title="String", num_episodes="7"),
+    ]
+    results[2]["media"].pop("numEpisodes")
+    routes: Routes = {
+        ("GET", "/api/libraries/lib2"): _podcast_library("lib2"),
+        ("GET", "/api/libraries/lib2/items"): {
+            "results": results,
+            "total": len(results),
+        },
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+
+    result = await client.list_podcasts("lib2", 10)
+
+    assert set(result) == {
+        "library_id",
+        "podcasts",
+        "count",
+        "total",
+        "page",
+        "limit",
+        "has_more",
+        "next_page",
+    }
+    assert result["library_id"] == "lib2"
+    assert result["count"] == 6
+    assert result["total"] == 6
+    assert result["page"] == 0
+    assert result["limit"] == 10
+    assert result["has_more"] is False
+    assert result["next_page"] is None
+    assert [podcast["id"] for podcast in result["podcasts"]] == [
+        "podA",
+        "podB",
+        "podC",
+        "podD",
+        "podE",
+        "podF",
+    ]
+    assert result["podcasts"][0]["title"] == "My Show"
+    assert result["podcasts"][1]["title"] == long_title[:297] + "..."
+    assert [podcast["downloaded_count"] for podcast in result["podcasts"]] == [
+        4,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]
+    for podcast in result["podcasts"]:
+        assert set(podcast) == {"id", "title", "downloaded_count"}
+
+    items_request = requests[-1]
+    assert items_request.url.params["minified"] == "1"
+    assert items_request.url.params["limit"] == "10"
+    assert items_request.url.params["page"] == "0"
+
+    rendered = json.dumps(result)
+    for forbidden in (
+        "feeds.example",
+        "images.example",
+        "private description",
+        "/podcasts",
+        "leaky-episode-id",
+        "http",
+    ):
+        assert forbidden not in rendered
+
+
+async def test_list_podcasts_uses_native_page_cursor(
+    podcast_factory: Any,
+) -> None:
+    def page_results(page: int) -> list[dict[str, Any]]:
+        if page == 0:
+            return [_library_podcast(f"pod{index}") for index in range(50)]
+        assert page == 2
+        return [_library_podcast(f"pod{index}") for index in range(100, 120)]
+
+    routes: Routes = {
+        ("GET", "/api/libraries/lib2"): _podcast_library("lib2"),
+        ("GET", "/api/libraries/lib2/items"): lambda request: httpx.Response(
+            200,
+            json={
+                "results": page_results(int(request.url.params["page"])),
+                "total": 120,
+            },
+        ),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+
+    first = await client.list_podcasts("lib2", 50, page=0)
+    last = await client.list_podcasts("lib2", 50, page=2)
+
+    assert first["count"] == 50
+    assert first["has_more"] is True
+    assert first["next_page"] == 1
+    assert first["page"] == 0
+    assert last["count"] == 20
+    assert last["has_more"] is False
+    assert last["next_page"] is None
+    assert [request.url.params["page"] for request in requests if request.url.path.endswith("/items")] == [
+        "0",
+        "2",
+    ]
+
+
+async def test_list_podcasts_page_bound_reports_bounded_note(
+    podcast_factory: Any,
+) -> None:
+    results = [_library_podcast(f"pod{index}") for index in range(50)]
+    transport, _ = _make_transport(_list_routes(results, 60000))
+    client = podcast_factory(transport)
+
+    result = await client.list_podcasts("lib2", 50, page=1000)
+
+    assert result["page"] == 1000
+    assert result["count"] == 50
+    assert result["has_more"] is False
+    assert result["next_page"] is None
+    assert "maximum supported page" in result["note"]
+    assert "not a complete archive" in result["note"]
+
+
+@pytest.mark.parametrize("limit", [True, 0, 51, "5", 1.0])
+@pytest.mark.parametrize("page", [True, -1, 1001, "0", 1.0])
+async def test_list_podcasts_rejects_typed_bounds_before_backend(
+    podcast_factory: Any, limit: object, page: object
+) -> None:
+    transport, requests = _make_transport({})
+    client = podcast_factory(transport)
+
+    with pytest.raises(ABSInvalidRequest):
+        await client.list_podcasts(
+            "lib2", limit, page=page  # type: ignore[arg-type]
+        )
+    assert requests == []
+
+
+async def test_list_podcasts_rejects_oversize_response(
+    podcast_factory: Any,
+) -> None:
+    oversized = b"{" + b'"x":"' + b"z" * (4 * 1024 * 1024) + b'"}'
+    routes: Routes = {
+        ("GET", "/api/libraries/lib2"): _podcast_library("lib2"),
+        ("GET", "/api/libraries/lib2/items"): httpx.Response(
+            200,
+            content=oversized,
+            headers={"Content-Type": "application/json"},
+        ),
+    }
+    transport, _ = _make_transport(routes)
+    client = podcast_factory(transport)
+
+    with pytest.raises(ABSResponseError, match="size limit") as raised:
+        await client.list_podcasts("lib2")
+    assert "zzzz" not in str(raised.value)
+
+
+async def test_list_podcasts_requires_allowlisted_actual_podcast_library(
+    podcast_factory: Any,
+) -> None:
+    transport, requests = _make_transport({})
+    client = podcast_factory(transport)
+
+    with pytest.raises(ABSInvalidRequest):
+        await client.list_podcasts("bad/id")
+    with pytest.raises(ABSNotAllowed, match="Library not found or not permitted"):
+        await client.list_podcasts("lib3")
+    assert requests == []
+
+    book_transport, book_requests = _make_transport(
+        {("GET", "/api/libraries/lib2"): _podcast_library("lib2", media_type="book")}
+    )
+    book_client = podcast_factory(book_transport)
+    with pytest.raises(ABSNotAllowed, match="Podcast library not found"):
+        await book_client.list_podcasts("lib2")
+    assert _method_paths(book_requests) == [("GET", "/api/libraries/lib2")]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"results": [], "total": 1},
+        {"results": [_library_podcast("podA")], "total": 0},
+        {"results": "nope", "total": 0},
+        {"results": [], "total": -1},
+        {"results": [], "total": True},
+        {"results": [], "total": "0"},
+        {"results": []},
+    ],
+)
+async def test_list_podcasts_rejects_inconsistent_paging(
+    podcast_factory: Any, payload: dict[str, Any]
+) -> None:
+    routes: Routes = {
+        ("GET", "/api/libraries/lib2"): _podcast_library("lib2"),
+        ("GET", "/api/libraries/lib2/items"): payload,
+    }
+    transport, _ = _make_transport(routes)
+    client = podcast_factory(transport)
+
+    with pytest.raises(
+        ABSResponseError,
+        match="Audiobookshelf returned an unexpected response",
+    ):
+        await client.list_podcasts("lib2", 5)
+
+
+@pytest.mark.parametrize(
+    ("page", "result_count", "total"),
+    [
+        (0, 2, 1),
+        (1, 2, 6),
+    ],
+)
+async def test_list_podcasts_rejects_rows_beyond_remaining_total(
+    podcast_factory: Any, page: int, result_count: int, total: int
+) -> None:
+    results = [
+        _library_podcast(f"pod{index}") for index in range(result_count)
+    ]
+    transport, requests = _make_transport(_list_routes(results, total))
+    client = podcast_factory(transport)
+
+    with pytest.raises(
+        ABSResponseError,
+        match="Audiobookshelf returned an unexpected response",
+    ):
+        await client.list_podcasts("lib2", 5, page=page)
+
+    assert len(
+        [
+            request
+            for request in requests
+            if request.url.path == "/api/libraries/lib2/items"
+        ]
+    ) == 1
+
+
+async def test_list_podcasts_accepts_empty_page_beyond_total(
+    podcast_factory: Any,
+) -> None:
+    transport, _ = _make_transport(_list_routes([], 3))
+    client = podcast_factory(transport)
+
+    result = await client.list_podcasts("lib2", 5, page=10)
+
+    assert result["podcasts"] == []
+    assert result["count"] == 0
+    assert result["total"] == 3
+    assert result["page"] == 10
+    assert result["has_more"] is False
+    assert result["next_page"] is None
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda item: item.update(id="bad/id"),
+        lambda item: item.update(libraryId="lib1"),
+        lambda item: item.update(mediaType="book"),
+        lambda item: item.pop("media"),
+        lambda item: item["media"].pop("metadata"),
+        lambda item: item.update(id=None),
+    ],
+)
+async def test_list_podcasts_fails_closed_on_malformed_items(
+    podcast_factory: Any, mutate: Callable[[dict[str, Any]], object]
+) -> None:
+    item = _library_podcast("podA")
+    mutate(item)
+    transport, _ = _make_transport(_list_routes([item], 1))
+    client = podcast_factory(transport)
+
+    with pytest.raises(
+        ABSResponseError,
+        match="Audiobookshelf returned an unexpected response",
+    ) as raised:
+        await client.list_podcasts("lib2")
+    assert "podA" not in str(raised.value)
+    assert "private" not in str(raised.value)
 
 
 async def test_podcast_reads_accept_between_1_and_4_mib(
@@ -1924,6 +3141,20 @@ async def test_selected_download_skips_known_without_backfill(
         "Episode 1",
         "Episode 4",
     ]
+    assert [
+        (entry["id"], entry["title"], entry["reason"])
+        for entry in result["skipped_episodes"]
+    ] == [
+        (selectors["Episode 2"], "Episode 2", "already_downloaded"),
+        (selectors["Episode 3"], "Episode 3", "already_queued"),
+    ]
+    assert all(
+        set(entry) == {"id", "title", "published_at", "reason"}
+        for entry in result["skipped_episodes"]
+    )
+    skipped_rendered = json.dumps(result["skipped_episodes"])
+    for forbidden in ("cdn.example", "guid", "downloaded.mp3", "/podcasts"):
+        assert forbidden not in skipped_rendered
 
     posts = _posts(requests, "/api/podcasts/pod1/download-episodes")
     assert len(posts) == 1
@@ -1931,6 +3162,50 @@ async def test_selected_download_skips_known_without_backfill(
         "Episode 1",
         "Episode 4",
     ]
+
+
+async def test_selected_download_reports_downloaded_reason_when_both_known(
+    podcast_factory: Any,
+) -> None:
+    item = _podcast(
+        episodes=[
+            _episode(
+                "ep2",
+                2000,
+                guid="g2",
+                url="https://cdn.example/2.mp3",
+            )
+        ]
+    )
+    item["episodeDownloadsQueued"] = [
+        _queue_entry("g2", "https://cdn.example/2.mp3")
+    ]
+    routes: Routes = {
+        ("GET", "/api/items/pod1"): item,
+        ("POST", "/api/podcasts/feed"): _feed(*_series_feed(2)),
+    }
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    selectors = _selectors_by_title(
+        await client.list_available_podcast_episodes("pod1", 50)
+    )
+
+    result = await client.download_podcast_episodes(
+        "pod1", [selectors["Episode 2"]]
+    )
+
+    assert result["status"] == "nothing_new"
+    assert result["queued_count"] == 0
+    assert result["skipped_count"] == 1
+    assert result["skipped_episodes"] == [
+        {
+            "id": selectors["Episode 2"],
+            "title": "Episode 2",
+            "published_at": "1970-01-01T00:00:02+00:00",
+            "reason": "already_downloaded",
+        }
+    ]
+    assert _posts(requests, "/api/podcasts/pod1/download-episodes") == []
 
 
 async def test_selected_download_all_known_sends_no_mutation(
@@ -1963,6 +3238,7 @@ async def test_selected_download_all_known_sends_no_mutation(
         "queued_count",
         "skipped_count",
         "episodes",
+        "skipped_episodes",
         "note",
     }
     assert result["podcast_id"] == "pod1"
@@ -1971,6 +3247,20 @@ async def test_selected_download_all_known_sends_no_mutation(
     assert result["queued_count"] == 0
     assert result["skipped_count"] == 2
     assert result["episodes"] == []
+    assert [entry["reason"] for entry in result["skipped_episodes"]] == [
+        "already_downloaded",
+        "already_queued",
+    ]
+    assert [entry["id"] for entry in result["skipped_episodes"]] == [
+        selectors["Episode 1"],
+        selectors["Episode 2"],
+    ]
+    assert [entry["title"] for entry in result["skipped_episodes"]] == [
+        "Episode 1",
+        "Episode 2",
+    ]
+    for entry in result["skipped_episodes"]:
+        assert set(entry) == {"id", "title", "published_at", "reason"}
     assert "not completed downloads" in result["note"]
     assert _posts(requests, "/api/podcasts/pod1/download-episodes") == []
 
@@ -2191,6 +3481,14 @@ async def test_selected_download_rereads_and_skips_newly_queued(
     assert result["selected_count"] == 2
     assert result["queued_count"] == 1
     assert result["skipped_count"] == 1
+    assert result["skipped_episodes"] == [
+        {
+            "id": selectors["Episode 2"],
+            "title": "Episode 2",
+            "published_at": "1970-01-01T00:00:02+00:00",
+            "reason": "already_queued",
+        }
+    ]
     posts = _posts(requests, "/api/podcasts/pod1/download-episodes")
     assert len(posts) == 1
     assert [episode["title"] for episode in json.loads(posts[0].content)] == [
@@ -2407,6 +3705,17 @@ async def test_chronological_skips_known_without_backfill(
     assert result["selected_count"] == 10
     assert result["queued_count"] == 8
     assert result["skipped_count"] == 2
+    assert [
+        (entry["title"], entry["reason"])
+        for entry in result["skipped_episodes"]
+    ] == [
+        ("Episode 6", "already_downloaded"),
+        ("Episode 12", "already_downloaded"),
+    ]
+    assert [entry["id"] for entry in result["skipped_episodes"]] == [
+        selectors["Episode 6"],
+        selectors["Episode 12"],
+    ]
     posts = _posts(requests, "/api/podcasts/pod1/download-episodes")
     assert [episode["title"] for episode in json.loads(posts[0].content)] == [
         "Episode 5",
@@ -2906,28 +4215,6 @@ async def test_available_search_and_page_bounds_never_reach_backend(
 
 
 # --- Selected episode deletion -------------------------------------------
-
-
-def _delete_handler(
-    item: dict[str, Any],
-    *,
-    fail: dict[str, httpx.Response] | None = None,
-    after: Callable[[str], None] | None = None,
-) -> Callable[[httpx.Request], httpx.Response]:
-    def handler(request: httpx.Request) -> httpx.Response:
-        episode_id = request.url.path.rsplit("/", 1)[-1]
-        if fail is not None and episode_id in fail:
-            return fail[episode_id]
-        item["media"]["episodes"] = [
-            episode
-            for episode in item["media"]["episodes"]
-            if episode["id"] != episode_id
-        ]
-        if after is not None:
-            after(episode_id)
-        return httpx.Response(204)
-
-    return handler
 
 
 def _delete_routes(

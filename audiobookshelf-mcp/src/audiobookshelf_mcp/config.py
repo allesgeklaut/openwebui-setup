@@ -7,6 +7,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8000
@@ -17,6 +18,7 @@ DEFAULT_ALLOWED_HOSTS = (
 )
 MIN_MCP_TOKEN_LENGTH = 32
 MAX_SECRET_FILE_BYTES = 8192
+MAX_TIMEZONE_NAME_LENGTH = 100
 
 # Audiobookshelf library and item IDs are opaque, but never contain URL syntax.
 _RESOURCE_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
@@ -27,6 +29,14 @@ _BIND_HOST_RE = re.compile(r"\A[A-Za-z0-9._:-]+\Z")
 _HOST_ENTRY_RE = re.compile(
     r"\A(?P<host>[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(?::(?P<port>[0-9]{1,5}|\*))?\Z"
 )
+
+# IANA zone keys are "/"-separated path-like names; reject anything that could
+# refer to a file outside the tz database (absolute paths, dot segments).
+_TIMEZONE_SEGMENT_RE = re.compile(r"\A[A-Za-z0-9._+-]+\Z")
+# Files shipped next to the tz database that are not IANA zone names.
+_NON_IANA_TIME_ZONE_KEYS = frozenset({"localtime", "posixrules"})
+_NON_IANA_TIME_ZONE_PREFIXES = frozenset({"posix", "right"})
+_INVALID_TIMEZONE_MESSAGE = "ABS_SERVER_TIMEZONE must be a valid IANA time zone name."
 
 
 class ConfigError(ValueError):
@@ -50,6 +60,7 @@ class Config:
     allowed_hosts: tuple[str, ...] = DEFAULT_ALLOWED_HOSTS
     allowed_origins: tuple[str, ...] = ()
     podcast_writes_enabled: bool = False
+    abs_server_timezone: str | None = None
 
 
 def is_valid_resource_id(value: object) -> bool:
@@ -79,6 +90,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     allowed_hosts = _parse_allowed_hosts(values)
     allowed_origins = _parse_allowed_origins(values)
     podcast_writes_enabled = _parse_podcast_writes(values)
+    abs_server_timezone = _parse_server_timezone(values)
 
     return Config(
         abs_url=abs_url,
@@ -90,6 +102,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         allowed_hosts=allowed_hosts,
         allowed_origins=allowed_origins,
         podcast_writes_enabled=podcast_writes_enabled,
+        abs_server_timezone=abs_server_timezone,
     )
 
 
@@ -192,6 +205,51 @@ def _parse_podcast_writes(env: Mapping[str, str]) -> bool:
     if value == "false":
         return False
     raise ConfigError("ABS_ENABLE_PODCAST_WRITES must be true or false.")
+
+
+def _parse_server_timezone(env: Mapping[str, str]) -> str | None:
+    """Read the optional Audiobookshelf server time zone for reporting.
+
+    Unset or blank values yield ``None`` so existing deployments keep working.
+    Supplied values must be plain IANA zone keys resolvable by :class:`ZoneInfo`.
+    Errors never echo the supplied value.
+    """
+    raw = env.get("ABS_SERVER_TIMEZONE")
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ConfigError(_INVALID_TIMEZONE_MESSAGE)
+    value = raw.strip()
+    if not value:
+        return None
+    if len(value) > MAX_TIMEZONE_NAME_LENGTH:
+        raise ConfigError(
+            f"ABS_SERVER_TIMEZONE must be at most {MAX_TIMEZONE_NAME_LENGTH} characters."
+        )
+    if any(
+        char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F for char in value
+    ):
+        raise ConfigError(_INVALID_TIMEZONE_MESSAGE)
+
+    segments = value.split("/")
+    if any(
+        not segment
+        or segment in {".", ".."}
+        or _TIMEZONE_SEGMENT_RE.fullmatch(segment) is None
+        for segment in segments
+    ):
+        raise ConfigError(_INVALID_TIMEZONE_MESSAGE)
+    if (
+        value in _NON_IANA_TIME_ZONE_KEYS
+        or segments[0] in _NON_IANA_TIME_ZONE_PREFIXES
+    ):
+        raise ConfigError(_INVALID_TIMEZONE_MESSAGE)
+
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError, TypeError, OSError):
+        raise ConfigError(_INVALID_TIMEZONE_MESSAGE) from None
+    return value
 
 
 def _parse_port(env: Mapping[str, str]) -> int:
