@@ -1,4 +1,4 @@
-# CI for the Audiobookshelf MCP service (read-only foundation).
+# CI for the Audiobookshelf MCP service.
 #
 # Runs the locked test suite, audits locked runtime dependencies, and builds the
 # local service image for a vulnerability scan. Nothing is published, no

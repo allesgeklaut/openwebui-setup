@@ -30,7 +30,7 @@ subscription, download, schedule, retention, or delete tool.
 | `list_podcasts` | `library_id`, `limit` (optional, 1–50, default 25), `page` (optional, 0–1000, default 0) | Enumerate podcast subscriptions in one allowed podcast library using bounded, minified native library-item page reads. Returns `library_id`, `podcasts` (each with `id`, `title`, and `downloaded_count` as an integer or `null`), `count`, `total`, `page`, `limit`, `has_more`, `next_page`, and optionally `note`. `next_page` is `null` when there is no next page. No feed or enclosure URL is returned, and this is not a generic API surface. |
 | `get_podcast_settings` | `podcast_id` | Current auto-download flag, schedule, per-check limit, retention limit, `downloaded_count`, `queued_download_count`, `active_download_count`, and the reported `server_timezone` (string or `null`), for an allowed podcast. The three counts are current backend state, not completion/failure history. |
 | `list_podcast_episodes` | `podcast_id`, `limit` (optional), `query` (optional), `order` (optional), `offset` (optional) | Downloaded episodes only, filtered by title and paginated. Defaults: newest first, limit 25, offset 0. Returns `id`, `title`, `published_at`, `duration_seconds`, and `listening_status` for the page, plus `count`, `total`, `offset`, `limit`, `has_more`, and `next_offset`. `listening_status` is `finished`, `in_progress`, or `not_started`, derived from one bounded `GET /api/me/progress` read for the connector's Audiobookshelf API-key account — not another user's progress and not a live playback claim. |
-| `list_available_podcast_episodes` | `podcast_id`, `limit` (optional), `query` (optional), `order` (optional), `offset` (optional) | Metadata-eligible episodes in the podcast's current feed (valid date plus a non-empty audio enclosure URL), with the same filtering and paging arguments. Returns opaque `feed_<sha256>` IDs plus `title`, `published_at`, `downloaded`, and `queued`; when exactly one downloaded episode matches, `downloaded_episode_id` is also included. This is not a usability check, does not probe audio availability, and is not a promise of the full archive. |
+| `list_available_podcast_episodes` | `podcast_id`, `limit` (optional), `query` (optional), `order` (optional), `offset` (optional) | Metadata-eligible episodes in the podcast's current feed (a usable title, a valid date, and a non-empty enclosure URL; the enclosure type is not enforced), with the same filtering and paging arguments. Returns opaque `feed_<sha256>` IDs plus `title`, `published_at`, `downloaded`, and `queued`; when exactly one downloaded episode matches, `downloaded_episode_id` is also included. This is not a usability check, does not probe audio availability, and is not a promise of the full archive. |
 | `add_podcast` | `library_id`, `feed_url` | Subscribe to a validated RSS feed in an allowed podcast library. An exact duplicate returns `already_exists`. New items use an internally generated UUID folder and start with auto-download off. |
 | `download_latest_episodes` | `podcast_id`, `count` (optional, 1–25, default 10) | Queue recent episodes that are not already downloaded, queued, or active. Before the single download request, it applies the same final scope, feed-identity, and blocked-state recomputation as the feed-selection tools after URL preflight. Returns `queued` or `nothing_new`, never `completed`. `queued_count` counts requests submitted to the native queue, not verified item-by-item acceptance or completion. |
 | `download_podcast_episodes` | `podcast_id`, `episode_ids` (1–25 unique feed IDs) | Queue individually selected episodes from the current feed. Feed IDs are resolved against the requested podcast's current feed; enclosure URLs pass the URL preflight before one download request; already downloaded or queued entries are skipped and listed in `skipped_episodes` with `reason`. Returns `queued` or `nothing_new` with submitted-request counts, never `completed`. |
@@ -39,7 +39,7 @@ subscription, download, schedule, retention, or delete tool.
 | `set_podcast_retention` | `podcast_id`, `keep`, `trim_existing` (optional, default `false`) | Set retention to 0–1000 episodes (0 = unlimited). Only an explicit `trim_existing=true` deletes surplus episodes now, capped at 100. |
 | `delete_podcast_episode` | `podcast_id`, `episode_id` (native ID) | Hard-delete one downloaded episode; removes its database record. Physical file wipe is not verified. |
 | `delete_podcast_episodes` | `podcast_id`, `episode_ids` (1–25 unique native IDs) | Hard-delete selected downloaded episodes after prevalidating every ID, path, and queue state. Stops at the first failure and returns an honest partial acknowledgement; no rollback, retry, or filesystem verification. |
-| `delete_finished_podcast_episodes` | `podcast_id`, `limit` (optional, 1–25, default 25) | Hard-delete up to `limit` downloaded episodes of one allowed podcast that the connector's Audiobookshelf API-key account marked finished, oldest `publishedAt` first with undated episodes last. Selection uses one bounded `GET /api/me/progress` snapshot. Every target is prevalidated with the same scope/path/queue guards as `delete_podcast_episodes`, the shared per-DELETE fence runs unchanged, then a fresh per-episode `GET /api/me/progress/{libraryItemId}/{episodeId}` recheck decides: a missing record (`progress_record_missing`) or a record not strictly `isFinished` true (`finished_flag_cleared`) skips that episode without stopping the batch; any other failure stops the run with an honest partial result. No retry, rollback, or filesystem verification. |
+| `delete_finished_podcast_episodes` | `podcast_id`, `limit` (optional, 1–25, default 25) | Hard-delete up to `limit` downloaded episodes of one allowed podcast that the connector's Audiobookshelf API-key account marked finished, oldest `publishedAt` first with undated episodes last. Selection uses one bounded `GET /api/me/progress` snapshot. Every target is prevalidated with the same scope/path/queue guards as `delete_podcast_episodes`, the shared per-DELETE fence runs unchanged, then a fresh per-episode `GET /api/me/progress/{libraryItemId}/{episodeId}` recheck decides: a missing or inaccessible record (`progress_record_missing`) or a validated record not strictly `isFinished` true (`finished_flag_cleared`) skips that episode without stopping the batch; a recheck record that does not identify the same podcast and episode, or whose `isFinished` is not a strict boolean, is an unexpected response that stops the run, as does any other failure, with an honest partial result. No retry, rollback, or filesystem verification. |
 | `delete_podcast` | `podcast_id` | Hard-delete the item; the backend recursively targets its stored directory and removes its database record. Physical file wipe is not verified. |
 
 All fourteen are restricted to allowed podcast libraries: podcast/item tools
@@ -131,11 +131,15 @@ a strict `isFinished` true. `in_progress` requires a saved record that is not
 finished and a non-boolean numeric `currentTime` greater than zero.
 `not_started` covers a missing record or a zero position. Rows for other
 library items are ignored. A malformed progress envelope fails the call closed
-rather than guessing a status. This is saved progress for one account, not the
+rather than guessing a status. The snapshot is one account-wide read under the
+same 4 MiB response cap: an account whose saved progress across all libraries
+grows beyond that bound makes these calls fail closed rather than silently
+guessing, and no other tool depends on that read. This is saved progress for one account, not the
 OpenWebUI or MCP caller's identity and not a claim about live playback. It is a
 projection only; there is no listening-status filter or ordering argument.
-`list_available_podcast_episodes` carries no listening status, because
-current-feed entries have no native progress record.
+`list_available_podcast_episodes` carries no listening status: feed entries are
+listed by opaque feed selectors and are not joined to the account's native
+progress records.
 
 ### Feed IDs versus native episode IDs
 
@@ -163,7 +167,8 @@ a title or URL match.
 
 `list_available_podcast_episodes` re-fetches the podcast's stored feed URL
 through Audiobookshelf on every call and returns metadata-eligible episodes:
-currently present, validly dated, and carrying a non-empty audio enclosure URL.
+currently present, validly dated, titled, and carrying a non-empty enclosure
+URL (the enclosure type is not enforced).
 This is metadata eligibility, not a usability or reachability check; URL
 preflight applies only when a selected or windowed download is requested.
 Undated or URL-less entries are omitted; excluding undated entries is the
@@ -210,7 +215,8 @@ no automatic retry.
 `download_episodes_from` is the fixed-window variant. `count` is 1–25 and
 defaults to 10; it includes the anchor. The window is the anchor plus the next
 `count - 1` newer episodes in chronological publication order, returned oldest
-to newest, with the same deterministic episode-ID tie-break. The anchor must
+to newest, with the same deterministic ordering by publication time and opaque
+feed selector. The anchor must
 resolve in the current feed; an unknown, stale, or removed anchor fails rather
 than falling back to another episode. Episodes already downloaded or queued
 inside the window are skipped and are not revalidated. Every remaining window
@@ -368,10 +374,13 @@ episodes last and takes at most `limit`. Every target is prevalidated with the
 same scope, path, podcast identity, and queue guards as
 `delete_podcast_episodes`; the shared per-DELETE fence then runs unchanged. A
 fresh per-episode `GET /api/me/progress/{libraryItemId}/{episodeId}` recheck
-immediately before each DELETE decides the outcome: a missing record is skipped
-with reason `progress_record_missing`, and a record that is not strictly
-finished is skipped with `finished_flag_cleared`. Skips continue the batch and
-are never deleted. Any other failure — fence, progress read, or DELETE — stops
+immediately before each DELETE decides the outcome: a record that is missing or
+inaccessible (the backend client maps both alike) is skipped with reason
+`progress_record_missing`, and a record that is not strictly finished is skipped
+with `finished_flag_cleared`. Skips continue the batch and are never deleted.
+The recheck record must identify the same podcast and episode and carry a strict
+boolean `isFinished`; anything else is an unexpected response that stops the
+run. Any other failure — fence, progress read, or DELETE — stops
 the run with `status: partial`, `failed_episode_id`, a sanitized `error`, and
 honest counts. Nothing is retried or rolled back.
 
@@ -555,7 +564,7 @@ All credentials are file-backed; there are intentionally no direct
 | `MCP_HOST` | no | `0.0.0.0` | Bind address. |
 | `MCP_PORT` | no | `8000` | Bind port. |
 | `MCP_ALLOWED_HOSTS` | no | `audiobookshelf-mcp:8000,localhost:8000,127.0.0.1:8000` | Exact `Host` allowlist. Update this if the service name or port changes. |
-| `MCP_ALLOWED_ORIGINS` | no | empty | Exact `Origin` allowlist. Empty rejects every request that carries an `Origin`; requests without `Origin` (OpenWebUI server-to-server) are accepted. |
+| `MCP_ALLOWED_ORIGINS` | no | empty | Exact `Origin` allowlist, comma-separated (for example `https://chat.example.com`). Empty rejects every request that carries an `Origin`; requests without `Origin` (OpenWebUI server-to-server) are accepted. |
 
 Startup fails closed on missing, empty, oversized, malformed, or unreadable
 secret files, on short MCP tokens, on invalid write-flag values, and on an
@@ -621,8 +630,9 @@ uv run --frozen audiobookshelf-mcp
 ```
 
 For writes, set `ABS_ENABLE_PODCAST_WRITES=true` and point `ABS_API_KEY_FILE`
-at the admin-owned key described above. The MCP endpoint is
-`http://audiobookshelf-mcp:8000/mcp`; authenticate with
+at the admin-owned key described above. Run locally with `uv run`, the MCP
+endpoint is `http://localhost:8000/mcp`; the Compose service is reachable as
+`http://audiobookshelf-mcp:8000/mcp` on its Docker network. Authenticate with
 `Authorization: Bearer <MCP_AUTH_TOKEN_FILE contents>`. The server is stateless
 in both modes; no session ID is issued or treated as authentication.
 Authentication is enforced for every method on `/mcp`, using a constant-time
@@ -654,9 +664,10 @@ with no published host port and with narrow, read-only secret mounts (no real
 credentials in the repo):
 
 ```bash
+docker network create abs-internal
 docker run --name audiobookshelf-mcp \
   --read-only --cap-drop=ALL --security-opt no-new-privileges \
-  --network audiobookshelf-internal \
+  --network abs-internal \
   -v /opt/secrets/abs_api_key:/run/secrets/abs_api_key:ro \
   -v /opt/secrets/mcp_token:/run/secrets/mcp_token:ro \
   -e ABS_URL=http://audiobookshelf:80 \
@@ -739,8 +750,11 @@ physical file removal.
 
 `.github/workflows/audiobookshelf-mcp.yml` runs the locked test suite, audits
 the locked runtime dependencies with pinned `pip-audit`, and builds the image
-to scan it with Trivy, failing only on fixable HIGH/CRITICAL findings; unfixed
-base-image findings are excluded from that gate and triaged separately. The
+to scan it with Trivy, failing only on fixable HIGH/CRITICAL findings; any
+finding without an available fix is excluded from that gate and must be
+triaged separately. It runs on pull requests and `main` pushes that touch
+`audiobookshelf-mcp/**` or the workflow and Dependabot files, on a weekly
+schedule, and on manual dispatch. The
 workflow publishes nothing and uses no repository secrets. Dependabot opens
 weekly update PRs for `uv.lock`, the Dockerfile base image, and GitHub Actions;
 they are reviewed manually.
