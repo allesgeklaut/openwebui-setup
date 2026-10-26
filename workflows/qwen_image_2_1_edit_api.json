@@ -53,43 +53,43 @@
       "negative_prompt": "",
       "resolution": 1024,
       "images.image_1": [
-        "4",
+        "19",
         0
       ],
       "images.image_2": [
-        "10",
+        "20",
         0
       ],
       "images.image_3": [
-        "11",
+        "21",
         0
       ],
       "images.image_4": [
-        "12",
+        "22",
         0
       ],
       "images.image_5": [
-        "13",
+        "23",
         0
       ],
       "images.image_6": [
-        "14",
+        "24",
         0
       ],
       "images.image_7": [
-        "15",
+        "25",
         0
       ],
       "images.image_8": [
-        "16",
+        "26",
         0
       ],
       "images.image_9": [
-        "17",
+        "27",
         0
       ],
       "images.image_10": [
-        "18",
+        "28",
         0
       ]
     },
@@ -246,5 +246,45 @@
     "_meta": {
       "title": "Reference image 10 (unused)"
     }
+  },
+  "19": {
+    "inputs": {"image": ["4", 0], "alpha": ["4", 1]},
+    "class_type": "JoinImageWithAlpha"
+  },
+  "20": {
+    "inputs": {"image": ["10", 0], "alpha": ["10", 1]},
+    "class_type": "JoinImageWithAlpha"
+  },
+  "21": {
+    "inputs": {"image": ["11", 0], "alpha": ["11", 1]},
+    "class_type": "JoinImageWithAlpha"
+  },
+  "22": {
+    "inputs": {"image": ["12", 0], "alpha": ["12", 1]},
+    "class_type": "JoinImageWithAlpha"
+  },
+  "23": {
+    "inputs": {"image": ["13", 0], "alpha": ["13", 1]},
+    "class_type": "JoinImageWithAlpha"
+  },
+  "24": {
+    "inputs": {"image": ["14", 0], "alpha": ["14", 1]},
+    "class_type": "JoinImageWithAlpha"
+  },
+  "25": {
+    "inputs": {"image": ["15", 0], "alpha": ["15", 1]},
+    "class_type": "JoinImageWithAlpha"
+  },
+  "26": {
+    "inputs": {"image": ["16", 0], "alpha": ["16", 1]},
+    "class_type": "JoinImageWithAlpha"
+  },
+  "27": {
+    "inputs": {"image": ["17", 0], "alpha": ["17", 1]},
+    "class_type": "JoinImageWithAlpha"
+  },
+  "28": {
+    "inputs": {"image": ["18", 0], "alpha": ["18", 1]},
+    "class_type": "JoinImageWithAlpha"
   }
 }

@@ -218,8 +218,9 @@ Open WebUI's ComfyUI engine drives the local stack (`../comfyui`) on
 the `config` table of the gitignored `data/webui.db`; the workflow files here
 are its reproducible mirror. Active in Open WebUI:
 `qwen_image_2_1_turbo_{t2i,edit}_api.json`. The base variants are the rollback
-path; the `_pe_` variants (Prompt Enhancer) belong to the ComfyUI MCP only —
-Open WebUI already rewrites prompts itself, so PE there would double-enhance.
+path. Separate Prompt Enhancer workflows have been removed: they added latency
+and could rewrite transparency requests into white/checkerboard backgrounds.
+Open WebUI's own chat prompt handling is unchanged.
 
 DB keys (Admin → Settings → Images, or the `config` table directly — applies
 live, no restart, reload the browser):
@@ -245,8 +246,14 @@ Node maps (`*.comfyui.nodes`; ids per the active Turbo workflows):
 `edit_image` tool passes `image_urls` lists end-to-end. Address references as
 `<image2>`..`<image10>` (`<image1>` is the target). Unfilled workflow slots
 carry the sentinel `multi_ref_unused.png`, which the lifecycle proxy strips
-from `POST /prompt` (`../litellm/comfyui_proxy/prompt_clean.py`); the ComfyUI
+along with its unused alpha-join helper from `POST /prompt`
+(`../litellm/comfyui_proxy/prompt_clean.py`); the ComfyUI
 MCP exposes the same via `reference_images`.
+
+Each edit image's RGB and mask outputs are recombined with `JoinImageWithAlpha`
+before Qwen encoding, preserving input transparency. Editing still defaults to
+a 1024 resolution budget as a speed/memory trade-off; choose a
+higher budget explicitly for final edits that need finer detail.
 
 Gotchas when writing the `config` table directly (violations fail as generic
 400s; non-JSON values crash every image request):
