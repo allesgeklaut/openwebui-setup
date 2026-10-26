@@ -200,6 +200,7 @@ services:
     networks:
       - default
       - stacks-shared
+      - trilium
 
   searxng:
     image: searxng/searxng:latest
@@ -273,6 +274,9 @@ networks:
   audiobookshelf:
     external: true
     name: audiobookshelf_default
+  trilium:
+    external: true
+    name: trilium_default
 
 volumes:
   searxng-valkey-data:
