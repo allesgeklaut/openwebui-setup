@@ -244,9 +244,18 @@ other schedules have not been evaluated. `KSampler` cannot load that schedule, s
 the Turbo workflows use a `ManualSigmas` node carrying the checkpoint's list
 (`1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0.0`)
 into `SamplerCustom` (euler). That is the documented schedule, not ComfyUI's own
-`simple` (which applies a ~1.15 `shift`). Resolution defaults to 2048×2048 for
-generation and 1024×1024 for editing (in both the workflow and the Open WebUI
-`*.size` keys); the Turbo card documents 2048-scale presets.
+`simple` (which applies a ~1.15 `shift`).
+
+Comfy-Org has since published official Turbo templates
+(`Comfy-Org/workflow_templates`, `image_qwen_image_2_1_turbo_{t2i,image_edit}.json`)
+using the byte-identical sigma list, euler, cfg 1, and the same int8/VAE files —
+the day-one integration here matches them. Generation keeps the native 2K pairing
+(2048×2048 latent + encode `resolution` 2048, mirrored by
+`image_generation.size`). Edits follow the official template: the sampling
+latent comes from `TextEncodeQwenImage21`'s `latent` output, which is sized to
+the input image (within the encode node's `resolution` budget, 1024 ≈ 1 MP), so
+the output preserves the input's aspect ratio; the UI size box does not apply
+to edits.
 
 **Open WebUI uses the plain Turbo workflows**
 (`qwen_image_2_1_turbo_{t2i,edit}_api.json`). It already has its own
@@ -274,7 +283,7 @@ DB keys to restore (Admin → Settings → Images, or the `config` table directl
 | `images.edit.comfyui.workflow` | `workflows/qwen_image_2_1_turbo_edit_api.json` |
 | `image_generation.model` / `images.edit.model` | `qwen_image_2.1_turbo_int8_convrot.safetensors` |
 | `image_generation.size` | `2048x2048` |
-| `images.edit.size` | `1024x1024` |
+| `images.edit.size` | unused — edit output follows the input image (no `EmptyLatentImage` node, nothing mapped) |
 | `image_generation.steps` | unused for Turbo — the schedule is fixed by `ManualSigmas`; left at `8` for the UI. Restore to `40` when rolling back to the base. |
 | `*.comfyui.base_url` | `http://${LAN_IP}:8189` (lifecycle proxy) |
 | `*.comfyui.api_key` | empty |
@@ -297,7 +306,7 @@ Update the `model` key as well.
 Node maps (`*.comfyui.nodes`); ids refer to the active **Turbo** workflows above.
 
 - generation (Turbo): `prompt`→4, `negative_prompt`→4, `model`/`unet_name`→1, `width`/`height`/`n`→5, `seed`→6 (`noise_seed`)
-- edit (Turbo): `image`→4, `prompt`→5, `model`/`unet_name`→1, `width`/`height`→7, `seed`→6 (`noise_seed`)
+- edit (Turbo): `image`→4, `prompt`→5, `model`/`unet_name`→1, `seed`→6 (`noise_seed`) — no `width`/`height`: the edit workflow has no `EmptyLatentImage` node anymore
 
 Neither maps `steps`: the Turbo schedule is fixed by `ManualSigmas`, and
 `SamplerCustom` has no `steps` input. The base workflows
@@ -306,27 +315,42 @@ generation maps `steps`/`seed`→6 and edit maps `seed`→6.
 
 PE workflows (`prompt` goes to the rewrite node, not `TextEncodeQwenImage21`):
 
-- PE generation: `prompt`→2, `negative_prompt`→6, `model`/`unet_name`→3, `width`/`height`/`n`→7, `steps`/`seed`→8
-- PE edit: `image`→3, `prompt`→2, `model`/`unet_name`→4, `width`/`height`→8, `seed`→9
+- PE generation: `prompt`→2, `negative_prompt`→6, `model`/`unet_name`→3, `width`/`height`/`n`→7, seed→8 (`noise_seed` for the Turbo `SamplerCustom`; `seed`+`steps` for the base `KSampler`)
+- PE edit: `image`→3, `prompt`→2, `model`/`unet_name`→4, seed→9 (same key rule as PE generation)
 
 (PE node ids: CLIPLoader PE=1, rewrite=2, then UNET=3/4, generation
-CLIPLoader, VAE, `TextEncodeQwenImage21`, `EmptyLatentImage`, `KSampler`,
-`VAEDecode`, `SaveImage`, `PreviewAny`. See the JSON files.)
+CLIPLoader, VAE, `TextEncodeQwenImage21`, `EmptyLatentImage` (t2i only),
+sampler, `VAEDecode`, `SaveImage`, `PreviewAny`. See the JSON files.)
 
 Neither node map sets `TextEncodeQwenImage21.resolution`, so it stays at the
-workflow's baked value (2048 for generation, 1024 for editing). Changing the
-size in the UI only rewrites `EmptyLatentImage` (`width`/`height`, nodes 5/7),
-so a different size desyncs the latent from `resolution` — use the baked size,
-or change `resolution` in the workflow (and the DB workflow) to match.
+workflow's baked value (2048 for generation, 1024 for editing). For generation,
+changing the size in the UI only rewrites `EmptyLatentImage` (`width`/`height`,
+node 5), so a different size desyncs the latent from `resolution` — use the
+baked size, or change `resolution` in the workflow (and the DB workflow) to
+match. For editing, `resolution` is the input-image size budget and the UI size
+box is not wired at all, so it cannot desync.
 
-Two gotchas, both of which fail with a generic 400 if violated:
+Node-map gotchas — violating any of these fails image requests with a generic
+400:
 
 - The **edit** node map must **not** include `negative_prompt`: `ComfyUIEditImageForm` has no such field and the node-map applier dereferences it unconditionally.
 - The **edit** node map must **not** include `steps`: the edit request path does not send it, so mapping it writes `None` and ComfyUI rejects the prompt. (The Turbo edit workflow takes its schedule from `ManualSigmas`; the base edit workflow's own default, 40, applies.)
+- The edit node map must **not** include `width`/`height` either: since the edit workflows sample from the encode node's latent (official wiring), they have no `EmptyLatentImage` node, and the applier would write into a missing node id.
 - The Turbo workflows seed through `SamplerCustom`, whose input is named `noise_seed` — so the `seed` map entry must use `"key": "noise_seed"` (the base `KSampler` uses `"key": "seed"`).
 
-Changing the DB directly requires an Open WebUI restart — image config is read
-into memory at startup.
+Changing the DB directly does **not** require an Open WebUI restart: since
+v0.12.4 the images router reads its config per request
+(`get_image_config()` → `Config.get_many()` queries the config table on every
+call), so changes apply immediately — the browser only needs a reload to
+refresh the settings UI.
+
+**ChatGPT subscription adapter (alternative).** Between 2026-10-18 and 2026-10-26
+Open WebUI's image engines were switched to the `chatgpt-images` shim
+(`../litellm/chatgpt_images/`). The shim is retained as an alternative: run its
+`configure_webui.py` to switch to it again. To switch back to ComfyUI, restore
+the keys per this section — or, for the exact adapter-era rows,
+`data/backups/config-image-gen-comfyui-backup-20261026.json` (secret-bearing,
+gitignored; contains the gateway key, delete once no longer needed).
 
 ## Ports
 

@@ -98,17 +98,6 @@
       "title": "Text Encode Qwen Image 2.1 (Edit)"
     }
   },
-  "8": {
-    "inputs": {
-      "width": 1024,
-      "height": 1024,
-      "batch_size": 1
-    },
-    "class_type": "EmptyLatentImage",
-    "_meta": {
-      "title": "Empty Latent"
-    }
-  },
   "9": {
     "inputs": {
       "model": [
@@ -124,8 +113,8 @@
         1
       ],
       "latent_image": [
-        "8",
-        0
+        "7",
+        2
       ],
       "seed": 0,
       "steps": 40,
