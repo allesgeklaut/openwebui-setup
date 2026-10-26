@@ -214,7 +214,7 @@ and reindex again.
 
 Open WebUI's ComfyUI engine drives the local stack (`../comfyui`) on
 **Qwen-Image-2.1-Turbo** for generation and editing, via the lifecycle proxy
-`http://${LAN_IP}:8189` (details in `../litellm/README.md`). The live config is
+`http://<LAN_IP>:8189` (details in `../litellm/README.md`). The live config is
 the `config` table of the gitignored `data/webui.db`; the workflow files here
 are its reproducible mirror. Active in Open WebUI:
 `qwen_image_2_1_turbo_{t2i,edit}_api.json`. The base variants are the rollback
@@ -232,7 +232,7 @@ live, no restart, reload the browser):
 | `image_generation.model` / `images.edit.model` | `qwen_image_2.1_turbo_int8_convrot.safetensors` |
 | `image_generation.size` | `2048x2048` (generation canvas; if changed, also change the workflow's encode `resolution`) |
 | `images.edit.size` | `1024x1024` — its **width** becomes the edit resolution budget; a request's `size` overrides it |
-| `*.comfyui.base_url` | `http://${LAN_IP}:8189` (lifecycle proxy, not `:8188`) |
+| `*.comfyui.base_url` | `http://<LAN_IP>:8189` (lifecycle proxy, not `:8188`) |
 | `*.comfyui.api_key` | empty |
 
 Node maps (`*.comfyui.nodes`; ids per the active Turbo workflows):
@@ -261,7 +261,11 @@ Gotchas when writing the `config` table directly (violations fail as generic
 Rollback to the base model: point the two workflow keys at
 `qwen_image_2_1_{t2i,edit}_api.json`, set both models to
 `qwen_image_2.1_int8_convrot.safetensors`, `image_generation.size` to
-`1024x1024` and `image_generation.steps` to `40`.
+`1024x1024`, `image_generation.steps` to `40`, and swap both node maps to
+the base variants (the ids/keys above are Turbo-specific): generation adds
+`steps`→6 and seeds via `"key": "seed"` (not `noise_seed`); edit points
+`image` at `["4", "10", ..., "18"]` and also seeds via `"key": "seed"`,
+keeping `prompt`→5, `model`→1 and `width`→5 (`resolution`) unchanged.
 
 **ChatGPT adapter (alternative).** The `chatgpt-images` shim
 (`../litellm/chatgpt_images/`) can serve both engines instead; run its
