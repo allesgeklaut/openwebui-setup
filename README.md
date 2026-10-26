@@ -253,9 +253,9 @@ the day-one integration here matches them. Generation keeps the native 2K pairin
 (2048×2048 latent + encode `resolution` 2048, mirrored by
 `image_generation.size`). Edits follow the official template: the sampling
 latent comes from `TextEncodeQwenImage21`'s `latent` output, which is sized to
-the input image (within the encode node's `resolution` budget, 1024 ≈ 1 MP), so
-the output preserves the input's aspect ratio; the UI size box does not apply
-to edits.
+the input image (within the encode node's `resolution` budget — see the
+resolution note under the node maps), so the output preserves the input's
+aspect ratio; the UI size box feeds that budget through its width.
 
 **Open WebUI uses the plain Turbo workflows**
 (`qwen_image_2_1_turbo_{t2i,edit}_api.json`). It already has its own
@@ -283,7 +283,7 @@ DB keys to restore (Admin → Settings → Images, or the `config` table directl
 | `images.edit.comfyui.workflow` | `workflows/qwen_image_2_1_turbo_edit_api.json` |
 | `image_generation.model` / `images.edit.model` | `qwen_image_2.1_turbo_int8_convrot.safetensors` |
 | `image_generation.size` | `2048x2048` |
-| `images.edit.size` | unused — edit output follows the input image (no `EmptyLatentImage` node, nothing mapped) |
+| `images.edit.size` | `1024x1024` — its **width** is written into the encode node's `resolution` (input-image budget); request `size` overrides it per edit |
 | `image_generation.steps` | unused for Turbo — the schedule is fixed by `ManualSigmas`; left at `8` for the UI. Restore to `40` when rolling back to the base. |
 | `*.comfyui.base_url` | `http://${LAN_IP}:8189` (lifecycle proxy) |
 | `*.comfyui.api_key` | empty |
@@ -306,36 +306,54 @@ Update the `model` key as well.
 Node maps (`*.comfyui.nodes`); ids refer to the active **Turbo** workflows above.
 
 - generation (Turbo): `prompt`→4, `negative_prompt`→4, `model`/`unet_name`→1, `width`/`height`/`n`→5, `seed`→6 (`noise_seed`)
-- edit (Turbo): `image`→4, `prompt`→5, `model`/`unet_name`→1, `seed`→6 (`noise_seed`) — no `width`/`height`: the edit workflow has no `EmptyLatentImage` node anymore
+- edit (Turbo): `image`→4 then the reference slots 12..20 positionally, `prompt`→5, `model`/`unet_name`→1, `seed`→6 (`noise_seed`), `width`→5 with `"key": "resolution"` (the size box's width is the edit resolution budget; height is ignored)
 
 Neither maps `steps`: the Turbo schedule is fixed by `ManualSigmas`, and
 `SamplerCustom` has no `steps` input. The base workflows
 (`qwen_image_2_1_{t2i,edit}_api.json`, rollback) still use `KSampler`, where
 generation maps `steps`/`seed`→6 and edit maps `seed`→6.
 
+**Multi-reference editing.** Qwen-Image-2.1 edits accept up to **10 images**
+(target + 9 references) and its editing is reference-based generation — the
+model composes new scenes from reference people/products (its showcase
+includes a group photo from six portrait references). The chat `edit_image`
+tool takes `image_urls` as a **list** plus an optional `size`, and
+`/api/v1/images/edit` accepts `"image": [...]`, so this works end-to-end:
+address references in the prompt as `<image2>` .. `<image10>` (`<image1>` is
+the target). The edit workflows carry ten `LoadImage` slots; unfilled slots
+keep the sentinel `multi_ref_unused.png`, and the ComfyUI lifecycle proxy
+strips those nodes (and links to them) from every `POST /prompt` before
+ComfyUI validates it (`../litellm/comfyui_proxy/prompt_clean.py` — Open
+WebUI's applier can write filenames into nodes but can neither create nor
+remove nodes). The ComfyUI MCP `edit_image` tool exposes the same thing via
+its `reference_images` parameter.
+
 PE workflows (`prompt` goes to the rewrite node, not `TextEncodeQwenImage21`):
 
 - PE generation: `prompt`→2, `negative_prompt`→6, `model`/`unet_name`→3, `width`/`height`/`n`→7, seed→8 (`noise_seed` for the Turbo `SamplerCustom`; `seed`+`steps` for the base `KSampler`)
-- PE edit: `image`→3, `prompt`→2, `model`/`unet_name`→4, seed→9 (same key rule as PE generation)
+- PE edit: `image`→3 then reference slots 16..24 (Turbo) / 14..22 (base), `prompt`→2, `model`/`unet_name`→4, seed→9 (same key rule as PE generation)
 
 (PE node ids: CLIPLoader PE=1, rewrite=2, then UNET=3/4, generation
 CLIPLoader, VAE, `TextEncodeQwenImage21`, `EmptyLatentImage` (t2i only),
-sampler, `VAEDecode`, `SaveImage`, `PreviewAny`. See the JSON files.)
+sampler, `VAEDecode`, `SaveImage`, `PreviewAny`, then the reference slots.
+See the JSON files.)
 
-Neither node map sets `TextEncodeQwenImage21.resolution`, so it stays at the
-workflow's baked value (2048 for generation, 1024 for editing). For generation,
-changing the size in the UI only rewrites `EmptyLatentImage` (`width`/`height`,
-node 5), so a different size desyncs the latent from `resolution` — use the
-baked size, or change `resolution` in the workflow (and the DB workflow) to
-match. For editing, `resolution` is the input-image size budget and the UI size
-box is not wired at all, so it cannot desync.
+Generation keeps `TextEncodeQwenImage21.resolution` at the workflow's baked
+2048 (native 2K pairing); the node map does not set it, so changing the
+generation size in the UI only rewrites `EmptyLatentImage` (`width`/`height`,
+node 5) — use the baked size, or change `resolution` in the workflow (and the
+DB workflow) to match. For editing, the map wires `width` into the encode
+node's `resolution` (the input-image size budget: aspect is preserved, ~1 MP
+at 1024, native 2K at 2048 — a 2048-budget edit takes ~7 min on the 16 GB
+card, so the default is 1024), with `images.edit.size` as the fallback when a
+request sends no size.
 
 Node-map gotchas — violating any of these fails image requests with a generic
 400:
 
 - The **edit** node map must **not** include `negative_prompt`: `ComfyUIEditImageForm` has no such field and the node-map applier dereferences it unconditionally.
 - The **edit** node map must **not** include `steps`: the edit request path does not send it, so mapping it writes `None` and ComfyUI rejects the prompt. (The Turbo edit workflow takes its schedule from `ManualSigmas`; the base edit workflow's own default, 40, applies.)
-- The edit node map must **not** include `width`/`height` either: since the edit workflows sample from the encode node's latent (official wiring), they have no `EmptyLatentImage` node, and the applier would write into a missing node id.
+- The edit map's `width` entry must use `"key": "resolution"` (the edit workflows sample from the encode node's latent, so there is no `EmptyLatentImage` canvas to size), and `images.edit.size` must stay non-empty: the applier writes `payload.width` unconditionally, so an empty size means `None` lands in `resolution` and ComfyUI rejects the prompt.
 - The Turbo workflows seed through `SamplerCustom`, whose input is named `noise_seed` — so the `seed` map entry must use `"key": "noise_seed"` (the base `KSampler` uses `"key": "seed"`).
 
 Changing the DB directly does **not** require an Open WebUI restart: since

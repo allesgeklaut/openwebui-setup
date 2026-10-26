@@ -55,6 +55,42 @@
       "images.image_1": [
         "4",
         0
+      ],
+      "images.image_2": [
+        "10",
+        0
+      ],
+      "images.image_3": [
+        "11",
+        0
+      ],
+      "images.image_4": [
+        "12",
+        0
+      ],
+      "images.image_5": [
+        "13",
+        0
+      ],
+      "images.image_6": [
+        "14",
+        0
+      ],
+      "images.image_7": [
+        "15",
+        0
+      ],
+      "images.image_8": [
+        "16",
+        0
+      ],
+      "images.image_9": [
+        "17",
+        0
+      ],
+      "images.image_10": [
+        "18",
+        0
       ]
     },
     "class_type": "TextEncodeQwenImage21",
@@ -119,6 +155,96 @@
     "class_type": "SaveImage",
     "_meta": {
       "title": "Save Image"
+    }
+  },
+  "10": {
+    "inputs": {
+      "image": "multi_ref_unused.png",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Reference image 2 (unused)"
+    }
+  },
+  "11": {
+    "inputs": {
+      "image": "multi_ref_unused.png",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Reference image 3 (unused)"
+    }
+  },
+  "12": {
+    "inputs": {
+      "image": "multi_ref_unused.png",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Reference image 4 (unused)"
+    }
+  },
+  "13": {
+    "inputs": {
+      "image": "multi_ref_unused.png",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Reference image 5 (unused)"
+    }
+  },
+  "14": {
+    "inputs": {
+      "image": "multi_ref_unused.png",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Reference image 6 (unused)"
+    }
+  },
+  "15": {
+    "inputs": {
+      "image": "multi_ref_unused.png",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Reference image 7 (unused)"
+    }
+  },
+  "16": {
+    "inputs": {
+      "image": "multi_ref_unused.png",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Reference image 8 (unused)"
+    }
+  },
+  "17": {
+    "inputs": {
+      "image": "multi_ref_unused.png",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Reference image 9 (unused)"
+    }
+  },
+  "18": {
+    "inputs": {
+      "image": "multi_ref_unused.png",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Reference image 10 (unused)"
     }
   }
 }
