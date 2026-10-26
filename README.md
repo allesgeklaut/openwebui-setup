@@ -212,163 +212,61 @@ and reindex again.
 
 ### Image generation & editing (`workflows/`)
 
-Open WebUI's native ComfyUI engine drives the local ComfyUI stack
-(`/opt/stacks/comfyui`) running **Qwen-Image-2.1** for both generation and
-editing. The active config lives in Open WebUI's config DB
-(`data/webui.db`, key/value `config` table), which is gitignored — so the
-workflows are mirrored here for reproducibility:
+Open WebUI's ComfyUI engine drives the local stack (`../comfyui`) on
+**Qwen-Image-2.1-Turbo** for generation and editing, via the lifecycle proxy
+`http://${LAN_IP}:8189` (details in `../litellm/README.md`). The live config is
+the `config` table of the gitignored `data/webui.db`; the workflow files here
+are its reproducible mirror. Active in Open WebUI:
+`qwen_image_2_1_turbo_{t2i,edit}_api.json`. The base variants are the rollback
+path; the `_pe_` variants (Prompt Enhancer) belong to the ComfyUI MCP only —
+Open WebUI already rewrites prompts itself, so PE there would double-enhance.
 
-- [`workflows/qwen_image_2_1_t2i_api.json`](workflows/qwen_image_2_1_t2i_api.json) — text-to-image (plain)
-- [`workflows/qwen_image_2_1_edit_api.json`](workflows/qwen_image_2_1_edit_api.json) — image edit (plain)
-- [`workflows/qwen_image_2_1_pe_t2i_api.json`](workflows/qwen_image_2_1_pe_t2i_api.json) — text-to-image with the Prompt Enhancer
-- [`workflows/qwen_image_2_1_pe_edit_api.json`](workflows/qwen_image_2_1_pe_edit_api.json) — image edit with the Prompt Enhancer
-
-- [`workflows/qwen_image_2_1_turbo_t2i_api.json`](workflows/qwen_image_2_1_turbo_t2i_api.json) — text-to-image, Turbo UNet, 8 steps (**active in Open WebUI**)
-- [`workflows/qwen_image_2_1_turbo_edit_api.json`](workflows/qwen_image_2_1_turbo_edit_api.json) — image edit, Turbo UNet, 8 steps (**active in Open WebUI**)
-- [`workflows/qwen_image_2_1_turbo_pe_t2i_api.json`](workflows/qwen_image_2_1_turbo_pe_t2i_api.json) — text-to-image, Turbo UNet + Prompt Enhancer
-- [`workflows/qwen_image_2_1_turbo_pe_edit_api.json`](workflows/qwen_image_2_1_turbo_pe_edit_api.json) — image edit, Turbo UNet + Prompt Enhancer
-
-All use the int8 text encoder (`qwen3vl_8b_int8_convrot`). The Turbo UNet
-(`qwen_image_2.1_turbo_int8_convrot.safetensors`, from `Comfy-Org/Qwen-Image-2.1`)
-has no encoder of its own and shares the same Qwen3-VL encoder. The Turbo
-checkpoint documents **CFG 1** and an **8-step schedule baked into the model**;
-the Turbo workflows reproduce both (see below).
-A single warm A/B run (seed 7, one prompt) took ~24–28 s versus ~80 s for the base
-at 40 steps — one uncontrolled sample, not a benchmark.
-The `_pe_` workflows (base and Turbo) prepend the official Qwen-Image-2.1 Prompt
-Enhancer (Qwen3.5-VL-9B; see `../comfyui/README.md`).
-
-**Turbo sampling schedule.** The official checkpoint stores its own 8-step sigma
-schedule (`Qwen-Image-2.1-Turbo/model_index.json`, shift 1.0), and its card says
-other schedules have not been evaluated. `KSampler` cannot load that schedule, so
-the Turbo workflows use a `ManualSigmas` node carrying the checkpoint's list
-(`1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0.0`)
-into `SamplerCustom` (euler). That is the documented schedule, not ComfyUI's own
-`simple` (which applies a ~1.15 `shift`).
-
-Comfy-Org has since published official Turbo templates
-(`Comfy-Org/workflow_templates`, `image_qwen_image_2_1_turbo_{t2i,image_edit}.json`)
-using the byte-identical sigma list, euler, cfg 1, and the same int8/VAE files —
-the day-one integration here matches them. Generation keeps the native 2K pairing
-(2048×2048 latent + encode `resolution` 2048, mirrored by
-`image_generation.size`). Edits follow the official template: the sampling
-latent comes from `TextEncodeQwenImage21`'s `latent` output, which is sized to
-the input image (within the encode node's `resolution` budget — see the
-resolution note under the node maps), so the output preserves the input's
-aspect ratio; the UI size box feeds that budget through its width.
-
-**Open WebUI uses the plain Turbo workflows**
-(`qwen_image_2_1_turbo_{t2i,edit}_api.json`). It already has its own
-prompt-rewrite step (`image_generation.prompt.enable`), so adding the PE would
-double-enhance and cost an extra 70–340 s per image. The PE is opt-in
-(`enhance=True`) in the ComfyUI MCP server, which otherwise also runs Turbo. To
-switch Open WebUI to the PE anyway, point the `*.comfyui.workflow` keys at the
-`turbo_pe` files, use the PE node maps below, and consider disabling Open
-WebUI's own rewrite so the PE is the single enhancer.
-
-Both `image_generation.comfyui.base_url` and `images.edit.comfyui.base_url`
-point at `http://${LAN_IP}:8189` — the ComfyUI lifecycle proxy in the litellm
-stack, **not** ComfyUI's own `:8188`. The proxy starts the `comfyui` container
-on demand (the first image after idle costs ~8 s to start the container plus
-~40–60 s for the first model load) and stops it after 15 minutes idle, so the
-GPU is not held when nobody is making images. The `COMFYUI_BASE_URL` env default is overridden by
-the DB value. See `../litellm/README.md`. The `runpod-bridge` service is
-retained but is no longer used for image work.
-
-DB keys to restore (Admin → Settings → Images, or the `config` table directly):
+DB keys (Admin → Settings → Images, or the `config` table directly — applies
+live, no restart, reload the browser):
 
 | Key | Value |
 |---|---|
+| `image_generation.engine` / `images.edit.engine` | `comfyui` |
 | `image_generation.comfyui.workflow` | `workflows/qwen_image_2_1_turbo_t2i_api.json` |
 | `images.edit.comfyui.workflow` | `workflows/qwen_image_2_1_turbo_edit_api.json` |
 | `image_generation.model` / `images.edit.model` | `qwen_image_2.1_turbo_int8_convrot.safetensors` |
-| `image_generation.size` | `2048x2048` |
-| `images.edit.size` | `1024x1024` — its **width** is written into the encode node's `resolution` (input-image budget); request `size` overrides it per edit |
-| `image_generation.steps` | unused for Turbo — the schedule is fixed by `ManualSigmas`; left at `8` for the UI. Restore to `40` when rolling back to the base. |
-| `*.comfyui.base_url` | `http://${LAN_IP}:8189` (lifecycle proxy) |
+| `image_generation.size` | `2048x2048` (generation canvas; if changed, also change the workflow's encode `resolution`) |
+| `images.edit.size` | `1024x1024` — its **width** becomes the edit resolution budget; a request's `size` overrides it |
+| `*.comfyui.base_url` | `http://${LAN_IP}:8189` (lifecycle proxy, not `:8188`) |
 | `*.comfyui.api_key` | empty |
 
-Rollback to the base model: point the two `*.comfyui.workflow` keys at
-`qwen_image_2_1_{t2i,edit}_api.json`, set both `model` keys to
-`qwen_image_2.1_int8_convrot.safetensors`, set the two `*.size` keys back to
-`1024x1024`, and set `image_generation.steps` to `40`. Then restart Open WebUI.
+Node maps (`*.comfyui.nodes`; ids per the active Turbo workflows):
 
-Storage note when writing the `config` table directly: `*.comfyui.workflow` is
-a JSON **string** whose content is the workflow file above, whereas
-`*.comfyui.nodes` is a raw JSON **array**. Double-encoding `nodes` (or leaving
-`workflow` unquoted) still loads but fails at generation time.
+- generation: `prompt`/`negative_prompt`→4, `model`/`unet_name`→1, `width`/`height`/`n`→5, `seed`→6 (`noise_seed`)
+- edit: `image`→4 then reference slots 12..20 positionally, `prompt`→5, `model`→1, `seed`→6 (`noise_seed`), `width`→5 (`resolution`)
 
-Precedence note: Open WebUI **overrides** the workflow's UNet node with
-`image_generation.model` / `images.edit.model`, so the `unet_name` inside the
-workflow file is effectively decorative — changing it alone does nothing.
-Update the `model` key as well.
+**Multi-reference editing.** Qwen-Image-2.1 edits accept up to 10 images
+(target + references) and are reference-based generation; the chat
+`edit_image` tool passes `image_urls` lists end-to-end. Address references as
+`<image2>`..`<image10>` (`<image1>` is the target). Unfilled workflow slots
+carry the sentinel `multi_ref_unused.png`, which the lifecycle proxy strips
+from `POST /prompt` (`../litellm/comfyui_proxy/prompt_clean.py`); the ComfyUI
+MCP exposes the same via `reference_images`.
 
-Node maps (`*.comfyui.nodes`); ids refer to the active **Turbo** workflows above.
+Gotchas when writing the `config` table directly (violations fail as generic
+400s):
 
-- generation (Turbo): `prompt`→4, `negative_prompt`→4, `model`/`unet_name`→1, `width`/`height`/`n`→5, `seed`→6 (`noise_seed`)
-- edit (Turbo): `image`→4 then the reference slots 12..20 positionally, `prompt`→5, `model`/`unet_name`→1, `seed`→6 (`noise_seed`), `width`→5 with `"key": "resolution"` (the size box's width is the edit resolution budget; height is ignored)
+- `*.comfyui.workflow` is a JSON **string** (double-encoded); `*.comfyui.nodes` is a raw JSON **array**.
+- The `model` keys override the workflow's `unet_name` — update the key, not just the file.
+- The edit node map must not map `negative_prompt` or `steps` (the edit request sends neither; `None` gets written).
+- The edit `width`→`resolution` mapping needs a non-empty `images.edit.size`.
+- Turbo seeds via `SamplerCustom` (`noise_seed`); the base `KSampler` uses `seed` + `steps`.
 
-Neither maps `steps`: the Turbo schedule is fixed by `ManualSigmas`, and
-`SamplerCustom` has no `steps` input. The base workflows
-(`qwen_image_2_1_{t2i,edit}_api.json`, rollback) still use `KSampler`, where
-generation maps `steps`/`seed`→6 and edit maps `seed`→6.
+Rollback to the base model: point the two workflow keys at
+`qwen_image_2_1_{t2i,edit}_api.json`, set both models to
+`qwen_image_2.1_int8_convrot.safetensors`, `image_generation.size` to
+`1024x1024` and `image_generation.steps` to `40`.
 
-**Multi-reference editing.** Qwen-Image-2.1 edits accept up to **10 images**
-(target + 9 references) and its editing is reference-based generation — the
-model composes new scenes from reference people/products (its showcase
-includes a group photo from six portrait references). The chat `edit_image`
-tool takes `image_urls` as a **list** plus an optional `size`, and
-`/api/v1/images/edit` accepts `"image": [...]`, so this works end-to-end:
-address references in the prompt as `<image2>` .. `<image10>` (`<image1>` is
-the target). The edit workflows carry ten `LoadImage` slots; unfilled slots
-keep the sentinel `multi_ref_unused.png`, and the ComfyUI lifecycle proxy
-strips those nodes (and links to them) from every `POST /prompt` before
-ComfyUI validates it (`../litellm/comfyui_proxy/prompt_clean.py` — Open
-WebUI's applier can write filenames into nodes but can neither create nor
-remove nodes). The ComfyUI MCP `edit_image` tool exposes the same thing via
-its `reference_images` parameter.
-
-PE workflows (`prompt` goes to the rewrite node, not `TextEncodeQwenImage21`):
-
-- PE generation: `prompt`→2, `negative_prompt`→6, `model`/`unet_name`→3, `width`/`height`/`n`→7, seed→8 (`noise_seed` for the Turbo `SamplerCustom`; `seed`+`steps` for the base `KSampler`)
-- PE edit: `image`→3 then reference slots 16..24 (Turbo) / 14..22 (base), `prompt`→2, `model`/`unet_name`→4, seed→9 (same key rule as PE generation)
-
-(PE node ids: CLIPLoader PE=1, rewrite=2, then UNET=3/4, generation
-CLIPLoader, VAE, `TextEncodeQwenImage21`, `EmptyLatentImage` (t2i only),
-sampler, `VAEDecode`, `SaveImage`, `PreviewAny`, then the reference slots.
-See the JSON files.)
-
-Generation keeps `TextEncodeQwenImage21.resolution` at the workflow's baked
-2048 (native 2K pairing); the node map does not set it, so changing the
-generation size in the UI only rewrites `EmptyLatentImage` (`width`/`height`,
-node 5) — use the baked size, or change `resolution` in the workflow (and the
-DB workflow) to match. For editing, the map wires `width` into the encode
-node's `resolution` (the input-image size budget: aspect is preserved, ~1 MP
-at 1024, native 2K at 2048 — a 2048-budget edit takes ~7 min on the 16 GB
-card, so the default is 1024), with `images.edit.size` as the fallback when a
-request sends no size.
-
-Node-map gotchas — violating any of these fails image requests with a generic
-400:
-
-- The **edit** node map must **not** include `negative_prompt`: `ComfyUIEditImageForm` has no such field and the node-map applier dereferences it unconditionally.
-- The **edit** node map must **not** include `steps`: the edit request path does not send it, so mapping it writes `None` and ComfyUI rejects the prompt. (The Turbo edit workflow takes its schedule from `ManualSigmas`; the base edit workflow's own default, 40, applies.)
-- The edit map's `width` entry must use `"key": "resolution"` (the edit workflows sample from the encode node's latent, so there is no `EmptyLatentImage` canvas to size), and `images.edit.size` must stay non-empty: the applier writes `payload.width` unconditionally, so an empty size means `None` lands in `resolution` and ComfyUI rejects the prompt.
-- The Turbo workflows seed through `SamplerCustom`, whose input is named `noise_seed` — so the `seed` map entry must use `"key": "noise_seed"` (the base `KSampler` uses `"key": "seed"`).
-
-Changing the DB directly does **not** require an Open WebUI restart: since
-v0.12.4 the images router reads its config per request
-(`get_image_config()` → `Config.get_many()` queries the config table on every
-call), so changes apply immediately — the browser only needs a reload to
-refresh the settings UI.
-
-**ChatGPT subscription adapter (alternative).** Between 2026-10-18 and 2026-10-26
-Open WebUI's image engines were switched to the `chatgpt-images` shim
-(`../litellm/chatgpt_images/`). The shim is retained as an alternative: run its
-`configure_webui.py` to switch to it again. To switch back to ComfyUI, restore
-the keys per this section — or, for the exact adapter-era rows,
-`data/backups/config-image-gen-comfyui-backup-20261026.json` (secret-bearing,
-gitignored; contains the gateway key, delete once no longer needed).
+**ChatGPT adapter (alternative).** The `chatgpt-images` shim
+(`../litellm/chatgpt_images/`) can serve both engines instead; run its
+`configure_webui.py` to switch. The adapter-era rows (incl. its gateway key)
+are backed up at `data/backups/config-image-gen-comfyui-backup-20261026.json`
+(gitignored; delete once obsolete).
 
 ## Ports
 
