@@ -249,8 +249,9 @@ from `POST /prompt` (`../litellm/comfyui_proxy/prompt_clean.py`); the ComfyUI
 MCP exposes the same via `reference_images`.
 
 Gotchas when writing the `config` table directly (violations fail as generic
-400s):
+400s; non-JSON values crash every image request):
 
+- Every `config.value` is a **JSON column**: direct SQL must store JSON — plain strings need quotes (`'"comfyui"'`, not `comfyui`); raw text crashes every image request inside `get_image_config` before any traffic reaches the proxy. (Raw integers are tolerated by the ORM's SQLite JSON dialect.)
 - `*.comfyui.workflow` is a JSON **string** (double-encoded); `*.comfyui.nodes` is a raw JSON **array**.
 - The `model` keys override the workflow's `unet_name` — update the key, not just the file.
 - The edit node map must not map `negative_prompt` or `steps` (the edit request sends neither; `None` gets written).
