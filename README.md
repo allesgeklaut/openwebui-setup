@@ -318,12 +318,8 @@ Other services run internally and are not exposed.
 ├── workflows/               # ComfyUI API workflows for Open WebUI (Qwen-Image-2.1)
 │   ├── qwen_image_2_1_t2i_api.json
 │   ├── qwen_image_2_1_edit_api.json
-│   ├── qwen_image_2_1_pe_t2i_api.json   # + Prompt Enhancer
-│   ├── qwen_image_2_1_pe_edit_api.json  # + Prompt Enhancer
 │   ├── qwen_image_2_1_turbo_t2i_api.json   # Turbo UNet, 8 steps (active)
-│   ├── qwen_image_2_1_turbo_edit_api.json  # Turbo UNet, 8 steps (active)
-│   ├── qwen_image_2_1_turbo_pe_t2i_api.json   # Turbo + Prompt Enhancer
-│   └── qwen_image_2_1_turbo_pe_edit_api.json  # Turbo + Prompt Enhancer
+│   └── qwen_image_2_1_turbo_edit_api.json  # Turbo UNet, 8 steps (active)
 └── data/                    # Open WebUI data & cache (gitignored)
 ```
 
