@@ -232,7 +232,7 @@ live, no restart, reload the browser):
 | `images.edit.comfyui.workflow` | `workflows/qwen_image_2_1_turbo_edit_api.json` |
 | `image_generation.model` / `images.edit.model` | `qwen_image_2.1_turbo_int8_convrot.safetensors` |
 | `image_generation.size` | `2048x2048` (generation canvas; if changed, also change the workflow's encode `resolution`) |
-| `images.edit.size` | `1024x1024` — its **width** becomes the edit resolution budget; a request's `size` overrides it |
+| `images.edit.size` | `1536x1536` — its **width** becomes the edit resolution budget; a request's `size` overrides it |
 | `*.comfyui.base_url` | `http://<LAN_IP>:8189` (lifecycle proxy, not `:8188`) |
 | `*.comfyui.api_key` | empty |
 
@@ -240,6 +240,11 @@ Node maps (`*.comfyui.nodes`; ids per the active Turbo workflows):
 
 - generation: `prompt`/`negative_prompt`→4, `model`/`unet_name`→1, `width`/`height`/`n`→5, `seed`→6 (`noise_seed`)
 - edit: `image`→4 then reference slots 12..20 positionally, `prompt`→5, `model`→1, `seed`→6 (`noise_seed`), `width`→5 (`resolution`)
+
+For edits, `size` is a **pixel-budget control**, not an exact output canvas:
+only its width is mapped to Qwen's `resolution`; height is ignored. Use a square
+value such as `1536x1536` to request about 2.36 MP. The actual dimensions preserve
+the first reference image's aspect ratio and are rounded to multiples of 32.
 
 **Multi-reference editing.** Qwen-Image-2.1 edits accept up to 10 images
 (target + references) and are reference-based generation; the chat
@@ -251,9 +256,9 @@ along with its unused alpha-join helper from `POST /prompt`
 MCP exposes the same via `reference_images`.
 
 Each edit image's RGB and mask outputs are recombined with `JoinImageWithAlpha`
-before Qwen encoding, preserving input transparency. Editing still defaults to
-a 1024 resolution budget as a speed/memory trade-off; choose a
-higher budget explicitly for final edits that need finer detail.
+before Qwen encoding, preserving input transparency. Active Turbo editing now
+defaults to a 1536 resolution budget for finer detail, at greater latency and
+memory cost; the base rollback workflow remains at 1024.
 
 Gotchas when writing the `config` table directly (violations fail as generic
 400s; non-JSON values crash every image request):
@@ -262,13 +267,15 @@ Gotchas when writing the `config` table directly (violations fail as generic
 - `*.comfyui.workflow` is a JSON **string** (double-encoded); `*.comfyui.nodes` is a raw JSON **array**.
 - The `model` keys override the workflow's `unet_name` — update the key, not just the file.
 - The edit node map must not map `negative_prompt` or `steps` (the edit request sends neither; `None` gets written).
-- The edit `width`→`resolution` mapping needs a non-empty `images.edit.size`.
+- The edit `width`→`resolution` mapping needs a non-empty `images.edit.size`;
+  changing the template alone does not override this live/request size.
 - Turbo seeds via `SamplerCustom` (`noise_seed`); the base `KSampler` uses `seed` + `steps`.
 
 Rollback to the base model: point the two workflow keys at
 `qwen_image_2_1_{t2i,edit}_api.json`, set both models to
 `qwen_image_2.1_int8_convrot.safetensors`, `image_generation.size` to
-`1024x1024`, `image_generation.steps` to `40`, and swap both node maps to
+`1024x1024`, `image_generation.steps` to `40`, `images.edit.size` to
+`1024x1024`, and swap both node maps to
 the base variants (the ids/keys above are Turbo-specific): generation adds
 `steps`→6 and seeds via `"key": "seed"` (not `noise_seed`); edit points
 `image` at `["4", "10", ..., "18"]` and also seeds via `"key": "seed"`,

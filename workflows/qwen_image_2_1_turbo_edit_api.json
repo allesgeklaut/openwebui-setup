@@ -51,7 +51,7 @@
       ],
       "prompt": "",
       "negative_prompt": "",
-      "resolution": 1024,
+      "resolution": 1536,
       "images.image_1": [
         "21",
         0
