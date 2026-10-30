@@ -3,7 +3,7 @@
   "private": true,
   "dependencies": {
     "@modelcontextprotocol/server-filesystem": "1.0.0",
-    "mcp-searxng": "2.7.0",
+    "mcp-searxng": "2.8.1",
     "triliumnext-mcp": "0.3.17"
   }
 }
