@@ -215,6 +215,12 @@ services:
       - UWSGI_THREADS=4
     volumes:
       - /opt/stacks/webui/searxng/config:/etc/searxng
+    # On stacks-shared so other stacks reach the engine directly at
+    # http://searxng:8080 (the searxng-mcp tool server and the
+    # trade-sentinel news pipeline) instead of the published LAN port.
+    networks:
+      - default
+      - stacks-shared
     depends_on:
       - searxng-valkey
 

@@ -70,9 +70,17 @@ class PackagePinsTest(unittest.TestCase):
 
     def test_template_uses_tracked_manifests(self):
         servers = json.loads((ROOT / "template_config.json").read_text())["mcpServers"]
-        for name in ["filesystem", "trilium", "searxng"]:
+        for name in ["filesystem", "trilium"]:
             self.assertEqual(servers[name]["command"], "/bin/sh")
             self.assertEqual(servers[name]["args"][0], "/stacks/webui/mcpo/run-npx.sh")
+        # searxng moved to the shared searxng-mcp stack (/opt/stacks/
+        # mcp-searxng): supergateway serves mcp-searxng over Streamable
+        # HTTP on stacks-shared, and mcpo proxies it remotely instead of
+        # spawning a stdio copy. The version pin moved with it (that
+        # stack's Dockerfile). The explicit type matters: without it mcpo
+        # falls back to the legacy SSE client.
+        self.assertEqual(servers["searxng"]["type"], "streamable-http")
+        self.assertEqual(servers["searxng"]["url"], "http://searxng-mcp:8808/mcp")
         for name in ["trainlocks", "deep-research"]:
             self.assertEqual(servers[name]["command"], "uvx")
             self.assertEqual(

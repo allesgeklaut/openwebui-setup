@@ -79,7 +79,10 @@ starts/recreates the stack. Do not edit the generated secret config directly.
 **Available MCP servers:**
 - **filesystem**: Access to `/stacks` directory (mounted read-only)
 - **trilium**: Integration with Trilium note-taking app (requires `TRILIUM_API_KEY`)
-- **searxng**: Web search via the SearXNG service
+- **searxng**: Web search via the shared `mcp-searxng` stack — supergateway
+  serves the pinned `mcp-searxng` package over Streamable HTTP on the
+  `stacks-shared` docker network; mcpo proxies it remotely
+  (`/opt/stacks/mcp-searxng`)
 - **trainlocks**: Training log integration
 - **deep-research**: Deep web research tool fronting the "Deep Researcher"
   Mistral Studio agent (`web_search_premium`). One tool,
@@ -93,6 +96,14 @@ starts/recreates the stack. Do not edit the generated secret config directly.
 ### SearXNG (`searxng/`)
 
 Privacy-respecting metasearch engine. Configuration is in [`searxng/config/settings.yml`](searxng/config/settings.yml ).
+
+The service is attached to the external `stacks-shared` network so other
+stacks reach the engine directly at `http://searxng:8080` — the shared
+`mcp-searxng` tool server and the trade-sentinel news pipeline use it
+instead of the published LAN port. The MCP tool server that mcpo exposes
+to Open WebUI lives in `/opt/stacks/mcp-searxng` (Streamable HTTP on
+`stacks-shared`); its `mcp-searxng` version pin supersedes the one this
+repository's mcpo npm manifest used to carry.
 
 ### Audiobookshelf MCP (`audiobookshelf-mcp/`)
 
