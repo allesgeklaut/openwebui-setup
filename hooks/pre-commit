@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Pre-commit hook: run gitleaks on staged changes.
+# Exit 1 (blocking the commit) if any secret is detected.
+
+set -euo pipefail
+
+# Non-interactive environments (systemd services, hooks) may not have the
+# user's local bin on PATH; add it so user-installed gitleaks is found.
+if [ -n "${HOME:-}" ] && [ -d "$HOME/.local/bin" ]; then
+    PATH="$HOME/.local/bin:$PATH"
+fi
+
+if command -v gitleaks >/dev/null 2>&1; then
+    exec gitleaks git --pre-commit --staged --redact=80 --no-banner
+else
+    printf '%s\n' \
+        "gitleaks not installed: secrets will NOT be checked." \
+        "Install it (https://gitleaks.io) to protect this repo." >&2
+    exit 0
+fi
