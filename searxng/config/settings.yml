@@ -300,6 +300,22 @@ categories_as_tabs:
   social media:
 
 engines:
+  # --- Exa (official Exa API) — added 2026-11-01 — the backbone engine ---
+  # API-backed (api.exa.ai): no page scraping, so it cannot be rate-limit
+  # banned the way the scraping engines were (brave/google/startpage banned
+  # this host's IP under machine-paced traffic on 2026-11-01). Carries the
+  # type-D news agent's nightly research. Key: /opt/secrets/exa.key (the old
+  # webui exa-loader credential). Flip this off if the quota runs dry.
+  - name: exaapi
+    engine: exaapi
+    shortcut: exa
+    api_key: __EXA_API_KEY__
+    results_per_page: 20
+    search_type: auto
+    content_mode: highlights
+    content_max_characters: 500
+    inactive: false
+    categories: [general, news]
   - name: 360search
     engine: 360search
     shortcut: 360so
@@ -529,6 +545,7 @@ engines:
     disabled: true
 
   - name: bing
+    disabled: true
     engine: bing
     shortcut: bi
     # base_url: https://cn.bing.com  # for instances hosted in China
@@ -539,6 +556,7 @@ engines:
     # base_url: https://cn.bing.com  # for instances hosted in China
 
   - name: bing news
+    disabled: true
     engine: bing_news
     shortcut: bin
     # base_url: https://cn.bing.com  # for instances hosted in China
@@ -698,9 +716,10 @@ engines:
     engine: yep
     shortcut: yep
     categories: general
-    disabled: true
+    inactive: true  # re-disabled 2026-11-01: api.yep.com 404s in this image; engines-param-proof
 
   - name: currency
+    disabled: true
     engine: currency_convert
     shortcut: cc
 
@@ -796,6 +815,7 @@ engines:
     inactive: true
 
   - name: wikidata
+    disabled: true
     engine: wikidata
     shortcut: wd
     timeout: 3.0
@@ -807,6 +827,7 @@ engines:
   - name: duckduckgo
     engine: duckduckgo
     shortcut: ddg
+    inactive: true  # CAPTCHA/crash-banned 2026-11-01 under machine-paced traffic; engines-param-proof
 
   - name: duckduckgo images
     engine: duckduckgo_extra
@@ -825,6 +846,7 @@ engines:
     categories: [news]
     ddg_category: news
     shortcut: ddn
+    inactive: true  # same duckduckgo CAPTCHA ban; engines-param-proof
 
   - name: duckduckgo weather
     engine: duckduckgo_weather
@@ -1065,6 +1087,7 @@ engines:
   - name: google
     engine: google
     shortcut: go
+    inactive: true  # IP-banned for scraping 2026-11-01; inactive (not disabled) so the engines param cannot select it
 
   - name: google images
     engine: google_images
@@ -1073,6 +1096,7 @@ engines:
   - name: google news
     engine: google_news
     shortcut: gon
+    inactive: true  # same google scrape ban; engines-param-proof
 
   - name: google videos
     engine: google_videos
@@ -1322,6 +1346,7 @@ engines:
     inactive: true
 
   - name: lingva
+    disabled: true
     engine: lingva
     shortcut: lv
     timeout: 6.0
@@ -1797,7 +1822,7 @@ engines:
     engine: qwant
     shortcut: qw
     categories: [general, web]
-    disabled: true
+    disabled: true  # Qwant API access-denied for this IP. NOT inactive: qwant images/videos need network: qwant; selected via engines param it errors loudly.
 
   - name: qwant news
     qwant_categ: news
@@ -1805,7 +1830,7 @@ engines:
     shortcut: qwn
     categories: news
     network: qwant
-    disabled: true
+    inactive: true  # re-disabled 2026-11-01: Qwant API access-denied for this host IP; engines-param-proof
 
   - name: qwant images
     qwant_categ: images
@@ -1860,6 +1885,7 @@ engines:
     shortcut: reu
     # https://docs.searxng.org/dev/engines/online/reuters.html
     # sort_order = "relevance"
+    inactive: true  # disabled 2026-11-01: Reuters content API 401s (locked down); engines-param-proof
 
   - name: rottentomatoes
     engine: rottentomatoes
@@ -2020,12 +2046,14 @@ engines:
     shortcut: sp
     startpage_categ: web
     categories: [general, web]
+    inactive: true  # CAPTCHA-banned 2026-11-01 under machine-paced traffic; engines-param-proof
 
   - name: startpage news
     engine: startpage
     startpage_categ: news
     categories: [news, web]
     shortcut: spn
+    inactive: true  # same startpage CAPTCHA ban; engines-param-proof
 
   - name: startpage images
     engine: startpage
@@ -2188,7 +2216,7 @@ engines:
   - name: yahoo
     engine: yahoo
     shortcut: yh
-    disabled: true
+    inactive: true  # dead backend; disabled was still selectable via the engines param (2026-11-01 smoke finding)
 
   - name: yahoo news
     engine: yahoo_news
@@ -2241,6 +2269,7 @@ engines:
       wikidata_id: Q367
 
   - name: wikinews
+    disabled: true
     engine: mediawiki
     shortcut: wn
     categories: [news, wikimedia]
@@ -2362,10 +2391,12 @@ engines:
     inactive: true
 
   - name: dictzone
+    disabled: true
     engine: dictzone
     shortcut: dc
 
   - name: mymemory translated
+    disabled: true
     engine: translated
     shortcut: tl
     timeout: 5.0
@@ -2418,6 +2449,7 @@ engines:
     inactive: true
 
   - name: mojeek
+    disabled: true
     shortcut: mjk
     engine: mojeek
     categories: [general, web]
@@ -2682,6 +2714,7 @@ engines:
     paging: true
     categories: [general, web]
     brave_category: search
+    disabled: true  # 429 rate-limit-banned 2026-11-01. NOT inactive: brave.images/videos need network: brave; selected via engines param it 429s loudly.
     # brave_spellcheck: true
 
   - name: brave.images
@@ -2704,6 +2737,7 @@ engines:
     shortcut: brnews
     categories: news
     brave_category: news
+    inactive: true  # same brave 429 ban; engines-param-proof
 
   # - name: brave.goggles
   #   engine: brave

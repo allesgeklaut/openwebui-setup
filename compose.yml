@@ -206,6 +206,17 @@ services:
     image: searxng/searxng:latest
     container_name: searxng
     restart: unless-stopped
+    # Run as the host user (johannes): the image entrypoint force-chowns
+    # /etc/searxng to its internal uid 977 on every root startup, which
+    # kept reverting the config dir's ownership. As uid 1000 the entrypoint
+    # skips the chown (benign ownership warning) and the config dir stays
+    # johannes-owned and normally editable.
+    user: "1000:1000"
+    # The repo's settings.yml carries only the __EXA_API_KEY__ placeholder;
+    # entrypoint-wrapper.sh injects the real key from the mounted secret
+    # into a container-local copy at startup — the key never lives
+    # anywhere but /opt/secrets (litellm/mistral.env pattern).
+    entrypoint: ["/bin/sh", "/etc/searxng/entrypoint-wrapper.sh"]
     ports:
       - "8081:8080"
     environment:
@@ -215,6 +226,13 @@ services:
       - UWSGI_THREADS=4
     volumes:
       - /opt/stacks/webui/searxng/config:/etc/searxng
+      # Single source of truth for the Exa key — read-only, consumed by
+      # the entrypoint wrapper, never written anywhere.
+      - /opt/secrets/exa.key:/run/secrets/exa.key:ro
+      # Named (not the image's anonymous volume) so the one-time chown
+      # survives container recreates; chowned to 1000 via a one-off root
+      # container after creation.
+      - searxng-cache:/var/cache/searxng
     # On stacks-shared so other stacks reach the engine directly at
     # http://searxng:8080 (the searxng-mcp tool server and the
     # trade-sentinel news pipeline) instead of the published LAN port.
@@ -286,3 +304,4 @@ networks:
 
 volumes:
   searxng-valkey-data:
+  searxng-cache:
