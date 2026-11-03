@@ -1,6 +1,6 @@
 services:
   open-webui:
-    image: ghcr.io/open-webui/open-webui:v0.12.5
+    image: ghcr.io/open-webui/open-webui:v0.13.0
     container_name: open-webui
     restart: unless-stopped
     ports:
@@ -163,7 +163,7 @@ services:
   # that removed it, plus restoring the audio.tts.* config rows (README).
 
   open-terminal:
-    image: ghcr.io/open-webui/open-terminal:0.14.2
+    image: ghcr.io/open-webui/open-terminal:0.16.0
     container_name: open-terminal
     restart: unless-stopped
     env_file:
