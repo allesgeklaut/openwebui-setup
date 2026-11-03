@@ -306,11 +306,19 @@ engines:
   # this host's IP under machine-paced traffic on 2026-11-01). Carries the
   # type-D news agent's nightly research. Key: /opt/secrets/exa.key (the old
   # webui exa-loader credential). Flip this off if the quota runs dry.
+  # results_per_page 20 -> 10 on 2026-11-03: Exa's auto-search base price
+  # ($7/1k requests) already INCLUDES up to 10 results with contents —
+  # every result above 10 bills $1/1k extra. At 20 the type-D nightly paid
+  # ~$0.017/search (97 searches ≈ $2 on 2026-11-02); at 10 it pays the
+  # bare base ($0.007, ~59% less). Going below 10 saves nothing (the base
+  # covers up to 10). Shared instance: every exa consumer gets cheaper
+  # searches; the D agent's model-side num_results truncations already
+  # showed the 11-20 tail was mostly discarded unread.
   - name: exaapi
     engine: exaapi
     shortcut: exa
     api_key: __EXA_API_KEY__
-    results_per_page: 20
+    results_per_page: 10
     search_type: auto
     content_mode: highlights
     content_max_characters: 500
