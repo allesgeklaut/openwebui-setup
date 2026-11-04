@@ -30,6 +30,20 @@ FEED_URL = "https://feeds.example/show.xml"
 BACKEND_SECRET = "backend-secret-body"
 FEED_ID_RE = re.compile(r"\Afeed_[0-9a-f]{64}\Z")
 
+
+@pytest.mark.parametrize(
+    ("timestamp", "expected"),
+    [
+        (0, "Thu, 01 Jan 1970 00:00:00 GMT"),
+        (1578459600000, "Wed, 08 Jan 2020 05:00:00 GMT"),
+        (None, None),
+        (10**30, None),
+        (10**1000, None),
+    ],
+)
+def test_rss_timestamp(timestamp: int | None, expected: str | None) -> None:
+    assert podcasts._rss_timestamp(timestamp) == expected
+
 RouteValue = dict[str, Any] | list[Any] | httpx.Response | Callable[[httpx.Request], httpx.Response]
 Routes = dict[tuple[str, str], RouteValue]
 
@@ -203,6 +217,20 @@ def _feed_episode(
         "enclosure": {"url": url, "type": "audio/mpeg", "length": "12345"},
         "description": "private feed description",
     }
+
+
+def test_feed_candidates_skip_unrepresentable_publication_dates() -> None:
+    candidates = podcasts._feed_candidates(
+        {"episodes": [
+            _feed_episode("valid", "https://cdn.example/valid.mp3", 1578459600000),
+            _feed_episode("overflow", "https://cdn.example/overflow.mp3", 10**30),
+        ]}
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["guid"] == "valid"
+    assert candidates[0]["published"] == 1578459600000
+    assert candidates[0]["pub_date"] == "Wed, 08 Jan 2020 05:00:00 GMT"
 
 
 def _feed(*episodes: dict[str, Any], title: str = "Feed Show") -> dict[str, Any]:
@@ -623,9 +651,11 @@ async def test_download_selects_newest_and_skips_known_episodes(
     post = _posts(requests, "/api/podcasts/pod1/download-episodes")[0]
     typed = json.loads(post.content)
     assert [episode["guid"] for episode in typed] == ["g5", "g4"]
-    assert set(typed[0]) == {"title", "guid", "publishedAt", "enclosure"}
+    assert set(typed[0]) == {"title", "guid", "publishedAt", "pubDate", "enclosure"}
     assert set(typed[0]["enclosure"]) == {"url", "type", "length"}
     assert typed[0]["publishedAt"] == 6000
+    assert typed[0]["pubDate"] == "Thu, 01 Jan 1970 00:00:06 GMT"
+    assert typed[1]["pubDate"] == "Thu, 01 Jan 1970 00:00:05 GMT"
     assert not any("checknew" in path or "clear-queue" in path for _, path in _method_paths(requests))
 
 
@@ -3285,7 +3315,8 @@ async def test_selected_download_arbitrary_entries_in_caller_order(
     ]
     assert sent[0]["guid"] == "g2"
     assert sent[0]["publishedAt"] == 2000
-    assert set(sent[0]) == {"title", "guid", "publishedAt", "enclosure"}
+    assert set(sent[0]) == {"title", "guid", "publishedAt", "pubDate", "enclosure"}
+    assert sent[0]["pubDate"] == "Thu, 01 Jan 1970 00:00:02 GMT"
     assert set(sent[0]["enclosure"]) == {"url", "type", "length"}
 
     item_reads = [

@@ -186,6 +186,11 @@ Because a later call fetches the feed again, a feed update can change totals,
 ordering, or IDs between pages; do not treat consecutive pages as a consistent
 snapshot.
 
+Download requests include both the numeric `publishedAt` timestamp and an
+equivalent RSS-style UTC `pubDate` string. Audiobookshelf stores these fields
+independently; providing both keeps episode dates visible in clients such as
+Plappa. Dates outside the supported datetime range are excluded as invalid.
+
 Each available episode is reported with `id`, `title`, `published_at`,
 `downloaded`, and `queued`. `downloaded` and `queued` are current-feed flags;
 neither proves that an asynchronous download has finished. When exactly one

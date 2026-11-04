@@ -96,6 +96,7 @@ import math
 import re
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from email.utils import format_datetime
 from typing import Any
 from urllib.parse import unquote, urlsplit, urlunsplit
 from uuid import uuid4
@@ -1452,6 +1453,9 @@ class PodcastClient(ABSClient):
                     "title": candidate["title"],
                     "guid": candidate["guid"],
                     "publishedAt": candidate["published"],
+                    # ABS stores these independently; clients such as Plappa
+                    # also need the RSS-style string, not just the timestamp.
+                    "pubDate": candidate["pub_date"],
                     "enclosure": {
                         "url": enclosure_url,
                         "type": candidate["type"],
@@ -2369,7 +2373,8 @@ def _feed_candidates(podcast: Mapping[str, Any]) -> list[dict[str, Any]]:
         url = enclosure.get("url") if isinstance(enclosure, dict) else None
         title = _sanitize_text(raw.get("title"), MAX_EPISODE_TITLE_LENGTH)
         published = _epoch_ms(raw.get("publishedAt"))
-        if not title or not isinstance(url, str) or not url.strip() or published is None:
+        pub_date = _rss_timestamp(published)
+        if not title or not isinstance(url, str) or not url.strip() or pub_date is None:
             # Feed entries without a playable enclosure or valid date cannot be
             # ordered or downloaded safely; they are not silently guessed.
             continue
@@ -2401,6 +2406,7 @@ def _feed_candidates(podcast: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "title": title,
                 "guid": normalized_guid,
                 "published": published,
+                "pub_date": pub_date,
                 "url": url.strip(),
                 "type": enclosure_type,
                 "length": enclosure_length,
@@ -2505,6 +2511,18 @@ def _epoch_ms(value: object) -> int | None:
     except (OverflowError, ValueError):
         return None
     return int(value)
+
+
+def _rss_timestamp(value: int | None) -> str | None:
+    """Encode the validated publication time for ABS's separate pubDate field."""
+    if value is None:
+        return None
+    try:
+        return format_datetime(
+            datetime.fromtimestamp(value / 1000, tz=timezone.utc), usegmt=True
+        )
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _iso_timestamp(value: int | None) -> str | None:
