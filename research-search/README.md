@@ -124,17 +124,20 @@ win over env on existing installs):
 | `web.loader.external_web_loader_url` | `http://research-search:8080/fetch` |
 | `web.loader.external_web_loader_api_key` | token in `/opt/secrets/research-search.token` |
 
-Full RAG search flow — **applies only when Open WebUI runs the forced
-pipeline** (models without native function calling, or
+Full RAG search flow — the `bypass_*` rows **apply only when Open WebUI
+runs the forced pipeline** (models without native function calling, or
 `function_calling=legacy`; in the default native-FC mode the chat model
-instead orchestrates `search_web` + `fetch_url` itself, and these
-`web.search.*` rows are dormant):
+instead orchestrates `search_web` + `fetch_url` itself).
+`web.search.result_count` applies in **both** modes (v0.13.0): the builtin
+`search_web` tool caps its returned SERP entries at it in native-FC mode,
+and the forced pipeline both requests that many results and fetches that
+many result pages via the loader:
 
 | Key | Value |
 |---|---|
 | `web.search.bypass_web_loader` | `false` — result pages are fetched via the loader (Mistral agent opens) |
 | `web.search.bypass_embedding_and_retrieval` | `false` — fetched pages are chunked + embedded, relevant chunks retrieved |
-| `web.search.result_count` | `5` |
+| `web.search.result_count` | `10` — raised from 5 on 2026-11-04; free in native-FC mode (the scout conversation is count-independent, only the harvest truncation moves), doubles forced-pipeline page fetches |
 | `rag.embedding_engine` / `rag.embedding_model` | `openai` (LiteLLM `http://…:4000/v1`) / `mistral-embed` |
 
 `rag.top_k`, `rag.chunk_size` and `rag.embedding_batch_size` are general RAG

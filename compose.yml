@@ -109,8 +109,10 @@ services:
       - RESEARCH_TOKEN_FILE=/run/secrets/research-search.token
       - SCOUT_AGENT_ID=${SCOUT_AGENT_ID}
       - PORT=8080
-      # All result pages fetch in one parallel round (each is a scout
-      # conversation); matches web.search.result_count=5 in OpenWebUI.
+      # Each result page fetch is one scout conversation. 8-wide: with
+      # web.search.result_count=10 in OpenWebUI, the forced pipeline's 10
+      # pages fetch as one 8-wide round + a short 2-fetch tail (native-FC
+      # fetch_url calls are single-URL, unaffected by this).
       - FETCH_WORKERS=8
     volumes:
       - /opt/secrets/mistral.env:/run/secrets/mistral.env:ro
