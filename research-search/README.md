@@ -138,6 +138,8 @@ many result pages via the loader:
 | `web.search.bypass_web_loader` | `false` — result pages are fetched via the loader (Mistral agent opens) |
 | `web.search.bypass_embedding_and_retrieval` | `false` — fetched pages are chunked + embedded, relevant chunks retrieved |
 | `web.search.result_count` | `10` — raised from 5 on 2026-11-04; free in native-FC mode (the scout conversation is count-independent, only the harvest truncation moves), doubles forced-pipeline page fetches |
+| `web.search.concurrent_requests` | `5` — per-search semaphore over the forced pipeline's parallel query searches (each query = one scout conversation); the cap doesn't change cost, only the burst against Mistral. Rarely binds: query generation emits 1–3 queries |
+| `web.loader.concurrent_requests` | `5` — **dead knob with the `external` loader**: v0.13.0's `ExternalWebLoader` accepts `requests_per_second` in `**kwargs` and never uses it. Real fetch parallelism is this service's `FETCH_WORKERS` (per ≤20-URL batch; batches sequential) |
 | `rag.embedding_engine` / `rag.embedding_model` | `openai` (LiteLLM `http://…:4000/v1`) / `mistral-embed` |
 
 `rag.top_k`, `rag.chunk_size` and `rag.embedding_batch_size` are general RAG
