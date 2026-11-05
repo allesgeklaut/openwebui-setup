@@ -1,5 +1,6 @@
 """Run synthetic tests against the installed OWUI runtime without activating code."""
 
+import argparse
 import json
 from pathlib import Path
 import subprocess
@@ -19,6 +20,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 payload = json.load(sys.stdin)
+installed = payload.pop('_installed', False)
 original_stdout = sys.stdout
 captured = io.StringIO()
 try:
@@ -28,11 +30,17 @@ try:
         with tempfile.TemporaryDirectory(prefix='chat-images-', dir=root) as folder:
             folder = Path(folder)
             for relative, text in payload.items():
+                if installed and relative == 'chat_image_retrieval/__init__.py':
+                    continue
                 path = folder / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(text)
             sys.path.insert(0, str(folder))
             import chat_image_retrieval as extension
+            if installed:
+                assert Path(extension.__file__).resolve() == Path(
+                    '/app/backend/extensions/chat_image_retrieval/__init__.py')
+                assert not Path('/app/backend/chat_image_retrieval').exists(), 'Old package mount remains'
             import test_chat_images as fixtures
             suite = unittest.defaultTestLoader.loadTestsFromModule(fixtures)
             tests = unittest.TextTestRunner(stream=captured).run(suite)
@@ -40,17 +48,34 @@ try:
                 raise AssertionError('Unit tests failed in container')
 
             from open_webui.utils import middleware
-            from open_webui.utils.plugin import load_function_module_by_id, load_tool_module_by_id
+            from open_webui.utils.plugin import (
+                extract_frontmatter, load_function_module_by_id, load_tool_module_by_id)
             from open_webui.utils.tools import get_tool_specs
             from open_webui.models.chats import Chats
             from open_webui.models.files import Files
 
             async def smoke():
+                filter_code, tool_code = payload['filter.py'], payload['tool.py']
+                if installed:
+                    from open_webui.models.functions import Functions
+                    from open_webui.models.tools import Tools
+                    registered_filter = await Functions.get_function_by_id('chat_image_retrieval_filter')
+                    registered_tool = await Tools.get_tool_by_id('chat_image_retrieval')
+                    assert registered_filter and registered_filter.is_active
+                    assert registered_tool
+                    assert registered_filter.content == filter_code, 'Registered filter differs from repo'
+                    assert registered_tool.content == tool_code, 'Registered tool differs from repo'
+                    assert registered_filter.meta.manifest == extract_frontmatter(filter_code)
+                    assert registered_tool.meta.manifest == extract_frontmatter(tool_code)
+                    filter_code, tool_code = registered_filter.content, registered_tool.content
                 function, kind, _, _ = await load_function_module_by_id(
-                    'chat_images_synthetic_test', content=payload['filter.py'])
+                    'chat_images_synthetic_test', content=filter_code)
                 tool, _, _ = await load_tool_module_by_id(
-                    'chat_images_synthetic_test', content=payload['tool.py'])
+                    'chat_images_synthetic_test', content=tool_code)
                 assert kind == 'filter' and hasattr(function, 'request')
+                assert type(function) is extension.Filter and type(tool) is extension.Tools
+                assert function.valves.gif_first_frame_models == 'mistral'
+                assert function.Valves.model_json_schema()['properties']['gif_first_frame_models']['default'] == 'mistral'
                 specs = get_tool_specs(tool)
                 assert len(specs) == 1 and specs[0]['name'] == 'retrieve_chat_image'
                 assert specs[0]['parameters']['required'] == ['image_ref']
@@ -80,6 +105,32 @@ try:
                     else:
                         raise AssertionError('Non-owned file accepted')
                     lookup.assert_awaited_once_with('file-test', 'owner')
+
+                # Native URL resolution runs before inlet: saved chat metadata
+                # keeps the URL while provider content contains base64 bytes.
+                from open_webui import config
+                gif_url = '/api/v1/files/synthetic-gif/content'
+                gif_path = folder / 'synthetic.gif'
+                gif_path.write_bytes(fixtures.gif())
+                gif_record = SimpleNamespace(id='synthetic-gif', user_id='owner',
+                                             path=str(gif_path), meta={'content_type': 'image/gif'})
+                gif_body = {'model': 'deepseek-v4.1-flash-mistral', 'messages': [
+                    {'role': 'user', 'content': [fixtures.part(gif_url)],
+                     'files': [{'type': 'image', 'url': gif_url}]}]}
+                with patch.object(Files, 'get_file_by_id', AsyncMock(return_value=gif_record)):
+                    resolved = await middleware.convert_url_images_to_base64(
+                        gif_body, user=SimpleNamespace(id='owner', role='user'))
+                assert resolved['messages'][0]['content'][0]['image_url']['url'].startswith('data:')
+                with patch.object(config, 'UPLOAD_DIR', folder), \
+                     patch.object(Files, 'get_file_by_id_and_user_id', AsyncMock(return_value=gif_record)), \
+                     patch.object(extension, 'owned_context', AsyncMock(return_value=({}, [gif_url]))), \
+                     patch.object(extension, 'response_images', AsyncMock(return_value={})):
+                    gif_req = fixtures.request()
+                    framed = await function.inlet(resolved, fixtures.USER, fixtures.META, gif_req)
+                    frame = framed['messages'][0]['content'][0]['image_url']['url']
+                    assert frame.startswith('data:image/jpeg;base64,')
+                    assert framed['messages'][0]['files'][0]['url'] == frame
+                    assert await function.request(resolved, fixtures.USER, fixtures.META, gif_req) == framed
 
                 req = fixtures.request()
                 meta = {**fixtures.META, 'chat_id': '00000000-0000-4000-8000-000000000001'}
@@ -169,6 +220,8 @@ try:
                       'ownership_adapters': 'pass', 'tool_image_roundtrip': 'pass',
                       'next_request_pruning': 'pass', 'provider_calls': 0,
                       'native_image_generation_output': 'pass',
+                      'native_gif_upload_roundtrip': 'pass',
+                      'installed_entries': 'pass' if installed else 'not_checked',
                       'registered_extensions': 0}
     original_stdout.write(json.dumps(result) + '\n')
 except Exception as exc:
@@ -181,11 +234,18 @@ except Exception as exc:
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--installed', action='store_true',
+                        help='Verify the mounted package and read registered filter/tool code; no DB writes.')
+    args = parser.parse_args()
     root = Path(__file__).resolve().parent
     files = {
         relative: (root / relative).read_text()
-        for relative in ["chat_image_retrieval/__init__.py", "filter.py", "tool.py", "test_chat_images.py"]
+        for relative in ["filter.py", "tool.py", "test_chat_images.py"]
     }
+    files['chat_image_retrieval/__init__.py'] = (
+        root.parent / 'chat_image_retrieval' / '__init__.py').read_text()
+    files['_installed'] = args.installed
     result = subprocess.run(
         ["docker", "exec", "-i", "-w", "/app/backend", "open-webui", "python", "-c", RUNTIME],
         input=json.dumps(files), text=True, capture_output=True, timeout=120,

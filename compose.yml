@@ -61,10 +61,12 @@ services:
       # as OPENAI_API_KEY (open-webui has no _FILE support). Mounted below.
       - APP_KEY_FILE=/run/secrets/litellm.key
       - APP_KEY_ENV=OPENAI_API_KEY
+      # One import root for all repo-managed extension packages.
+      - PYTHONPATH=/app/backend/extensions:/app/backend
     volumes:
       - /opt/stacks/webui/data:/app/backend/data
-      # Repo-managed native Filter + Tool; registration/activation is explicit.
-      - ./openwebui-extensions/chat-images/chat_image_retrieval:/app/backend/chat_image_retrieval:ro
+      # Mount trusted extensions read-only; registration/activation stays explicit.
+      - ./openwebui-extensions:/app/backend/extensions:ro
       # Single source of truth for the LiteLLM API key — /opt/secrets/litellm.key.
       # Injected as OPENAI_API_KEY by the shared entrypoint wrapper, so the key
       # is not duplicated into any env file.

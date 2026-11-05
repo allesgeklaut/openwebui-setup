@@ -9,20 +9,22 @@ these files and their registration.
 
 - Keep images from the latest **saved user message containing images**, including
   on text-only follow-ups. Up to eight images in that set, 10 MiB per source.
-  Current-message uploads referenced by file URL (Open WebUI 0.13's native
-  format) or embedded base64 both survive; their `files` metadata is preserved
-  too, so photo uploads and image editing inputs keep working.
+  Latest-set uploads referenced by file URL or resolved embedded base64 both
+  survive; their `files` metadata is preserved too, so photo uploads and image
+  editing inputs keep working.
 - Omit earlier image content parts and historical tool-result images, leaving
   text intact. The database and original attachments are never modified.
-- **Animated-GIF first-frame extraction (v0.2.0):** Mistral rejects animated GIFs
-  with an HTTP 400 before the model runs. For models whose ID matches the
+- **Animated-GIF first-frame extraction:** tested Mistral-routed models reject
+  animated GIFs with HTTP 400. For models whose ID matches the
   `gif_first_frame_models` valve (default `mistral`, comma-separated
   case-insensitive substrings; empty disables the feature), the filter replaces
-  the current message's animated-GIF references with a rendered first-frame
-  JPEG in content parts and `files` entries. The substitution persists across
-  tool rounds. Unmatched occurrences fail safe: they are pruned instead of
+  latest saved image set's animated-GIF references with a rendered first-frame
+  JPEG in content parts and `files` entries, matching both upload URLs and
+  resolved bytes. The substitution persists across tool rounds. Unmatched
+  occurrences fail safe: they are pruned instead of
   sending a payload the provider would reject. Out-of-scope models are not
-  modified. Retrieval of an older GIF also returns the first frame.
+  converted by this feature. Retrieval of an older GIF always returns the first
+  frame, regardless of model. New current-response tool images remain unchanged.
 - Include a bounded manifest (last 100 references) with message/image positions.
   Untrusted filenames, captions and URLs are not copied into the system manifest.
 - `retrieve_chat_image(image_ref)` requires explicit browser confirmation before
@@ -92,7 +94,9 @@ historical image-loading cost. It never fetches arbitrary URLs itself.
    ```sh
    docker compose up -d --no-deps open-webui
    ```
-   The package must be importable as `chat_image_retrieval` inside `/app/backend`.
+   The whole `openwebui-extensions/` directory is mounted read-only at
+   `/app/backend/extensions`, which is on `PYTHONPATH`. Runtime packages live
+   directly under that root; `chat_image_retrieval` is shared by both entries.
    Do not install third-party requirements: Pillow is already in this image.
 3. As an administrator, create a **Filter Function** using the contents of
    `filter.py`, and a **Workspace Tool** using `tool.py`. Keep both private.
@@ -103,20 +107,31 @@ historical image-loading cost. It never fetches arbitrary URLs itself.
 5. Perform the acceptance checks below before enabling it elsewhere. Disable the
    filter and deselect the tool together to revert to ordinary image handling.
 
-The two small entry files import the common repo-mounted package; they are not
-standalone implementations. Since v0.2.0 the entry files reload the package
-in place (`importlib.reload`) whenever Open WebUI reloads the function/tool
-module, so updating the common package deploys by saving either entry file
-(for example a version bump) in the admin UI — no backend restart needed.
-Registration is explicit; merely editing this repo or adding the mount does not
-activate anything in Open WebUI.
+The two small entry files contain frontmatter and a plain import of the shared
+package. They are native registration adapters, not standalone implementations.
+There is no hot reload, module-cache manipulation, or upstream Open WebUI patch.
+
+- **Package-only updates:** update the repo and run
+  `docker compose restart open-webui` to start a fresh Python process.
+- **Compose mount/environment changes:** run
+  `docker compose up -d --no-deps --force-recreate open-webui`; a plain restart
+  does not apply Compose changes.
+- **Entry changes:** explicitly update the two registered contents from
+  `filter.py` / `tool.py` and restart. This is only needed when those entries
+  actually change (imports, registration metadata or the native interface), not
+  for every package update.
+
+Registration stays explicit; mounting a package does not activate it. Back up
+both the repository and Open WebUI data. A database-only export omits the
+implementation. Keep the extension code present on the deployed branch; do not
+switch to a branch that lacks it while these registrations are active.
 
 ## Tests
 
 From the repository root, with Python 3.12+ and Pillow:
 
 ```sh
-python3 -m unittest discover -s openwebui-extensions/chat-images -p 'test_*.py' -v
+PYTHONPATH=openwebui-extensions python3 -m unittest discover -s openwebui-extensions/chat-images -p 'test_*.py' -v
 docker compose config --quiet
 ```
 
@@ -125,6 +140,14 @@ For a synthetic integration smoke test in the running Open WebUI container
 
 ```sh
 python3 openwebui-extensions/chat-images/container_smoke.py
+```
+
+After deployment, verify the **actual mounted package** and read the two
+registered entries for exact agreement with the repo (no database writes or
+provider calls; all chat/file adapters still use synthetic fixtures):
+
+```sh
+python3 openwebui-extensions/chat-images/container_smoke.py --installed
 ```
 
 ### Acceptance checks before wider rollout

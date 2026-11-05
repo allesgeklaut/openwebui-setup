@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import base64
 import copy
 import io
@@ -162,7 +163,7 @@ class PolicyTests(unittest.TestCase):
                          [{"type": "file", "id": "doc"}])
 
     def test_current_file_url_upload_survives_pruning(self):
-        # OWUI 0.13 references the current photo by file URL, not embedded bytes.
+        # URL-form input must survive just like resolved embedded bytes.
         allowed = {extension.fingerprint(FILE_URL), extension.raw_fingerprint(png())}
         body = {"messages": [{"role": "user", "content": [
             {"type": "text", "text": "What is this?"}, part(FILE_URL)],
@@ -214,6 +215,23 @@ class PolicyTests(unittest.TestCase):
         with Image.open(io.BytesIO(extension.decode_image_url(rendered))) as image:
             self.assertEqual(image.format, "JPEG")
             self.assertEqual(image.size, (8, 8))
+            red, green, blue = image.getpixel((0, 0))
+            self.assertGreater(red, 200)
+            self.assertLess(max(green, blue), 40)
+
+    def test_entry_files_are_static_imports_of_the_shared_package(self):
+        for name, exported in [("filter.py", "Filter"), ("tool.py", "Tools")]:
+            with self.subTest(name=name):
+                code = (Path(__file__).parent / name).read_text()
+                tree = ast.parse(code)
+                self.assertEqual(len(tree.body), 2)  # Frontmatter + one import.
+                entry = tree.body[1]
+                self.assertIsInstance(entry, ast.ImportFrom)
+                self.assertEqual(entry.module, "chat_image_retrieval")
+                self.assertEqual([alias.name for alias in entry.names], [exported])
+                namespace = {}
+                exec(compile(tree, name, "exec"), namespace)
+                self.assertIs(namespace[exported], getattr(extension, exported))
 
     def test_invalid_sources_rejected(self):
         for url in ["file:///etc/passwd", "https://example.org/photo.png",
@@ -469,8 +487,8 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             await self.filter.inlet({"messages": []}, USER, META, self.req)
 
     async def test_current_photo_upload_survives_inlet(self):
-        # The regression that broke real uploads: latest image referenced by
-        # file URL, content parts and files entries also use the file URL.
+        # Saved metadata and some filter inputs use upload URLs. Keep both
+        # the image content part and its matching files entry.
         self.context_mock.return_value = ({}, [FILE_URL])
         with patch.object(extension, "load_source", AsyncMock(return_value=png())) as load:
             body = {"model": "mistral.mistral-large-4", "messages": [
@@ -506,6 +524,39 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             {"role": "user", "content": [part(ANIMATED_GIF)]}]}
         result = await self.filter.inlet(body, USER, META, self.req)
         self.assertEqual(result["messages"][0]["content"], [part(ANIMATED_GIF)])
+
+    async def test_file_url_gif_resolved_to_base64_is_substituted_across_rounds(self):
+        self.context_mock.return_value = ({}, [FILE_URL])
+        # Saved metadata keeps the upload URL; OWUI has already resolved the
+        # provider content to base64. MIME aliases must not change identity.
+        resolved = ANIMATED_GIF.replace("image/gif", "image/png")
+        body = {"model": "deepseek-v4.1-flash-mistral", "messages": [
+            {"role": "user", "content": [part(resolved)],
+             "files": [{"type": "image", "url": FILE_URL}]}]}
+        before = copy.deepcopy(body)
+        with patch.object(extension, "load_source", AsyncMock(return_value=gif())):
+            result = await self.filter.inlet(body, USER, META, self.req)
+        rendered = result["messages"][0]["content"][0]["image_url"]["url"]
+        self.assertTrue(rendered.startswith("data:image/jpeg;base64,"))
+        self.assertEqual(result["messages"][0]["files"][0]["url"], rendered)
+        self.assertEqual(body, before)
+        self.assertEqual(await self.filter.request(body, USER, META, self.req), result)
+        self.assertEqual(await self.filter.request(result, USER, META, self.req), result)
+
+    async def test_first_frame_valve_can_be_disabled(self):
+        self.filter.valves.gif_first_frame_models = ""
+        self.context_mock.return_value = ({}, [ANIMATED_GIF])
+        body = {"model": "mistral-large-4", "messages": [
+            {"role": "user", "content": [part(ANIMATED_GIF)]}]}
+        self.assertEqual(await self.filter.inlet(body, USER, META, self.req), body)
+
+    async def test_current_tool_gif_is_unchanged_even_if_it_matches_upload(self):
+        self.context_mock.return_value = ({}, [ANIMATED_GIF])
+        await self.filter.inlet({"model": "mistral-large-4", "messages": []}, USER, META, self.req)
+        self.response_mock.return_value = {"call:generate": (ANIMATED_GIF,)}
+        body = {"messages": [{"role": "user", "content": [part(ANIMATED_GIF)],
+                              "files": [{"type": "image", "url": ANIMATED_GIF}]}]}
+        self.assertEqual(await self.filter.request(body, USER, META, self.req), body)
 
     async def test_static_gif_not_substituted(self):
         self.context_mock.return_value = ({}, [STATIC_GIF])

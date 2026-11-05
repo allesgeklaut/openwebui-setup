@@ -68,6 +68,11 @@ only after explicit approval. It is **not activated automatically**. See its
 installation guide, limits, security tests, and scoped rollout checklist before
 enabling it on a model.
 
+The whole [extensions directory](openwebui-extensions/README.md) is mounted
+read-only at `/app/backend/extensions` and added to Python's import path.
+Package updates require a backend restart; mount/environment changes require
+container recreation. Extensions still need explicit native registration.
+
 ### MCP Servers (`mcpo/`)
 
 The `mcpo` service connects to various Model Context Protocol servers. The configuration is generated from [`mcpo/template_config.json`](mcpo/template_config.json ) using your environment variables.

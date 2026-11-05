@@ -196,15 +196,16 @@ def prune_messages(body, approved=(), current=(), substitutions=None):
         if processed_parts > MAX_HISTORY_IMAGE_PARTS:
             raise ValueError("Image history exceeds the 2048 image-part processing limit.")
         url = image_url(item)
-        if url in substitutions:
+        digest = identity(url)
+        if digest is not None and digest in current:
+            return True
+        target = substitutions.get(url, substitutions.get(digest))
+        if target is not None:
             # The substituted frame is pre-approved; keep the newest occurrence.
-            digest = identity(substitutions[url])
+            digest = identity(target)
             if digest in seen_images:
                 return False
             seen_images.add(digest)
-            return True
-        digest = identity(url)
-        if digest is not None and digest in current:
             return True
         if digest is None or digest not in approved:
             return False
@@ -214,7 +215,10 @@ def prune_messages(body, approved=(), current=(), substitutions=None):
         return True
 
     def substitute(item):
-        target = substitutions.get(image_url(item))
+        url = image_url(item)
+        if identity(url) in current:
+            return item
+        target = substitutions.get(url, substitutions.get(identity(url)))
         if target is None:
             return item
         item = copy.deepcopy(item)
@@ -263,7 +267,12 @@ def prune_messages(body, approved=(), current=(), substitutions=None):
                     kept_files.append(item)
                     continue
                 url = item.get("url")
-                target = substitutions.get(url) if isinstance(url, str) else None
+                source_digest = identity(url)
+                if source_digest is not None and source_digest in current:
+                    kept_files.append(item)
+                    continue
+                target = (substitutions.get(url, substitutions.get(identity(url)))
+                          if isinstance(url, str) else None)
                 digest = identity(target if target is not None else url)
                 if digest is not None and (digest in current or digest in approved):
                     if target is not None:
@@ -498,6 +507,9 @@ class Filter:
                 if extract_gifs and await asyncio.to_thread(is_animated_gif, raw):
                     rendered = await asyncio.to_thread(render_image, raw)
                     substitutions[url] = rendered
+                    # OWUI may have resolved this upload URL to embedded bytes
+                    # before the filter runs. Match either representation.
+                    substitutions[await asyncio.to_thread(raw_fingerprint, raw)] = rendered
                     # Only the rendered frame is approved; an un-substituted
                     # occurrence fails safe by being pruned, not sent as GIF.
                     allowed.add(await asyncio.to_thread(fingerprint, rendered))
