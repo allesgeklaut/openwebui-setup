@@ -9,15 +9,27 @@ these files and their registration.
 
 - Keep images from the latest **saved user message containing images**, including
   on text-only follow-ups. Up to eight images in that set, 10 MiB per source.
+  Current-message uploads referenced by file URL (Open WebUI 0.13's native
+  format) or embedded base64 both survive; their `files` metadata is preserved
+  too, so photo uploads and image editing inputs keep working.
 - Omit earlier image content parts and historical tool-result images, leaving
   text intact. The database and original attachments are never modified.
+- **Animated-GIF first-frame extraction (v0.2.0):** Mistral rejects animated GIFs
+  with an HTTP 400 before the model runs. For models whose ID matches the
+  `gif_first_frame_models` valve (default `mistral`, comma-separated
+  case-insensitive substrings; empty disables the feature), the filter replaces
+  the current message's animated-GIF references with a rendered first-frame
+  JPEG in content parts and `files` entries. The substitution persists across
+  tool rounds. Unmatched occurrences fail safe: they are pruned instead of
+  sending a payload the provider would reject. Out-of-scope models are not
+  modified. Retrieval of an older GIF also returns the first frame.
 - Include a bounded manifest (last 100 references) with message/image positions.
   Untrusted filenames, captions and URLs are not copied into the system manifest.
 - `retrieve_chat_image(image_ref)` requires explicit browser confirmation before
   loading an older image. This confirmation is required even in full tool mode.
   Missing/disconnected clients, non-boolean approvals and timeouts deny access.
 - Return a metadata-free JPEG, maximum edge 1536 px, for actual visual inspection.
-  PNG/JPEG/WebP only, first frame only, maximum 25 million source pixels.
+  PNG/JPEG/WebP/GIF accepted, first frame only, maximum 25 million source pixels.
 - Limit retrieval attempts to three per response (including declined attempts),
   serialize concurrent calls, and recheck ownership/branch after confirmation.
 - The `request` hook runs again during tool loops: the latest image set, approved
@@ -92,9 +104,12 @@ historical image-loading cost. It never fetches arbitrary URLs itself.
    filter and deselect the tool together to revert to ordinary image handling.
 
 The two small entry files import the common repo-mounted package; they are not
-standalone implementations. Updating the common package requires a backend
-restart to clear Python's import cache. Registration is explicit; merely
-editing this repo or adding the mount does not activate anything in Open WebUI.
+standalone implementations. Since v0.2.0 the entry files reload the package
+in place (`importlib.reload`) whenever Open WebUI reloads the function/tool
+module, so updating the common package deploys by saving either entry file
+(for example a version bump) in the admin UI — no backend restart needed.
+Registration is explicit; merely editing this repo or adding the mount does not
+activate anything in Open WebUI.
 
 ## Tests
 

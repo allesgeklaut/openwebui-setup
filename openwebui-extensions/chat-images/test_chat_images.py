@@ -2,6 +2,7 @@ import asyncio
 import base64
 import copy
 import io
+import json
 from pathlib import Path
 import tempfile
 import threading
@@ -20,8 +21,19 @@ def png(color="red", size=(8, 8)):
     return output.getvalue()
 
 
+def gif(frames=2, size=(8, 8)):
+    images = [Image.new("RGB", size, color) for color in ("red", "blue")[:frames]]
+    output = io.BytesIO()
+    images[0].save(output, "GIF", save_all=True, append_images=images[1:])
+    return output.getvalue()
+
+
 def uri(raw):
     return "data:image/png;base64," + base64.b64encode(raw).decode()
+
+
+def gif_uri(raw):
+    return "data:image/gif;base64," + base64.b64encode(raw).decode()
 
 
 def part(url):
@@ -29,6 +41,8 @@ def part(url):
 
 
 OLD, NEW = uri(png()), uri(png("blue"))
+ANIMATED_GIF, STATIC_GIF = gif_uri(gif()), gif_uri(gif(1))
+FILE_URL = "/api/v1/files/upload-test/content"
 USER = {"id": "owner"}
 META = {"chat_id": "chat", "message_id": "answer"}
 
@@ -146,6 +160,60 @@ class PolicyTests(unittest.TestCase):
             {"content_type": "image/png", "url": OLD}, {"type": "file", "id": "doc"}]}]}
         self.assertEqual(extension.prune_messages(body)["messages"][0]["files"],
                          [{"type": "file", "id": "doc"}])
+
+    def test_current_file_url_upload_survives_pruning(self):
+        # OWUI 0.13 references the current photo by file URL, not embedded bytes.
+        allowed = {extension.fingerprint(FILE_URL), extension.raw_fingerprint(png())}
+        body = {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "What is this?"}, part(FILE_URL)],
+            "files": [{"type": "image", "url": FILE_URL, "name": "photo.png"}]}]}
+        result = extension.prune_messages(body, allowed)
+        self.assertEqual(result["messages"][0]["content"],
+                         [{"type": "text", "text": "What is this?"}, part(FILE_URL)])
+        self.assertEqual(result["messages"][0]["files"],
+                         [{"type": "image", "url": FILE_URL, "name": "photo.png"}])
+
+    def test_historical_file_url_uploads_are_pruned(self):
+        body = {"messages": [{"role": "user", "files": [
+            {"type": "image", "url": "/api/v1/files/old/content"}]}]}
+        self.assertEqual(extension.prune_messages(body)["messages"][0]["files"], [])
+
+    def test_substituted_gif_parts_and_files_replaced(self):
+        rendered = uri(png("gold"))
+        allowed = {extension.fingerprint(rendered)}
+        body = {"messages": [{"role": "user", "content": [part(FILE_URL)],
+                              "files": [{"type": "image", "url": FILE_URL}]}]}
+        result = extension.prune_messages(body, allowed, (), {FILE_URL: rendered})
+        self.assertEqual(result["messages"][0]["content"], [part(rendered)])
+        self.assertEqual(result["messages"][0]["files"], [{"type": "image", "url": rendered}])
+
+    def test_unsubstituted_gif_occurrence_fails_safe(self):
+        rendered = uri(png("gold"))
+        allowed = {extension.fingerprint(rendered)}
+        body = {"messages": [{"role": "user", "content": [part(FILE_URL)]}]}
+        result = extension.prune_messages(body, allowed, (), {"/api/v1/files/other/content": rendered})
+        self.assertIsInstance(result["messages"][0]["content"], str)
+
+    def test_model_scope_matching(self):
+        self.assertTrue(extension.model_in_scope("mistral.mistral-large-4", "mistral"))
+        self.assertTrue(extension.model_in_scope("deepseek-v4.1-flash-mistral", "Mistral"))
+        self.assertTrue(extension.model_in_scope("mistral-large-4", " mistral , other"))
+        self.assertFalse(extension.model_in_scope("gpt-6-luna", "mistral"))
+        self.assertFalse(extension.model_in_scope(None, "mistral"))
+        self.assertFalse(extension.model_in_scope("mistral-large-4", ""))
+        self.assertFalse(extension.model_in_scope("mistral-large-4", " , "))
+
+    def test_animated_gif_probe(self):
+        self.assertTrue(extension.is_animated_gif(extension.decode_image_url(ANIMATED_GIF)))
+        self.assertFalse(extension.is_animated_gif(extension.decode_image_url(STATIC_GIF)))
+        self.assertFalse(extension.is_animated_gif(b""))
+        self.assertFalse(extension.is_animated_gif(b"not an image"))
+
+    def test_render_first_gif_frame(self):
+        rendered = extension.render_image(gif())
+        with Image.open(io.BytesIO(extension.decode_image_url(rendered))) as image:
+            self.assertEqual(image.format, "JPEG")
+            self.assertEqual(image.size, (8, 8))
 
     def test_invalid_sources_rejected(self):
         for url in ["file:///etc/passwd", "https://example.org/photo.png",
@@ -399,6 +467,60 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.context_mock.return_value = ({}, [NEW] * 9)
         with self.assertRaisesRegex(ValueError, "eight"):
             await self.filter.inlet({"messages": []}, USER, META, self.req)
+
+    async def test_current_photo_upload_survives_inlet(self):
+        # The regression that broke real uploads: latest image referenced by
+        # file URL, content parts and files entries also use the file URL.
+        self.context_mock.return_value = ({}, [FILE_URL])
+        with patch.object(extension, "load_source", AsyncMock(return_value=png())) as load:
+            body = {"model": "mistral.mistral-large-4", "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}, part(FILE_URL)],
+                 "files": [{"type": "image", "url": FILE_URL}]}]}
+            result = await self.filter.inlet(body, USER, META, self.req)
+            load.assert_awaited_once_with(FILE_URL, "owner")
+        self.assertEqual(result["messages"][0]["content"],
+                         [{"type": "text", "text": "hi"}, part(FILE_URL)])
+        self.assertEqual(result["messages"][0]["files"], [{"type": "image", "url": FILE_URL}])
+
+    async def test_animated_gif_first_frame_substituted_for_scoped_model(self):
+        self.context_mock.return_value = ({}, [ANIMATED_GIF])
+        body = {"model": "mistral-large-4", "messages": [
+            {"role": "user", "content": [part(ANIMATED_GIF)],
+             "files": [{"type": "image", "url": ANIMATED_GIF}]}]}
+        result = await self.filter.inlet(body, USER, META, self.req)
+        content = result["messages"][0]["content"]
+        self.assertTrue(content[0]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+        self.assertNotIn(ANIMATED_GIF, json.dumps(result))
+        state = extension.request_state(self.req, USER, META)
+        self.assertTrue(state["substitutions"][ANIMATED_GIF].startswith("data:image/jpeg"))
+        # Substitution persists across tool rounds via the request filter.
+        again = {"model": "mistral-large-4", "messages": [
+            {"role": "user", "content": [part(ANIMATED_GIF)]}]}
+        rerun = await self.filter.request(again, USER, META, self.req)
+        self.assertTrue(rerun["messages"][0]["content"][0]["image_url"]["url"]
+                        .startswith("data:image/jpeg;base64,"))
+
+    async def test_animated_gif_kept_for_out_of_scope_model(self):
+        self.context_mock.return_value = ({}, [ANIMATED_GIF])
+        body = {"model": "gpt-6-luna", "messages": [
+            {"role": "user", "content": [part(ANIMATED_GIF)]}]}
+        result = await self.filter.inlet(body, USER, META, self.req)
+        self.assertEqual(result["messages"][0]["content"], [part(ANIMATED_GIF)])
+
+    async def test_static_gif_not_substituted(self):
+        self.context_mock.return_value = ({}, [STATIC_GIF])
+        body = {"model": "mistral-large-4", "messages": [
+            {"role": "user", "content": [part(STATIC_GIF)]}]}
+        result = await self.filter.inlet(body, USER, META, self.req)
+        self.assertEqual(result["messages"][0]["content"], [part(STATIC_GIF)])
+
+    async def test_gif_retrieval_renders_first_frame(self):
+        catalog, latest = context()
+        catalog["first:1"] = {"url": ANIMATED_GIF, "label": "user message 1, image 1"}
+        self.context_mock.return_value = (catalog, latest)
+        await self.filter.inlet({"messages": []}, USER, META, self.req)
+        result = await self.retrieve()
+        self.assertTrue(result.startswith("data:image/jpeg;base64,"))
 
     async def test_external_source_is_not_fetched(self):
         for url in ["https://127.0.0.1/private", "file:///etc/passwd", "/etc/passwd",

@@ -44,9 +44,10 @@ def decode_image_url(url):
         raise ValueError("Unsupported or oversized image.")
     header, separator, payload = url.partition(",")
     if not separator or header.lower() not in {
-        "data:image/png;base64", "data:image/jpeg;base64", "data:image/webp;base64"
+        "data:image/png;base64", "data:image/jpeg;base64", "data:image/webp;base64",
+        "data:image/gif;base64"
     }:
-        raise ValueError("Only embedded PNG, JPEG and WebP images are supported.")
+        raise ValueError("Only embedded PNG, JPEG, WebP and GIF images are supported.")
     try:
         raw = base64.b64decode(payload, validate=True)
     except (ValueError, binascii.Error) as exc:
@@ -79,13 +80,37 @@ def raw_fingerprint(raw):
     return "data:" + hashlib.sha256(base64.b64encode(raw)).hexdigest()
 
 
+def is_animated_gif(raw):
+    """Header/frame-count probe only; no pixel data is decoded here."""
+    if not raw or len(raw) > MAX_SOURCE_BYTES:
+        return False
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            with Image.open(io.BytesIO(raw)) as image:
+                return image.format == "GIF" and getattr(image, "n_frames", 1) > 1
+        except Exception:
+            return False
+
+
+def model_in_scope(model_id, patterns):
+    """Case-insensitive substring match against comma-separated model patterns."""
+    if not isinstance(model_id, str) or not isinstance(patterns, str):
+        return False
+    return any(
+        pattern and pattern in model_id.lower()
+        for pattern in (candidate.strip().lower() for candidate in patterns.split(","))
+    )
+
+
 def message_images(message):
     """Uploaded images only; never search assistant text or arbitrary markdown URLs."""
     result, seen = [], set()
     for attachment in message.get("files") or []:
         if isinstance(attachment, dict) and (
             attachment.get("type") == "image"
-            or attachment.get("content_type") in {"image/png", "image/jpeg", "image/webp"}
+            or attachment.get("content_type") in {"image/png", "image/jpeg", "image/webp",
+                                                 "image/gif"}
         ):
             url = attachment.get("url")
             if isinstance(url, str) and url and url not in seen:
@@ -136,13 +161,16 @@ def image_catalog(branch):
     return dict(list(catalog.items())[-MAX_REFERENCES:])
 
 
-def prune_messages(body, approved=(), current=()):
+def prune_messages(body, approved=(), current=(), substitutions=None):
     """Copy/prune historical images without treating fresh tool output as history.
 
     Handles both Chat Completions content parts and OWUI structured tool output.
-    Does not interpret or alter text/markdown, tool arguments, or database records.
+    Substitutions replace current-message images (for example an animated GIF's
+    rendered first frame) with an already-approved URL. Does not interpret or
+    alter text/markdown, tool arguments, or database records.
     """
     result = copy.deepcopy(body)
+    substitutions = dict(substitutions or {})
     messages = result.get("messages") or []
     seen_images = set()
     fingerprints = {}
@@ -167,7 +195,15 @@ def prune_messages(body, approved=(), current=()):
         processed_parts += 1
         if processed_parts > MAX_HISTORY_IMAGE_PARTS:
             raise ValueError("Image history exceeds the 2048 image-part processing limit.")
-        digest = identity(image_url(item))
+        url = image_url(item)
+        if url in substitutions:
+            # The substituted frame is pre-approved; keep the newest occurrence.
+            digest = identity(substitutions[url])
+            if digest in seen_images:
+                return False
+            seen_images.add(digest)
+            return True
+        digest = identity(url)
         if digest is not None and digest in current:
             return True
         if digest is None or digest not in approved:
@@ -177,12 +213,29 @@ def prune_messages(body, approved=(), current=()):
         seen_images.add(digest)
         return True
 
+    def substitute(item):
+        target = substitutions.get(image_url(item))
+        if target is None:
+            return item
+        item = copy.deepcopy(item)
+        if isinstance(item.get("image_url"), dict):
+            item["image_url"]["url"] = target
+        elif "image_url" in item:
+            item["image_url"] = target
+        else:
+            item["url"] = target
+        return item
+
     def clean(value):
         if isinstance(value, list):
-            return [clean(item) for item in value if not (
-                isinstance(item, dict) and item.get("type") in IMAGE_TYPES
-                and not keep_image(item)
-            )]
+            kept = []
+            for item in value:
+                if isinstance(item, dict) and item.get("type") in IMAGE_TYPES:
+                    if keep_image(item):
+                        kept.append(substitute(item))
+                else:
+                    kept.append(clean(item))
+            return kept
         if isinstance(value, dict):
             # Only traverse image-bearing fields, never JSON tool argument strings.
             return {
@@ -196,13 +249,28 @@ def prune_messages(body, approved=(), current=()):
         message = messages[index]
         messages[index] = clean(message)
         if isinstance(message.get("files"), list):
-            messages[index]["files"] = [
-                item for item in message["files"]
-                if not isinstance(item, dict) or (
-                    item.get("type") != "image"
-                    and item.get("content_type") not in {"image/png", "image/jpeg", "image/webp"}
-                ) or (bool(current) and identity(item.get("url")) in current)
-            ]
+            kept_files = []
+            for item in message["files"]:
+                if not isinstance(item, dict):
+                    kept_files.append(item)
+                    continue
+                is_image = (
+                    item.get("type") == "image"
+                    or item.get("content_type") in {"image/png", "image/jpeg", "image/webp",
+                                                   "image/gif"}
+                )
+                if not is_image:
+                    kept_files.append(item)
+                    continue
+                url = item.get("url")
+                target = substitutions.get(url) if isinstance(url, str) else None
+                digest = identity(target if target is not None else url)
+                if digest is not None and (digest in current or digest in approved):
+                    if target is not None:
+                        item = copy.deepcopy(item)
+                        item["url"] = target
+                    kept_files.append(item)
+            messages[index]["files"] = kept_files
         if messages[index].get("content") == []:
             messages[index]["content"] = "[Earlier image omitted; use retrieve_chat_image if needed.]"
     return result
@@ -214,13 +282,16 @@ def render_image(raw):
     with warnings.catch_warnings():
         warnings.simplefilter("error", Image.DecompressionBombWarning)
         with Image.open(io.BytesIO(raw)) as image:
-            if image.format not in {"PNG", "JPEG", "WEBP"}:
-                raise ValueError("Only PNG, JPEG and WebP images are supported.")
+            if image.format not in {"PNG", "JPEG", "WEBP", "GIF"}:
+                raise ValueError("Only PNG, JPEG, WebP and GIF images are supported.")
             if image.width * image.height > MAX_PIXELS:
                 raise ValueError("Image exceeds the pixel limit.")
             # Read only the first frame; flatten transparency and discard metadata.
+            if image.format == "GIF":
+                image.seek(0)
             image.thumbnail((MAX_EDGE, MAX_EDGE))
-            image = ImageOps.exif_transpose(image)
+            if image.format != "GIF":
+                image = ImageOps.exif_transpose(image)
             rgba = image.convert("RGBA")
             flattened = Image.new("RGB", rgba.size, "white")
             flattened.paste(rgba, mask=rgba.getchannel("A"))
@@ -383,7 +454,32 @@ def request_state(request, user, metadata):
     return state
 
 
+try:
+    from pydantic import BaseModel
+
+    class _ValvesBase(BaseModel):
+        priority: int = 0
+        gif_first_frame_models: str = "mistral"
+except ImportError:
+    # Policy tests run outside the application image, without pydantic.
+    class _ValvesBase:
+        priority = 0
+        gif_first_frame_models = "mistral"
+
+        def __init__(self, **values):
+            for key, value in values.items():
+                setattr(self, key, value)
+
+
 class Filter:
+    class Valves(_ValvesBase):
+        """gif_first_frame_models: comma-separated, case-insensitive model-id
+        substrings whose provider rejects animated GIFs (for example Mistral).
+        The first frame is extracted and sent instead. Empty disables it."""
+
+    def __init__(self):
+        self.valves = self.Valves()
+
     async def inlet(self, body: dict, __user__: dict = None, __metadata__: dict = None,
                     __request__=None) -> dict:
         if __request__ is None:
@@ -391,11 +487,23 @@ class Filter:
         catalog, latest = await owned_context(__user__, __metadata__)
         if len(latest) > MAX_LATEST_IMAGES:
             raise ValueError("At most eight images are supported in the latest image set.")
+        valves = getattr(self, "valves", None)
+        model_id = body.get("model") if isinstance(body, dict) else None
+        extract_gifs = model_in_scope(model_id, getattr(valves, "gif_first_frame_models", ""))
         allowed = set()
+        substitutions = {}
         try:
             for url in latest:
                 raw = await load_source(url, __user__["id"])
-                allowed.add(await asyncio.to_thread(raw_fingerprint, raw))
+                if extract_gifs and await asyncio.to_thread(is_animated_gif, raw):
+                    rendered = await asyncio.to_thread(render_image, raw)
+                    substitutions[url] = rendered
+                    # Only the rendered frame is approved; an un-substituted
+                    # occurrence fails safe by being pruned, not sent as GIF.
+                    allowed.add(await asyncio.to_thread(fingerprint, rendered))
+                else:
+                    allowed.add(await asyncio.to_thread(fingerprint, url))
+                    allowed.add(await asyncio.to_thread(raw_fingerprint, raw))
         except Exception:
             raise ValueError("Latest images must be accessible embedded images or local uploads "
                              "of at most 10 MiB each.") from None
@@ -404,6 +512,7 @@ class Filter:
             "approved": allowed, "attempts": 0, "lock": asyncio.Lock(),
             "processed": dict(baseline),
             "current": set(), "filter_lock": asyncio.Lock(),
+            "substitutions": substitutions,
         }
         # Multi-model responses share an HTTP Request; isolate each response ID.
         states = getattr(__request__.state, STATE_KEY, None)
@@ -411,7 +520,7 @@ class Filter:
             states = {}
             setattr(__request__.state, STATE_KEY, states)
         states[context_binding(__user__, __metadata__)] = state
-        result = await asyncio.to_thread(prune_messages, body, allowed)
+        result = await asyncio.to_thread(prune_messages, body, allowed, (), substitutions)
         if catalog:
             manifest = (
                 "Saved images in this conversation branch (reference IDs are opaque):\n"
@@ -442,7 +551,8 @@ class Filter:
                 state["current"].update(await response_source_keys(changed, __user__["id"]))
                 state["processed"].update(changed)
             return await asyncio.to_thread(prune_messages, body, set(state["approved"]),
-                                           set(state["current"]))
+                                           set(state["current"]),
+                                           dict(state.get("substitutions") or {}))
 
 
 class Tools:
