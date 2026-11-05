@@ -60,6 +60,14 @@ docker compose up -d
 
 ## Configuration
 
+### Selective chat image retrieval (optional)
+
+The repo-managed [Chat Image Retrieval Filter + Tool](openwebui-extensions/chat-images/README.md)
+keeps the latest image set in context and retrieves older current-chat images
+only after explicit approval. It is **not activated automatically**. See its
+installation guide, limits, security tests, and scoped rollout checklist before
+enabling it on a model.
+
 ### MCP Servers (`mcpo/`)
 
 The `mcpo` service connects to various Model Context Protocol servers. The configuration is generated from [`mcpo/template_config.json`](mcpo/template_config.json ) using your environment variables.
