@@ -9,22 +9,38 @@ these files and their registration.
 
 - Keep images from the latest **saved user message containing images**, including
   on text-only follow-ups. Up to eight images in that set, 10 MiB per source.
-  Latest-set uploads referenced by file URL or resolved embedded base64 both
-  survive; their `files` metadata is preserved too, so photo uploads and image
+  Latest-set uploads referenced by bare file ID, file URL or resolved base64 all
+  survive; ordinary `files` metadata is preserved too, so photo uploads and image
   editing inputs keep working.
 - Omit earlier image content parts and historical tool-result images, leaving
   text intact. The database and original attachments are never modified.
-- **Animated-GIF first-frame extraction:** tested Mistral-routed models reject
-  animated GIFs with HTTP 400. For models whose ID matches the
-  `gif_first_frame_models` valve (default `mistral`, comma-separated
-  case-insensitive substrings; empty disables the feature), the filter replaces
-  latest saved image set's animated-GIF references with a rendered first-frame
-  JPEG in content parts and `files` entries, matching both upload URLs and
-  resolved bytes. The substitution persists across tool rounds. Unmatched
-  occurrences fail safe: they are pruned instead of
-  sending a payload the provider would reject. Out-of-scope models are not
-  converted by this feature. Retrieval of an older GIF always returns the first
-  frame, regardless of model. New current-response tool images remain unchanged.
+- **Animated-GIF sampling, for every model using this filter:** replace each
+  animated GIF in the latest saved image set with up to **four chronological
+  JPEG frames**, at most 1536 px on the longest edge. This does not add vision
+  capability to text-only models. Samples are spread across playback time using
+  frame delays, including the first and last frames when the configured maximum
+  is at least two. Short animations send only their available frames. Missing or
+  zero delays use 100 ms; labels show the selected frames' actual start timestamps,
+  not idealized target times. GIF disposal and transparency are composited before
+  resizing; transparency is flattened onto white and original metadata discarded.
+- Each sampled frame has a GIF/group number and timestamp. A request-only note
+  explains that these are **samples, not the complete animation**: motion, brief
+  events, flicker and loop seams can be missed. Converted `files` entries describe
+  JPEG stills without the original GIF ID, filename or nested record. Stored GIFs
+  and chat display are untouched. Source URLs, bare IDs and resolved bytes match;
+  original or already-sampled tool-loop messages normalize idempotently, including
+  repeated-pixel frames and GIFs sharing a first frame. Unrecognized original GIF
+  payloads fail safe by being pruned, not forwarded.
+- GIF decoding is limited to **512 source frames**, **25 million pixels per
+  frame**, and a conservative **128 million decoded-pixel work budget** covering
+  two passes per GIF. Over-budget, malformed or inaccessible sources reject the
+  request rather than silently forwarding the original animation. The latest
+  image set may contain at most **16 images after expansion** by default; excess
+  produces a clear error suggesting fewer GIFs or fewer samples.
+- Single-frame GIFs remain unchanged. Retrieval of an **older GIF** still returns
+  one resized first-frame JPEG after approval; the retrieval tool does not expose
+  the original animation. **New current-response tool images remain unchanged**
+  and are not subject to latest-upload expansion or its image-count cap.
 - Include a bounded manifest (last 100 references) with message/image positions.
   Untrusted filenames, captions and URLs are not copied into the system manifest.
 - `retrieve_chat_image(image_ref)` requires explicit browser confirmation before
@@ -55,6 +71,40 @@ these files and their registration.
   approval again for older-image retrieval; current tool execution retains its
   normal Open WebUI permissions and approval policy.
 
+### Sampling valves and upgrade behaviour
+
+| Valve | Default | Allowed values | Purpose |
+| --- | --- | --- | --- |
+| `gif_max_frames` | `4` | `1`–`4` | Maximum samples per latest-set animated GIF; `1` explicitly sends only the first frame. |
+| `max_expanded_images` | `16` | `1`–`32` | Maximum latest-set image count after sampling, including normal images. Excess is rejected, never silently truncated. |
+
+The old `gif_first_frame_models` valve is obsolete and ignored, including when
+present in saved registration settings. Sampling now applies across providers.
+The static registration adapters have not changed; package-only deployment still
+requires just a restart. Adjust valves through the usual Open WebUI function
+settings if needed; do not change tool permissions to control sampling.
+
+### Large images and multiple normal uploads
+
+- Multiple PNG/JPEG/WebP uploads in one message form **one retained image set**:
+  keep all of them, not just the last image. The source limit is eight images,
+  each at most 10 MiB. Text-only follow-ups retain the same set. A later
+  image-bearing user message replaces it; older payloads then require retrieval.
+- Ordinary latest-set images and their metadata are **not resized or recompressed
+  by this filter**. A file over 10 MiB is rejected before decoding/resizing; the
+  filter does not rescue oversized sources by loading them without a bound.
+  Pixel/work limits above apply to GIF sampling (and the existing single-image
+  renderer used by retrieval), not a guaranteed normal-image resolution cap.
+- Open WebUI offers optional **Settings > Interface > Image Compression** and
+  configurable dimensions. Its documented built-in default is off; compression
+  depends on UI/admin configuration and the upload path, not an unconditional
+  backend resize. See [official interface defaults](https://docs.openwebui.com/features/administration/interface-defaults/).
+  This extension does not alter that setting or recover animation already lost
+  by browser-side compression before upload.
+- Provider image-count, resolution, request-size and context limits still apply.
+  The expansion cap is not a provider-token budget and does not cap fresh tool
+  images or approved retrievals. Consider provider limits before raising it.
+
 ## Access boundary and limitations
 
 The tool accepts an opaque `message-id:image-number` reference, **not** a file
@@ -65,6 +115,9 @@ other chats, other users, shared non-owned chats, or admin ownership bypass.
 Attachment-file lookups additionally require file ownership. Local reads are
 rooted under `UPLOAD_DIR`, reject symlinks at every path component, and enforce
 file type/size limits. Embedded base64 images in owned chat messages also work.
+Native raster attachments can have `type: file` and `url` equal to a bare upload
+ID; these use the same owned-file lookup as `/api/v1/files/{id}/content` routes.
+Neither form accepts arbitrary filesystem paths or fetches external URLs.
 
 This initial version intentionally does **not** support external image URLs,
 absolute upload URLs, S3/cloud-storage paths, temporary/unsaved chats, assistant
@@ -170,7 +223,16 @@ Use a **new saved private test chat**, not a sensitive existing conversation.
 8. Generate/edit an image using the normal image-generation tool: verify the UI
    image and JSON result remain intact. If a tool returns multimodal image parts,
    verify those reach the provider unchanged, including identical-pixel repeats.
-   Verify a later turn still omits older payloads without deleting displayed images.
+    Verify a later turn still omits older payloads without deleting displayed images.
+9. Upload a synthetic GIF with at least six distinct frames and varying delays:
+   verify up to four timestamped JPEG parts, first/last coverage, one sampling
+   disclosure and no original GIF file tag. Repeat with a non-Mistral model and
+   a tool-call round; labels and images must not accumulate. Four samples do not
+   prove the model has seen the complete animation.
+10. Upload several ordinary images together and follow with text only: keep the
+    full latest set unchanged. Try a source over 10 MiB, more than eight sources,
+    and GIFs exceeding the expansion/work budget: expect clear errors, not a
+    fallback that replays all originals.
 
 Unit and synthetic runtime tests do not substitute for these browser/provider
 checks. Provider checks incur normal inference costs and are not automated here.

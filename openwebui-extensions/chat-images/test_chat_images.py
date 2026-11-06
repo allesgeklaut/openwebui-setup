@@ -22,10 +22,12 @@ def png(color="red", size=(8, 8)):
     return output.getvalue()
 
 
-def gif(frames=2, size=(8, 8)):
-    images = [Image.new("RGB", size, color) for color in ("red", "blue")[:frames]]
+def gif(frames=2, size=(8, 8), duration=None):
+    colors = ("red", "blue", "green", "yellow", "purple", "orange", "cyan", "white")
+    images = [Image.new("RGB", size, colors[index % len(colors)]) for index in range(frames)]
     output = io.BytesIO()
-    images[0].save(output, "GIF", save_all=True, append_images=images[1:])
+    options = {"duration": duration} if duration is not None else {}
+    images[0].save(output, "GIF", save_all=True, append_images=images[1:], **options)
     return output.getvalue()
 
 
@@ -44,6 +46,7 @@ def part(url):
 OLD, NEW = uri(png()), uri(png("blue"))
 ANIMATED_GIF, STATIC_GIF = gif_uri(gif()), gif_uri(gif(1))
 FILE_URL = "/api/v1/files/upload-test/content"
+FILE_ID = "00000000-0000-4000-8000-000000000002"
 USER = {"id": "owner"}
 META = {"chat_id": "chat", "message_id": "answer"}
 
@@ -67,6 +70,21 @@ def request():
 
 
 class PolicyTests(unittest.TestCase):
+    def test_local_source_references_accept_bare_ids_and_content_routes(self):
+        self.assertEqual(extension.source_file_id(FILE_ID), FILE_ID)
+        self.assertEqual(extension.source_file_id(FILE_URL), "upload-test")
+        for source in [None, "", "../secret", "/etc/passwd", "file:///etc/passwd",
+                       "https://example.org/photo.gif", "//host/path", "photo.gif",
+                       "/api/v1/files/../content", "/api/v1/files/id/content?download=1",
+                       "id/other", "x" * 129, ANIMATED_GIF]:
+            with self.subTest(source_type=type(source).__name__):
+                self.assertIsNone(extension.source_file_id(source))
+
+    def test_native_file_type_gif_attachment_is_catalogued(self):
+        self.assertEqual(extension.message_images({"files": [
+            {"type": "file", "content_type": "image/gif", "url": FILE_ID, "id": FILE_ID}]}),
+            [FILE_ID])
+
     def test_history_is_never_base64_decoded(self):
         body = {"messages": [{"role": "user", "content": [part(OLD)]}]}
         with patch.object(extension.base64, "b64decode", side_effect=AssertionError("History decoded")):
@@ -184,31 +202,86 @@ class PolicyTests(unittest.TestCase):
         allowed = {extension.fingerprint(rendered)}
         body = {"messages": [{"role": "user", "content": [part(FILE_URL)],
                               "files": [{"type": "image", "url": FILE_URL}]}]}
-        result = extension.prune_messages(body, allowed, (), {FILE_URL: rendered})
-        self.assertEqual(result["messages"][0]["content"], [part(rendered)])
-        self.assertEqual(result["messages"][0]["files"], [{"type": "image", "url": rendered}])
+        group = {"number": 1, "frames": ({"url": rendered, "timestamp_ms": 0},)}
+        result = extension.prune_messages(body, allowed, (), {FILE_URL: group})
+        self.assertEqual(result["messages"][0]["content"], [
+            part(rendered), {"type": "text", "text": extension.gif_frame_label(group, 0)},
+            {"type": "text", "text": extension.GIF_SAMPLING_NOTICE}])
+        self.assertEqual(result["messages"][0]["files"], [
+            {"type": "image", "url": rendered, "content_type": "image/jpeg",
+             "name": "gif-1-frame-1.jpg"}])
 
     def test_unsubstituted_gif_occurrence_fails_safe(self):
         rendered = uri(png("gold"))
         allowed = {extension.fingerprint(rendered)}
         body = {"messages": [{"role": "user", "content": [part(FILE_URL)]}]}
-        result = extension.prune_messages(body, allowed, (), {"/api/v1/files/other/content": rendered})
+        group = {"number": 1, "frames": ({"url": rendered, "timestamp_ms": 0},)}
+        result = extension.prune_messages(body, allowed, (), {"/api/v1/files/other/content": group})
         self.assertIsInstance(result["messages"][0]["content"], str)
 
-    def test_model_scope_matching(self):
-        self.assertTrue(extension.model_in_scope("mistral.mistral-large-4", "mistral"))
-        self.assertTrue(extension.model_in_scope("deepseek-v4.1-flash-mistral", "Mistral"))
-        self.assertTrue(extension.model_in_scope("mistral-large-4", " mistral , other"))
-        self.assertFalse(extension.model_in_scope("gpt-6-luna", "mistral"))
-        self.assertFalse(extension.model_in_scope(None, "mistral"))
-        self.assertFalse(extension.model_in_scope("mistral-large-4", ""))
-        self.assertFalse(extension.model_in_scope("mistral-large-4", " , "))
+    def test_gif_sampling_is_temporal_bounded_and_includes_endpoints(self):
+        frames = extension.sample_gif(gif(8, duration=100))
+        self.assertEqual([frame["timestamp_ms"] for frame in frames], [0, 200, 500, 700])
+        self.assertTrue(all(frame["url"].startswith("data:image/jpeg;base64,") for frame in frames))
+        self.assertEqual(len(extension.sample_gif(gif(), 4)), 2)
+        self.assertEqual(len(extension.sample_gif(gif(8), 1)), 1)
 
-    def test_animated_gif_probe(self):
-        self.assertTrue(extension.is_animated_gif(extension.decode_image_url(ANIMATED_GIF)))
-        self.assertFalse(extension.is_animated_gif(extension.decode_image_url(STATIC_GIF)))
-        self.assertFalse(extension.is_animated_gif(b""))
-        self.assertFalse(extension.is_animated_gif(b"not an image"))
+    def test_gif_sampling_uses_variable_delays_not_frame_index(self):
+        frames = extension.sample_gif(gif(8, duration=[100, 100, 1000, 100, 100, 100, 100, 100]))
+        self.assertEqual([frame["timestamp_ms"] for frame in frames], [0, 200, 1200, 1600])
+
+    def test_gif_sampling_static_non_gif_and_invalid_inputs(self):
+        self.assertIsNone(extension.sample_gif(gif(1)))
+        self.assertIsNone(extension.sample_gif(png()))
+        for count in (0, 5, True, "4"):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                extension.sample_gif(gif(), count)
+        for raw in (b"", b"not an image", gif()[:20]):
+            with self.subTest(raw_length=len(raw)), self.assertRaises((ValueError, OSError)):
+                extension.sample_gif(raw)
+
+    def test_gif_sampling_source_frames_and_decode_pixels_are_bounded(self):
+        with patch.object(extension, "MAX_GIF_SOURCE_FRAMES", 2):
+            self.assertEqual(len(extension.sample_gif(gif(2))), 2)
+            with self.assertRaisesRegex(ValueError, "source-frame"):
+                extension.sample_gif(gif(3))
+        with patch.object(extension, "MAX_GIF_DECODE_PIXELS", 8 * 8 * 2 * 2):
+            self.assertEqual(len(extension.sample_gif(gif(2))), 2)
+            with self.assertRaisesRegex(ValueError, "decoding"):
+                extension.sample_gif(gif(3))
+        with patch.object(extension, "MAX_PIXELS", 16), self.assertRaisesRegex(ValueError, "pixel"):
+            extension.sample_gif(gif())
+        with patch.object(extension, "MAX_SOURCE_BYTES", 16), self.assertRaisesRegex(ValueError, "oversized"):
+            extension.sample_gif(gif())
+
+    def test_gif_samples_resize_and_preserve_source(self):
+        raw = gif(size=(100, 50))
+        before = bytes(raw)
+        with patch.object(extension, "MAX_EDGE", 16):
+            frames = extension.sample_gif(raw)
+        for frame in frames:
+            with Image.open(io.BytesIO(extension.decode_image_url(frame["url"]))) as image:
+                self.assertEqual(image.size, (16, 8))
+                self.assertEqual(image.format, "JPEG")
+        self.assertEqual(raw, before)
+
+    def test_gif_samples_composite_transparency_and_disposal(self):
+        palette = [0, 0, 0, 255, 0, 0, 0, 0, 255] + [0] * (768 - 9)
+        images = [Image.new("P", (16, 16), 0) for _ in range(2)]
+        for image in images:
+            image.putpalette(palette)
+        images[0].paste(1, (0, 0, 8, 8))
+        images[1].paste(2, (8, 8, 16, 16))
+        output = io.BytesIO()
+        images[0].save(output, "GIF", save_all=True, append_images=images[1:],
+                       transparency=0, disposal=2, optimize=False, duration=100)
+        samples = extension.sample_gif(output.getvalue())
+        with Image.open(io.BytesIO(extension.decode_image_url(samples[1]["url"]))) as image:
+            # The previous red patch must have been disposed, not overlaid.
+            self.assertTrue(all(channel > 230 for channel in image.getpixel((2, 2))))
+            red, green, blue = image.getpixel((12, 12))
+            self.assertGreater(blue, 200)
+            self.assertLess(max(red, green), 40)
 
     def test_render_first_gif_frame(self):
         rendered = extension.render_image(gif())
@@ -500,7 +573,38 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
                          [{"type": "text", "text": "hi"}, part(FILE_URL)])
         self.assertEqual(result["messages"][0]["files"], [{"type": "image", "url": FILE_URL}])
 
-    async def test_animated_gif_first_frame_substituted_for_scoped_model(self):
+    async def test_eight_normal_images_remain_unchanged_on_text_followups(self):
+        sources = [uri(png(color)) for color in (
+            "red", "blue", "green", "yellow", "purple", "orange", "cyan", "white")]
+        self.context_mock.return_value = ({}, sources)
+        body = {"messages": [
+            {"role": "user", "content": [part(url) for url in sources],
+             "files": [{"type": "file", "content_type": "image/png", "url": url,
+                        "name": f"photo-{index}.png"} for index, url in enumerate(sources)]},
+            {"role": "assistant", "content": "I see eight pictures."},
+            {"role": "user", "content": "Compare their colors."}]}
+        before = copy.deepcopy(body)
+        result = await self.filter.inlet(body, USER, META, self.req)
+        self.assertEqual(result, before)
+        self.assertEqual(await self.filter.request(result, USER, META, self.req), before)
+        self.assertEqual(body, before)
+
+    async def test_new_normal_image_set_replaces_the_older_set(self):
+        self.context_mock.return_value = ({}, [NEW])
+        body = {"messages": [{"role": "user", "content": [part(OLD)],
+                              "files": [{"type": "image", "url": OLD}]},
+                             {"role": "user", "content": [part(NEW)],
+                              "files": [{"type": "image", "url": NEW}]}]}
+        result = await self.filter.inlet(body, USER, META, self.req)
+        self.assertFalse(extension.message_images(result["messages"][0]))
+        self.assertEqual(result["messages"][1], body["messages"][1])
+
+    async def test_oversized_normal_image_fails_closed(self):
+        self.context_mock.return_value = ({}, [NEW])
+        with patch.object(extension, "MAX_SOURCE_BYTES", 16), self.assertRaisesRegex(ValueError, "10 MiB"):
+            await self.filter.inlet({"messages": []}, USER, META, self.req)
+
+    async def test_animated_gif_expands_to_available_samples(self):
         self.context_mock.return_value = ({}, [ANIMATED_GIF])
         body = {"model": "mistral-large-4", "messages": [
             {"role": "user", "content": [part(ANIMATED_GIF)],
@@ -510,7 +614,8 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(content[0]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
         self.assertNotIn(ANIMATED_GIF, json.dumps(result))
         state = extension.request_state(self.req, USER, META)
-        self.assertTrue(state["substitutions"][ANIMATED_GIF].startswith("data:image/jpeg"))
+        self.assertEqual(len(state["substitutions"][ANIMATED_GIF]["frames"]), 2)
+        self.assertEqual(len(extension.message_images(result["messages"][0])), 2)
         # Substitution persists across tool rounds via the request filter.
         again = {"model": "mistral-large-4", "messages": [
             {"role": "user", "content": [part(ANIMATED_GIF)]}]}
@@ -518,12 +623,13 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rerun["messages"][0]["content"][0]["image_url"]["url"]
                         .startswith("data:image/jpeg;base64,"))
 
-    async def test_animated_gif_kept_for_out_of_scope_model(self):
+    async def test_animated_gif_sampled_for_non_mistral_model(self):
         self.context_mock.return_value = ({}, [ANIMATED_GIF])
         body = {"model": "gpt-6-luna", "messages": [
             {"role": "user", "content": [part(ANIMATED_GIF)]}]}
         result = await self.filter.inlet(body, USER, META, self.req)
-        self.assertEqual(result["messages"][0]["content"], [part(ANIMATED_GIF)])
+        self.assertNotIn(ANIMATED_GIF, json.dumps(result))
+        self.assertEqual(len(extension.message_images(result["messages"][0])), 2)
 
     async def test_file_url_gif_resolved_to_base64_is_substituted_across_rounds(self):
         self.context_mock.return_value = ({}, [FILE_URL])
@@ -543,12 +649,171 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.filter.request(body, USER, META, self.req), result)
         self.assertEqual(await self.filter.request(result, USER, META, self.req), result)
 
-    async def test_first_frame_valve_can_be_disabled(self):
-        self.filter.valves.gif_first_frame_models = ""
+    async def test_gif_frame_count_valve_can_select_one(self):
+        self.filter.valves.gif_max_frames = 1
         self.context_mock.return_value = ({}, [ANIMATED_GIF])
         body = {"model": "mistral-large-4", "messages": [
             {"role": "user", "content": [part(ANIMATED_GIF)]}]}
-        self.assertEqual(await self.filter.inlet(body, USER, META, self.req), body)
+        result = await self.filter.inlet(body, USER, META, self.req)
+        self.assertEqual(len(extension.message_images(result["messages"][0])), 1)
+
+    async def test_gif_expansion_budget_fails_closed(self):
+        sources = [gif_uri(gif(4, size=(8 + index, 8))) for index in range(5)]
+        self.context_mock.return_value = ({}, sources)
+        body = {"messages": [{"role": "user", "content": [part(url) for url in sources]}]}
+        with self.assertRaisesRegex(ValueError, "expand to 20.*limit is 16"):
+            await self.filter.inlet(body, USER, META, self.req)
+        self.filter.valves.gif_max_frames = 3
+        result = await self.filter.inlet(body, USER, META, self.req)
+        self.assertEqual(len(extension.message_images(result["messages"][0])), 15)
+        self.assertEqual(await self.filter.request(result, USER, META, self.req), result)
+
+    async def test_gif_decode_limit_fails_closed(self):
+        self.context_mock.return_value = ({}, [ANIMATED_GIF])
+        with patch.object(extension, "MAX_GIF_SOURCE_FRAMES", 1), self.assertRaisesRegex(ValueError, "GIFs must also fit"):
+            await self.filter.inlet({"messages": []}, USER, META, self.req)
+
+    async def test_sampling_configuration_limits_are_validated_at_inlet(self):
+        for key, invalid in (("gif_max_frames", 0), ("gif_max_frames", 5),
+                             ("gif_max_frames", True), ("max_expanded_images", 0),
+                             ("max_expanded_images", 33)):
+            with self.subTest(key=key, value=invalid):
+                self.filter.valves = SimpleNamespace(gif_max_frames=4, max_expanded_images=16)
+                setattr(self.filter.valves, key, invalid)
+                with self.assertRaises(ValueError):
+                    await self.filter.inlet({"messages": []}, USER, META, self.req)
+
+    async def test_gif_sampling_runs_off_the_event_loop(self):
+        self.context_mock.return_value = ({}, [ANIMATED_GIF])
+        loop_thread = threading.get_ident()
+        original = extension.sample_gif
+
+        def checked(*args):
+            self.assertNotEqual(threading.get_ident(), loop_thread)
+            return original(*args)
+
+        with patch.object(extension, "sample_gif", side_effect=checked):
+            await self.filter.inlet({"messages": []}, USER, META, self.req)
+
+    async def test_same_start_frames_in_two_gifs_remain_distinct_and_idempotent(self):
+        longer = gif_uri(gif(4))
+        self.context_mock.return_value = ({}, [ANIMATED_GIF, longer])
+        body = {"messages": [{"role": "user", "content": [part(ANIMATED_GIF), part(longer)],
+                              "files": [{"type": "image", "url": url}
+                                        for url in (ANIMATED_GIF, longer)]}]}
+        result = await self.filter.inlet(body, USER, META, self.req)
+        content = result["messages"][0]["content"]
+        self.assertEqual(sum(item.get("type") == "image_url" for item in content), 6)
+        self.assertEqual(len(result["messages"][0]["files"]), 6)
+        self.assertEqual(await self.filter.request(result, USER, META, self.req), result)
+
+    async def test_repeated_pixel_samples_keep_their_separate_timestamps(self):
+        images = [Image.new("RGB", (8, 8), color) for color in ("red", "blue", "red", "blue")]
+        output = io.BytesIO()
+        images[0].save(output, "GIF", save_all=True, append_images=images[1:], duration=100)
+        source = gif_uri(output.getvalue())
+        self.context_mock.return_value = ({}, [source])
+        body = {"messages": [{"role": "user", "content": [part(source)]}]}
+        result = await self.filter.inlet(body, USER, META, self.req)
+        content = result["messages"][0]["content"]
+        self.assertEqual(sum(item.get("type") == "image_url" for item in content), 4)
+        self.assertIn("timestamp 0.200 s", json.dumps(content))
+        self.assertEqual(await self.filter.request(result, USER, META, self.req), result)
+
+    async def test_mixed_content_and_files_only_gif_groups_are_idempotent(self):
+        other_gif = gif_uri(gif(size=(10, 10)))
+        self.context_mock.return_value = ({}, [ANIMATED_GIF, other_gif])
+        body = {"messages": [{"role": "user", "content": [part(ANIMATED_GIF)],
+                              "files": [{"type": "image", "url": other_gif}]}]}
+        result = await self.filter.inlet(body, USER, META, self.req)
+        content = result["messages"][0]["content"]
+        self.assertEqual(sum(item.get("type") == "image_url" for item in content), 4)
+        self.assertEqual(json.dumps(content).count(extension.GIF_SAMPLING_NOTICE), 1)
+        self.assertEqual(await self.filter.request(result, USER, META, self.req), result)
+
+    async def test_gif_mixtures_normalize_idempotently_across_reconstruction(self):
+        gifs = [gif_uri(gif(count, size=(8 + index, 8), duration=100))
+                for index, count in enumerate((2, 4, 6))]
+        photo = extension.sample_gif(gif(2, duration=100))[0]["url"]
+        for count in range(1, 4):
+            for with_photo in (False, True):
+                for files_only in (False, True):
+                    with self.subTest(gifs=count, photo=with_photo, files_only=files_only):
+                        sources = gifs[:count] + ([photo] if with_photo else [])
+                        self.context_mock.return_value = ({}, sources)
+                        content = [{"type": "text", "text": "Compare these images."}]
+                        if not files_only:
+                            content += [part(url) for url in sources]
+                        body = {"messages": [{"role": "user", "content": content,
+                                              "files": [{"type": "image", "url": url} for url in sources]}]}
+                        req = request()
+                        result = await self.filter.inlet(body, USER, META, req)
+                        self.assertEqual(await self.filter.request(result, USER, META, req), result)
+                        rebuilt = copy.deepcopy(result)
+                        rebuilt["messages"][0].pop("files")
+                        normalized = await self.filter.request(rebuilt, USER, META, req)
+                        self.assertEqual(normalized, rebuilt)
+
+    async def test_normal_photo_identical_to_gif_sample_is_not_expanded(self):
+        photo = extension.sample_gif(gif())[0]["url"]
+        self.context_mock.return_value = ({}, [ANIMATED_GIF, photo])
+        photo_file = {"type": "image", "content_type": "image/jpeg", "url": photo, "name": "photo.jpg"}
+        body = {"messages": [{"role": "user", "content": [part(ANIMATED_GIF), part(photo)],
+                              "files": [{"type": "image", "url": ANIMATED_GIF}, photo_file]}]}
+        result = await self.filter.inlet(body, USER, META, self.req)
+        content = result["messages"][0]["content"]
+        self.assertEqual(sum(item.get("type") == "image_url" for item in content), 3)
+        self.assertEqual(result["messages"][0]["files"][-1], photo_file)
+        self.assertEqual(await self.filter.request(result, USER, META, self.req), result)
+
+    async def test_fresh_tool_image_identical_to_sample_is_preserved(self):
+        self.context_mock.return_value = ({}, [ANIMATED_GIF])
+        body = {"messages": [{"role": "user", "content": [part(ANIMATED_GIF)],
+                              "files": [{"type": "image", "url": ANIMATED_GIF}]}]}
+        result = await self.filter.inlet(body, USER, META, self.req)
+        generated = extension.sample_gif(gif())[0]["url"]
+        self.response_mock.return_value = {"call:generate": (generated,)}
+        fresh = {"role": "user", "content": [part(generated)],
+                 "files": [{"type": "image", "url": generated, "name": "generated.jpg"}]}
+        result["messages"].append(fresh)
+        rerun = await self.filter.request(result, USER, META, self.req)
+        self.assertEqual(rerun, result)
+        self.assertEqual(rerun["messages"][-1], fresh)
+
+    async def test_sampled_frames_do_not_leak_into_the_next_turn(self):
+        self.context_mock.return_value = ({}, [ANIMATED_GIF])
+        body = {"messages": [{"role": "user", "content": [part(ANIMATED_GIF)]}]}
+        result = await self.filter.inlet(body, USER, META, self.req)
+        self.context_mock.return_value = ({}, [NEW])
+        later = await self.filter.inlet(result, USER, META, request())
+        self.assertFalse(extension.message_images(later["messages"][0]))
+
+    async def test_nested_gif_samples_keep_native_input_image_shape(self):
+        self.context_mock.return_value = ({}, [ANIMATED_GIF])
+        body = {"messages": [{"role": "user", "content": [part(ANIMATED_GIF)]}]}
+        await self.filter.inlet(body, USER, META, self.req)
+        nested = {"messages": [{"role": "assistant", "output": [
+            {"type": "function_call_output", "output": [
+                {"type": "input_image", "image_url": ANIMATED_GIF}]}]}]}
+        result = await self.filter.request(nested, USER, META, self.req)
+        output = result["messages"][0]["output"][0]["output"]
+        self.assertEqual([item["type"] for item in output],
+                         ["input_image", "input_text", "input_image", "input_text", "input_text"])
+        self.assertEqual(output[-1]["text"], extension.GIF_SAMPLING_NOTICE)
+        self.assertEqual(await self.filter.request(result, USER, META, self.req), result)
+
+    async def test_native_bare_id_gif_attachment_is_substituted(self):
+        self.context_mock.return_value = ({}, [FILE_ID])
+        body = {"model": "mistral-large-4", "messages": [
+            {"role": "user", "content": [part(ANIMATED_GIF)], "files": [
+                {"type": "file", "content_type": "image/gif", "url": FILE_ID, "id": FILE_ID}]}]}
+        with patch.object(extension, "load_source", AsyncMock(return_value=gif())) as load:
+            result = await self.filter.inlet(body, USER, META, self.req)
+            load.assert_awaited_once_with(FILE_ID, "owner")
+        frame = result["messages"][0]["content"][0]["image_url"]["url"]
+        self.assertTrue(frame.startswith("data:image/jpeg;base64,"))
+        self.assertEqual(result["messages"][0]["files"][0]["url"], frame)
+        self.assertEqual(await self.filter.request(body, USER, META, self.req), result)
 
     async def test_current_tool_gif_is_unchanged_even_if_it_matches_upload(self):
         self.context_mock.return_value = ({}, [ANIMATED_GIF])
@@ -557,6 +822,67 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         body = {"messages": [{"role": "user", "content": [part(ANIMATED_GIF)],
                               "files": [{"type": "image", "url": ANIMATED_GIF}]}]}
         self.assertEqual(await self.filter.request(body, USER, META, self.req), body)
+
+    async def test_gif_disclosure_and_metadata_are_request_only_and_idempotent(self):
+        self.context_mock.return_value = ({}, [FILE_ID])
+        attachment = {"type": "file", "content_type": "image/gif", "url": FILE_ID,
+                      "id": FILE_ID, "name": "original-animation.gif", "size": 123,
+                      "file": {"id": FILE_ID, "filename": "original-animation.gif",
+                               "meta": {"content_type": "image/gif"}}}
+        document = {"type": "file", "url": "document-id", "name": "notes.txt"}
+        body = {"model": "mistral-large-4", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "do you see that?"},
+                                         part(ANIMATED_GIF)],
+             "files": [attachment, document]}]}
+        before = copy.deepcopy(body)
+        with patch.object(extension, "load_source", AsyncMock(return_value=gif())):
+            result = await self.filter.inlet(body, USER, META, self.req)
+        message = result["messages"][0]
+        frame = message["content"][1]["image_url"]["url"]
+        group = extension.request_state(self.req, USER, META)["substitutions"][FILE_ID]
+        self.assertEqual(message["files"], [
+            {"type": "image", "content_type": "image/jpeg", "url": sample["url"],
+             "name": f"gif-1-frame-{index}.jpg"}
+            for index, sample in enumerate(group["frames"], 1)] + [document])
+        notice = {"type": "text", "text": extension.GIF_SAMPLING_NOTICE}
+        self.assertEqual(message["content"].count(notice), 1)
+        self.assertNotIn(FILE_ID, json.dumps(result))
+        self.assertNotIn("original-animation.gif", json.dumps(result))
+        self.assertEqual(body, before)
+        for source in (body, result):
+            self.assertEqual(await self.filter.request(source, USER, META, self.req), result)
+        # Native tool-loop reconstruction can drop files and the injected note.
+        rebuilt = {"model": body["model"], "messages": [
+            {"role": "user", "content": [part(frame)]}]}
+        restored = await self.filter.request(rebuilt, USER, META, self.req)
+        self.assertEqual(restored["messages"][0]["content"], message["content"][1:])
+        self.assertEqual(await self.filter.request(restored, USER, META, self.req), restored)
+
+    async def test_multiple_converted_gifs_have_one_notice_and_leave_photo_unchanged(self):
+        other_gif = gif_uri(gif(size=(10, 10)))
+        self.context_mock.return_value = ({}, [ANIMATED_GIF, other_gif, NEW])
+        body = {"model": "mistral", "messages": [
+            {"role": "user", "content": [part(ANIMATED_GIF), part(other_gif), part(NEW)],
+             "files": [{"type": "image", "url": NEW, "name": "photo.png"}]}]}
+        result = await self.filter.inlet(body, USER, META, self.req)
+        self.assertEqual(result["messages"][0]["files"], body["messages"][0]["files"])
+        self.assertIn(part(NEW), result["messages"][0]["content"])
+        self.assertEqual(json.dumps(result).count(extension.GIF_SAMPLING_NOTICE), 1)
+        self.assertEqual(await self.filter.request(result, USER, META, self.req), result)
+
+    async def test_files_only_gif_gets_disclosure_without_mutating_user_text(self):
+        self.context_mock.return_value = ({}, [FILE_ID])
+        body = {"model": "mistral", "messages": [
+            {"role": "user", "content": "look at this", "files": [
+                {"type": "file", "content_type": "image/gif", "url": FILE_ID}]}]}
+        with patch.object(extension, "load_source", AsyncMock(return_value=gif())):
+            result = await self.filter.inlet(body, USER, META, self.req)
+        self.assertEqual(result["messages"][0]["content"][0], {"type": "text", "text": "look at this"})
+        self.assertEqual(len(extension.message_images(result["messages"][0])), 2)
+        self.assertIn({"type": "text", "text": extension.GIF_SAMPLING_NOTICE},
+                      result["messages"][0]["content"])
+        self.assertEqual(body["messages"][0]["content"], "look at this")
+        self.assertEqual(await self.filter.request(result, USER, META, self.req), result)
 
     async def test_static_gif_not_substituted(self):
         self.context_mock.return_value = ({}, [STATIC_GIF])

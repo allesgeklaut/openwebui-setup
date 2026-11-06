@@ -74,8 +74,14 @@ try:
                     'chat_images_synthetic_test', content=tool_code)
                 assert kind == 'filter' and hasattr(function, 'request')
                 assert type(function) is extension.Filter and type(tool) is extension.Tools
-                assert function.valves.gif_first_frame_models == 'mistral'
-                assert function.Valves.model_json_schema()['properties']['gif_first_frame_models']['default'] == 'mistral'
+                assert function.valves.gif_max_frames == 4
+                assert function.valves.max_expanded_images == 16
+                schema = function.Valves.model_json_schema()['properties']
+                assert schema['gif_max_frames']['default'] == 4
+                assert schema['gif_max_frames']['minimum'] == 1
+                assert schema['gif_max_frames']['maximum'] == 4
+                assert 'gif_first_frame_models' not in schema
+                assert function.Valves(gif_first_frame_models='mistral').gif_max_frames == 4
                 specs = get_tool_specs(tool)
                 assert len(specs) == 1 and specs[0]['name'] == 'retrieve_chat_image'
                 assert specs[0]['parameters']['required'] == ['image_ref']
@@ -98,39 +104,73 @@ try:
                         raise AssertionError('Non-owned chat accepted')
 
                 with patch.object(Files, 'get_file_by_id_and_user_id', AsyncMock(return_value=None)) as lookup:
-                    try:
-                        await extension.load_source('/api/v1/files/file-test/content', 'owner')
-                    except ValueError:
-                        pass
-                    else:
-                        raise AssertionError('Non-owned file accepted')
-                    lookup.assert_awaited_once_with('file-test', 'owner')
+                    for source, expected_id in [('/api/v1/files/file-test/content', 'file-test'),
+                                                (fixtures.FILE_ID, fixtures.FILE_ID)]:
+                        lookup.reset_mock()
+                        try:
+                            await extension.load_source(source, 'owner')
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError('Non-owned file accepted')
+                        lookup.assert_awaited_once_with(expected_id, 'owner')
 
                 # Native URL resolution runs before inlet: saved chat metadata
                 # keeps the URL while provider content contains base64 bytes.
                 from open_webui import config
-                gif_url = '/api/v1/files/synthetic-gif/content'
                 gif_path = folder / 'synthetic.gif'
-                gif_path.write_bytes(fixtures.gif())
-                gif_record = SimpleNamespace(id='synthetic-gif', user_id='owner',
+                gif_bytes = fixtures.gif(6, duration=100)
+                gif_path.write_bytes(gif_bytes)
+                gif_record = SimpleNamespace(id=fixtures.FILE_ID, user_id='owner',
                                              path=str(gif_path), meta={'content_type': 'image/gif'})
-                gif_body = {'model': 'deepseek-v4.1-flash-mistral', 'messages': [
-                    {'role': 'user', 'content': [fixtures.part(gif_url)],
-                     'files': [{'type': 'image', 'url': gif_url}]}]}
-                with patch.object(Files, 'get_file_by_id', AsyncMock(return_value=gif_record)):
-                    resolved = await middleware.convert_url_images_to_base64(
-                        gif_body, user=SimpleNamespace(id='owner', role='user'))
-                assert resolved['messages'][0]['content'][0]['image_url']['url'].startswith('data:')
-                with patch.object(config, 'UPLOAD_DIR', folder), \
-                     patch.object(Files, 'get_file_by_id_and_user_id', AsyncMock(return_value=gif_record)), \
-                     patch.object(extension, 'owned_context', AsyncMock(return_value=({}, [gif_url]))), \
-                     patch.object(extension, 'response_images', AsyncMock(return_value={})):
-                    gif_req = fixtures.request()
-                    framed = await function.inlet(resolved, fixtures.USER, fixtures.META, gif_req)
-                    frame = framed['messages'][0]['content'][0]['image_url']['url']
-                    assert frame.startswith('data:image/jpeg;base64,')
-                    assert framed['messages'][0]['files'][0]['url'] == frame
-                    assert await function.request(resolved, fixtures.USER, fixtures.META, gif_req) == framed
+                for gif_url, model in [
+                        (source, model) for source in [f'/api/v1/files/{fixtures.FILE_ID}/content', fixtures.FILE_ID]
+                        for model in ['synthetic-mistral', 'synthetic-vision-model']]:
+                    gif_body = {'model': model, 'messages': [
+                        {'role': 'user', 'content': [fixtures.part(gif_url)],
+                         'files': [{'type': 'file', 'content_type': 'image/gif',
+                                     'id': fixtures.FILE_ID, 'url': gif_url,
+                                     'name': 'synthetic-animation.gif',
+                                     'file': {'id': fixtures.FILE_ID, 'meta': {'content_type': 'image/gif'}}}]}]}
+                    with patch.object(Files, 'get_file_by_id', AsyncMock(return_value=gif_record)):
+                        resolved = await middleware.convert_url_images_to_base64(
+                            gif_body, user=SimpleNamespace(id='owner', role='user'))
+                    assert resolved['messages'][0]['content'][0]['image_url']['url'].startswith('data:')
+                    with patch.object(config, 'UPLOAD_DIR', folder), \
+                         patch.object(Files, 'get_file_by_id_and_user_id', AsyncMock(return_value=gif_record)) as lookup, \
+                         patch.object(extension, 'owned_context', AsyncMock(return_value=({}, [gif_url]))), \
+                         patch.object(extension, 'response_images', AsyncMock(return_value={})):
+                        gif_req = fixtures.request()
+                        framed = await function.inlet(resolved, fixtures.USER, fixtures.META, gif_req)
+                        lookup.assert_awaited_once_with(fixtures.FILE_ID, 'owner')
+                        frame = framed['messages'][0]['content'][0]['image_url']['url']
+                        assert frame.startswith('data:image/jpeg;base64,')
+                        assert framed['messages'][0]['files'][0]['url'] == frame
+                        assert await function.request(resolved, fixtures.USER, fixtures.META, gif_req) == framed
+                        # Exercise native file-context formatting and tool-loop
+                        # reconstruction, not only our intermediate files list.
+                        converted = middleware.process_messages_with_output(
+                            framed['messages'], include_file_context=True)
+                        provider_body = await function.request(
+                            {'model': gif_body['model'], 'messages': converted},
+                            fixtures.USER, fixtures.META, gif_req)
+                        serialized = json.dumps(provider_body)
+                        assert fixtures.FILE_ID not in serialized, 'Original GIF id exposed'
+                        assert 'image/gif' not in serialized, 'Original GIF MIME exposed'
+                        assert '<attached_files>' not in serialized, 'GIF advertised as inspectable file'
+                        assert serialized.count(extension.GIF_SAMPLING_NOTICE) == 1
+                        assert 'synthetic-animation.gif' not in serialized
+                        image_parts = [item for item in provider_body['messages'][0]['content']
+                                       if item.get('type') == 'image_url']
+                        assert len(image_parts) == 4, 'GIF did not expand to four images'
+                        group = extension.request_state(gif_req, fixtures.USER, fixtures.META)['substitutions'][gif_url]
+                        assert [sample['timestamp_ms'] for sample in group['frames']] == [0, 200, 300, 500]
+                        assert frame in serialized
+                        assert await function.request(
+                            provider_body, fixtures.USER, fixtures.META, gif_req) == provider_body
+                        # Fresh native tool images can also use bare file IDs.
+                        keys = await extension.response_source_keys({'call:generate': (gif_url,)}, 'owner')
+                        assert extension.raw_fingerprint(gif_bytes) in keys
 
                 req = fixtures.request()
                 meta = {**fixtures.META, 'chat_id': '00000000-0000-4000-8000-000000000001'}
@@ -221,6 +261,9 @@ try:
                       'next_request_pruning': 'pass', 'provider_calls': 0,
                       'native_image_generation_output': 'pass',
                       'native_gif_upload_roundtrip': 'pass',
+                      'native_bare_file_id': 'pass',
+                      'native_gif_disclosure_and_file_context': 'pass',
+                      'native_four_frame_sampling_all_models': 'pass',
                       'installed_entries': 'pass' if installed else 'not_checked',
                       'registered_extensions': 0}
     original_stdout.write(json.dumps(result) + '\n')
