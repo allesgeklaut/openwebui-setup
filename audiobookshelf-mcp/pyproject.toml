@@ -7,7 +7,7 @@ requires-python = ">=3.14"
 dependencies = [
     "httpx==0.28.1",
     "mcp==1.30.0",
-    "pydantic==2.14.1",
+    "pydantic==2.14.2",
 ]
 
 [project.scripts]
