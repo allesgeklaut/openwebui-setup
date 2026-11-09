@@ -39,15 +39,28 @@
       "models": {
         "deepseek-v4-1-flash-1017": {
           "capabilities": { "input": ["text", "image"] },
-          "limit": { "input": 307200 }
+          "limit": { "input": 307200 },
+          "settings": { "reasoningEffort": "max" }
         },
-        "zai-glm-5-3": { "limit": { "input": 307200 } },
+        "mistral-large-4": {
+          "capabilities": { "input": ["text", "image"] },
+          "limit": { "input": 307200 },
+          "settings": { "reasoningEffort": "high" }
+        },
+        "zai-glm-5-3": {
+          "limit": { "input": 307200 },
+          "settings": { "reasoningEffort": "max" }
+        },
         "zai-glm-5-3-longctx": {
           "modelID": "zai-glm-5-3",
           "name": "Z.ai GLM 5.3 (long ctx)",
-          "limit": { "input": 607200 }
+          "limit": { "input": 607200 },
+          "settings": { "reasoningEffort": "max" }
         },
-        "zai-glm-5-3-flash": { "limit": { "input": 307200 } }
+        "zai-glm-5-3-flash": {
+          "limit": { "input": 307200 },
+          "settings": { "reasoningEffort": "max" }
+        }
       }
     }
   },
