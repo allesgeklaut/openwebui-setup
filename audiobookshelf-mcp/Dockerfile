@@ -3,7 +3,7 @@
 # virtual environment and source into the runtime image. The project itself is
 # never built or installed, and no package manager runs at runtime.
 
-FROM python:3.14.9-slim@sha256:35caba83af2fe6da9a5d922f9b0156f21d1246a48278c58a08bd253303ba42e8 AS builder
+FROM python:3.14.10-slim@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:0.12.1@sha256:cf4eedcaa81655197f625739489effcbe71b61ceb1506f332c3facae5deceded /uv /uvx /bin/
 
@@ -18,7 +18,16 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project --no-build
 
 
-FROM python:3.14.9-slim@sha256:35caba83af2fe6da9a5d922f9b0156f21d1246a48278c58a08bd253303ba42e8
+FROM python:3.14.10-slim@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
+
+# Apply Debian security updates at build time: the digest-pinned base image
+# lags behind trixie-security (e.g. zlib1g deb13u1 was published after the
+# pinned image was built), and the weekly CI rebuild + Trivy scan relies on
+# this step to pick up such fixes. Python dependencies stay locked via
+# uv.lock; only OS packages float with the Debian security archive.
+RUN apt-get update \
+    && apt-get -y upgrade \
+    && rm -rf /var/lib/apt/lists/*
 
 # No system pip is needed at runtime: dependencies are installed into the
 # copied virtual environment at build time. Removing pip, its shims, and the
