@@ -1,6 +1,6 @@
 services:
   open-webui:
-    image: ghcr.io/open-webui/open-webui:v0.13.0
+    image: ghcr.io/open-webui/open-webui:v0.13.3
     container_name: open-webui
     restart: unless-stopped
     ports:
@@ -169,13 +169,22 @@ services:
   # that removed it, plus restoring the audio.tts.* config rows (README).
 
   open-terminal:
-    image: ghcr.io/open-webui/open-terminal:0.16.0
+    image: ghcr.io/open-webui/open-terminal:0.17.6
     container_name: open-terminal
     restart: unless-stopped
     env_file:
       - /opt/secrets/webui.env
+    environment:
+      - OPEN_TERMINAL_OPENCODE_COMMAND=/home/user/.local/bin/opencode
     volumes:
       - /opt/stacks/webui/terminal:/home/user
+      # Runtime metadata stays writable in the terminal home; managed files do not.
+      - ./opencode/config/opencode.json:/home/user/.config/opencode/opencode.json:ro
+      - ./opencode/config/AGENTS.md:/home/user/.config/opencode/AGENTS.md:ro
+      - ./opencode/config/agents:/home/user/.config/opencode/agents:ro
+      # Only selected files are discovered via config/agents symlinks.
+      - /opt/stacks/.opencode/agents:/opt/opencode/agents:ro
+      - /opt/stacks/.opencode/session-model-plugin:/opt/opencode/session-model-plugin:ro
 
   tika:
     image: apache/tika:latest
