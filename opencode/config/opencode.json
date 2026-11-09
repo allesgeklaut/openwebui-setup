@@ -2,6 +2,9 @@
   "$schema": "https://opencode.ai/config.json",
   "update": "disable",
   "default_agent": "build",
+  "websearch": {
+    "provider": "random"
+  },
   "policies": [
     { "action": "provider.use", "resource": "*", "effect": "deny" },
     { "action": "provider.use", "resource": "mistral", "effect": "allow" }
