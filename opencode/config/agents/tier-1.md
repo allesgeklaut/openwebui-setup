@@ -1,0 +1,1 @@
+/opt/opencode/agents/tier-1.md

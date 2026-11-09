@@ -1,0 +1,1 @@
+/opt/opencode/agents/alloy.md

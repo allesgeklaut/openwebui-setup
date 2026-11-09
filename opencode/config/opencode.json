@@ -1,0 +1,74 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "update": "disable",
+  "default_agent": "build",
+  "policies": [
+    { "action": "provider.use", "resource": "*", "effect": "deny" },
+    { "action": "provider.use", "resource": "mistral", "effect": "allow" }
+  ],
+  "plugins": [
+    {
+      "package": "/opt/opencode/session-model-plugin",
+      "options": {
+        "agents": ["alloy"],
+        "models": ["mistral/*"]
+      }
+    }
+  ],
+  "providers": {
+    "opencode-go": {
+      "models": {
+        "claude-haiku-5-5": { "limit": { "input": 106496 } },
+        "gpt-5.6-luna": { "limit": { "input": 255616 } },
+        "gpt-6-luna": { "limit": { "input": 255616 } },
+        "deepseek-v4.1-flash": { "limit": { "input": 262144 } },
+        "glm-5.3-flash": { "limit": { "input": 262144 } },
+        "qwen3.8-flash": { "limit": { "input": 262144 } }
+      }
+    },
+    "openai": {
+      "models": {
+        "gpt-6.1-sol": { "limit": { "input": 278528 } },
+        "gpt-6-luna": { "limit": { "input": 278528 } }
+      }
+    },
+    "mistral": {
+      "models": {
+        "deepseek-v4-1-flash-1017": {
+          "capabilities": { "input": ["text", "image"] },
+          "limit": { "input": 307200 }
+        },
+        "zai-glm-5-3": { "limit": { "input": 307200 } },
+        "zai-glm-5-3-longctx": {
+          "modelID": "zai-glm-5-3",
+          "name": "Z.ai GLM 5.3 (long ctx)",
+          "limit": { "input": 607200 }
+        },
+        "zai-glm-5-3-flash": { "limit": { "input": 307200 } }
+      }
+    }
+  },
+  "permissions": [
+    { "action": "shell", "resource": "*", "effect": "ask" },
+    { "action": "shell", "resource": "pwd", "effect": "allow" },
+    { "action": "shell", "resource": "git status *", "effect": "allow" },
+    { "action": "shell", "resource": "git diff *", "effect": "allow" },
+    { "action": "shell", "resource": "git diff *--out*", "effect": "ask" },
+    { "action": "shell", "resource": "git diff *--ext*", "effect": "ask" },
+    { "action": "shell", "resource": "git diff *--textc*", "effect": "ask" },
+    { "action": "shell", "resource": "git diff *--no-ind*", "effect": "ask" },
+    { "action": "shell", "resource": "git diff *-O*", "effect": "ask" },
+    { "action": "shell", "resource": "sudo *", "effect": "deny" },
+    { "action": "external_directory", "resource": "*", "effect": "ask" },
+    { "action": "read", "resource": "*.env", "effect": "ask" },
+    { "action": "read", "resource": "*.env.*", "effect": "ask" },
+    { "action": "read", "resource": "*.env.example", "effect": "allow" },
+    { "action": "read", "resource": "~/.ssh/*", "effect": "deny" },
+    { "action": "edit", "resource": "~/.ssh/*", "effect": "deny" },
+    { "action": "read", "resource": "~/.local/share/opencode/*", "effect": "deny" },
+    { "action": "edit", "resource": "~/.local/share/opencode/*", "effect": "deny" },
+    { "action": "edit", "resource": "~/.local/bin/*", "effect": "deny" },
+    { "action": "edit", "resource": "~/.local/share/opencode-cli/*", "effect": "deny" },
+    { "action": "edit", "resource": "~/.config/opencode/*", "effect": "deny" }
+  ]
+}
