@@ -329,9 +329,16 @@ engines:
   # The same keyless backends OpenCode v2's WebSearch service uses. They
   # need no API key and no signup; each is a courtesy quota on shared
   # infrastructure, so a 429 is possible and SearXNG suspends the engine
-  # temporarily. Unlike the scraping engines (bing, duckduckgo, google,
-  # brave, startpage, mojeek, ...) they never serve captchas and cannot
-  # get this host's IP banned.
+  # temporarily. Together with the keyed exaapi they form the ban-proof
+  # API backbone of the fan-out: plain API calls, no captchas, no IP
+  # bans, clean HTTP-status failures.
+  #
+  # Layered on top (below in this file) are best-effort scraping engines
+  # (duckduckgo, startpage, brave, mojeek): they rate-limit/captcha under
+  # machine-paced traffic and SearXNG auto-suspends them (captcha -> 7
+  # days, 429 -> minutes, in-memory), so they contribute whenever they
+  # are healthy and get out of the way when banned. Bing and google stay
+  # off entirely (never requested / worst ban profile).
   #
   # exa keyless: MCP endpoint mcp.exa.ai (no key). The keyed `exaapi`
   # engine above stays the primary Exa backend; this one is the no-key
@@ -372,6 +379,27 @@ engines:
     categories: [news]
     tinyfish_categ: news
     timeout: 15.0
+
+  # web scout: the stack's own Mistral-agent-backed search (research-search
+  # service, POST /search). Consolidates every backend into SearXNG: each
+  # search runs one Web Scout agent conversation that harvests Mistral's
+  # web_search results. Billed per search (Mistral API) and slow (an agent
+  # round-trip, seconds) — unlike the flat/free API engines above — so it
+  # ships disabled: select it with !scout when Mistral-sourced results are
+  # wanted, or flip disabled to false to add it to the default fan-out.
+  # Token: __SCOUT_TOKEN__ placeholder, injected by entrypoint-wrapper.sh
+  # from /opt/secrets/research-search.token (same pattern as __EXA_API_KEY__).
+  # enable_http: the default network is https-only; research-search is a
+  # plain-http internal service, so this engine opts into http.
+  - name: web scout
+    engine: webscout
+    shortcut: scout
+    api_key: __SCOUT_TOKEN__
+    categories: [general]
+    results_per_page: 10
+    disabled: true
+    enable_http: true
+    timeout: 25.0
 
   - name: 360search
     engine: 360search
@@ -884,7 +912,12 @@ engines:
   - name: duckduckgo
     engine: duckduckgo
     shortcut: ddg
-    inactive: true  # CAPTCHA/crash-banned 2026-11-01 under machine-paced traffic; engines-param-proof
+    # Best-effort contributor (2026-11-10): still anomaly/captcha-banned from
+    # the 2026-11-01 machine-traffic ban, but DDG bans lift — SearXNG suspends
+    # the engine on captcha (7 days, in-memory) and it contributes again
+    # whenever the ban clears. The API backbone (exaapi + keyless) keeps
+    # results flowing regardless.
+    inactive: false
 
   - name: duckduckgo images
     engine: duckduckgo_extra
@@ -2106,7 +2139,12 @@ engines:
     shortcut: sp
     startpage_categ: web
     categories: [general, web]
-    inactive: true  # CAPTCHA-banned 2026-11-01 under machine-paced traffic; engines-param-proof
+    # Best-effort contributor (2026-11-10): probe shows the 2026-11-01
+    # captcha ban has lifted (clean 200s). Google-backed results — the
+    # highest-quality scraping engine here. Will re-ban under machine-paced
+    # bursts; SearXNG's captcha suspension (7 days, in-memory) keeps it out
+    # of the way until then.
+    inactive: false
 
   - name: startpage news
     engine: startpage
@@ -2509,7 +2547,12 @@ engines:
     inactive: true
 
   - name: mojeek
-    disabled: true
+    # Best-effort contributor (2026-11-10): independent index (own crawler,
+    # genuinely different results) but re-bans fast under machine-paced
+    # traffic — captcha-walled again at the moment. SearXNG's captcha
+    # suspension keeps it out of the way; it contributes in the windows
+    # where it is healthy.
+    disabled: false
     shortcut: mjk
     engine: mojeek
     categories: [general, web]
@@ -2774,7 +2817,11 @@ engines:
     paging: true
     categories: [general, web]
     brave_category: search
-    disabled: true  # 429 rate-limit-banned 2026-11-01. NOT inactive: brave.images/videos need network: brave; selected via engines param it 429s loudly.
+    # Best-effort contributor (2026-11-10): 429-banned at the moment, but
+    # brave bans are shorter-lived than DDG's; contributes between bursts.
+    # NOT inactive: brave.images/videos need network: brave; selected via
+    # engines param it 429s loudly.
+    disabled: false  # was: true, 429 rate-limit-banned 2026-11-01
     # brave_spellcheck: true
 
   - name: brave.images

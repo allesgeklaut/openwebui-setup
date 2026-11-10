@@ -110,10 +110,14 @@ starts/recreates the stack. Do not edit the generated secret config directly.
 
 Privacy-respecting metasearch engine. Configuration is in [`searxng/config/settings.yml`](searxng/config/settings.yml).
 
-The general/news fan-out is API-only: the keyed `exaapi` engine (Exa key from
-`/opt/secrets/exa.key`) is the primary source, and keyless backends add breadth
-without keys, signup, captchas or IP bans:
+The fan-out is layered: a ban-proof **API backbone** plus **best-effort
+scraping engines** that contribute whenever they are healthy.
 
+API backbone (always-on; plain API calls, no captchas, no IP bans, clean
+HTTP-status failures):
+
+- `exaapi` — the keyed Exa API (key from `/opt/secrets/exa.key`), the primary
+  source.
 - `exa keyless` — Exa's MCP endpoint (`mcp.exa.ai`), the same keyless mode
   OpenCode v2's WebSearch uses.
 - `tinyfish keyless` / `tinyfish news` — TinyFish's MCP endpoint
@@ -122,13 +126,22 @@ without keys, signup, captchas or IP bans:
   ships **disabled**: its keyless quota is a small shared courtesy cap that
   light testing exhausted within a few calls (HTTP 429, ~15–20 min cooldown).
   Select it with `!tvl`, or flip `disabled: false` to add it to the fan-out.
+- `web scout` (`!scout`) — the stack's own Mistral-agent-backed search (the
+  `research-search` service): one Web Scout agent conversation per search.
+  It consolidates every backend into SearXNG, but each search is billed
+  (Mistral API) and slow (an agent round-trip), so it also ships **disabled**;
+  select it with `!scout` when Mistral-sourced results are wanted. Its
+  bearer token comes from `/opt/secrets/research-search.token` via the
+  `__SCOUT_TOKEN__` placeholder (same injection pattern as the Exa key).
 
-The scraping engines (bing, duckduckgo, google, brave, startpage, mojeek, …)
-stay disabled/inactive: under machine-paced traffic they serve captchas and ban
-the host IP. The keyless engines are plain API calls, so they fail as clean HTTP
-status codes instead.
+Best-effort scrapers (duckduckgo, startpage, brave, mojeek): independent or
+Google-backed indexes that rate-limit and captcha under machine-paced traffic.
+SearXNG auto-suspends them when they do (captcha → 7 days, 429 → minutes,
+in-memory), so they contribute whenever they are healthy and get out of the
+way when banned — the API backbone keeps results flowing regardless. Bing and
+google stay off entirely.
 
-`searxng/engines/` holds the three small SearXNG engine modules; compose mounts
+`searxng/engines/` holds the four small SearXNG engine modules; compose mounts
 them individually into the image's `searx/engines/` directory (SearXNG loads an
 engine by file name, and mounting a directory would shadow the bundled engines).
 Note: SearXNG exits at startup if an engine module fails to *import*, so after a
@@ -362,10 +375,11 @@ Other services run internally and are not exposed.
 ├── searxng/
 │   ├── config/
 │   │   └── settings.yml      # SearXNG configuration
-│   └── engines/              # Keyless-API engine modules (mounted individually)
+│   └── engines/              # Keyless-API + Web Scout engine modules (mounted individually)
 │       ├── exa_keyless.py
 │       ├── tavily_keyless.py
-│       └── tinyfish_keyless.py
+│       ├── tinyfish_keyless.py
+│       └── webscout.py
 ├── research-search/         # Web search + URL fetch via the Mistral "Web Scout" agent
 │   ├── app.py               # stdlib HTTP adapter (search + fetch contracts)
 │   ├── test_app.py          # unit tests for the parsing helpers

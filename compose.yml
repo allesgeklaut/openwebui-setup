@@ -241,15 +241,19 @@ services:
       - UWSGI_THREADS=4
     volumes:
       - /opt/stacks/webui/searxng/config:/etc/searxng
-      # Keyless-API engine modules (Exa/Tavily/TinyFish). SearXNG loads an
+      # Keyless-API engine modules (Exa/Tavily/TinyFish) plus the Web Scout
+      # engine (Mistral agent via research-search). SearXNG loads an
       # engine module by file name from its package engines/ directory, so
       # the repo files are mounted individually, read-only.
       - /opt/stacks/webui/searxng/engines/exa_keyless.py:/usr/local/searxng/searx/engines/exa_keyless.py:ro
       - /opt/stacks/webui/searxng/engines/tavily_keyless.py:/usr/local/searxng/searx/engines/tavily_keyless.py:ro
       - /opt/stacks/webui/searxng/engines/tinyfish_keyless.py:/usr/local/searxng/searx/engines/tinyfish_keyless.py:ro
-      # Single source of truth for the Exa key — read-only, consumed by
-      # the entrypoint wrapper, never written anywhere.
+      - /opt/stacks/webui/searxng/engines/webscout.py:/usr/local/searxng/searx/engines/webscout.py:ro
+      # Single source of truth for the Exa key and the research-search
+      # bearer token — read-only, consumed by the entrypoint wrapper,
+      # never written anywhere.
       - /opt/secrets/exa.key:/run/secrets/exa.key:ro
+      - /opt/secrets/research-search.token:/run/secrets/research-search.token:ro
       # Named (not the image's anonymous volume) so the one-time chown
       # survives container recreates; chowned to 1000 via a one-off root
       # container after creation.
