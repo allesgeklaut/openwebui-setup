@@ -10,7 +10,7 @@ Only trusted, administrator-reviewed Python code belongs here.
   [installation/deployment documentation](chat-images/README.md).
 - `searxng_image_search/` — runtime implementation of the image-search tool.
 - `searxng-images/` — its registration entry, tests and
-  [installation/review documentation](searxng-images/README.md).
+  [installation documentation](searxng-images/README.md).
 
 Mounting code does **not** register or activate extensions. Native Function/Tool
 entries are stored by Open WebUI in its database and import the runtime package.

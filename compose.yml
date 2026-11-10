@@ -87,20 +87,9 @@ services:
       - searxng
       - research-search
 
-  # Mistral-agent-backed web search + URL fetch. Serves BOTH of Open WebUI's
-  # `external` contracts from one process: POST /search {query,count} ->
-  # [{link,title,snippet}] and POST /fetch {urls} -> [{page_content,
-  # metadata}]. Both run the "Web Scout" Mistral Studio agent (web_search),
-  # which only runs the searches / opens the URL and replies
-  # "DONE"; this adapter harvests the raw tool results. Replaces the Exa
-  # search engine + exa-loader so all web access goes through Mistral (EU).
-  # Mistral-only by design: no direct HTTP fetching, so target sites never
-  # see this server's IP and there is no outbound-fetch/SSRF surface here.
-  # Pages truncated by Mistral's 32768-char tool cap are flagged
-  # (metadata.truncated + note in page_content). Refused opens
-  # (can_open=false, e.g. robots.txt-banned instagram.com) are fetch
-  # failures — SERP fallback, then 502 — never returned as page text.
-  # Internal only: no ports.
+  # Optional Mistral Web Scout backend for SearXNG's !scout engine.
+  # Also provides /fetch for Open WebUI's external-loader option.
+  # Current defaults are SearXNG search + Open WebUI's direct HTTP loader.
   research-search:
     build: ./research-search
     image: research-search:local
@@ -113,10 +102,7 @@ services:
       - RESEARCH_TOKEN_FILE=/run/secrets/research-search.token
       - SCOUT_AGENT_ID=${SCOUT_AGENT_ID}
       - PORT=8080
-      # Each result page fetch is one scout conversation. 8-wide: with
-      # web.search.result_count=10 in OpenWebUI, the forced pipeline's 10
-      # pages fetch as one 8-wide round + a short 2-fetch tail (native-FC
-      # fetch_url calls are single-URL, unaffected by this).
+      # Per-request fetch parallelism when the external loader is selected.
       - FETCH_WORKERS=8
     volumes:
       - /opt/secrets/mistral.env:/run/secrets/mistral.env:ro
@@ -131,15 +117,8 @@ services:
       timeout: 10s
       retries: 3
 
-  # External web loader exa-loader: REMOVED when web search + URL fetch
-  # moved to the Mistral-backed research-search service (all web access via
-  # Mistral, no US search provider in the loop). Rollback = git revert of the
-  # commit that removed it, plus restoring the web.search.*/web.loader.* config
-  # rows from data/backups/config-web-backup-2026-10-20.json (README).
-
-  # Translates Open WebUI's native ComfyUI protocol (ws + /prompt + /history +
-  # /view) into RunPod serverless calls so the flux1-dev endpoint can serve
-  # image *generation*. Local ComfyUI on 8188 stays in charge of image *edit*.
+  # Optional ComfyUI-protocol bridge to RunPod serverless generation/editing.
+  # Local ComfyUI serves both by default.
   runpod-bridge:
     build: ./runpod-bridge
     image: runpod-bridge:local
@@ -163,10 +142,6 @@ services:
       - |
         export RUNPOD_API_KEY="$$(cat /run/secrets/runpod.key)"
         exec python app.py
-
-  # Kokoro-FastAPI TTS: removed when voice chat switched to Mistral Voxtral
-  # via litellm (see AUDIO_TTS_* above). Rollback = git revert of the commit
-  # that removed it, plus restoring the audio.tts.* config rows (README).
 
   open-terminal:
     image: ghcr.io/open-webui/open-terminal:0.17.6
@@ -227,10 +202,8 @@ services:
     # skips the chown (benign ownership warning) and the config dir stays
     # johannes-owned and normally editable.
     user: "1000:1000"
-    # The repo's settings.yml carries only the __EXA_API_KEY__ placeholder;
-    # entrypoint-wrapper.sh injects the real key from the mounted secret
-    # into a container-local copy at startup — the key never lives
-    # anywhere but /opt/secrets (litellm/mistral.env pattern).
+    # Wrapper injects Exa/Scout placeholders into private container settings
+    # and exports the signing secret from read-only /run/secrets mounts.
     entrypoint: ["/bin/sh", "/etc/searxng/entrypoint-wrapper.sh"]
     ports:
       - "8081:8080"
@@ -249,10 +222,9 @@ services:
       - /opt/stacks/webui/searxng/engines/tavily_keyless.py:/usr/local/searxng/searx/engines/tavily_keyless.py:ro
       - /opt/stacks/webui/searxng/engines/tinyfish_keyless.py:/usr/local/searxng/searx/engines/tinyfish_keyless.py:ro
       - /opt/stacks/webui/searxng/engines/webscout.py:/usr/local/searxng/searx/engines/webscout.py:ro
-      # Single source of truth for the Exa key, the research-search bearer
-      # token and the SearXNG signing secret — read-only, consumed by the
-      # entrypoint wrapper, never written anywhere (so the secret also
-      # never appears in `docker inspect` container env).
+      # Read-only source secrets. Wrapper writes Exa/Scout values to private
+      # container-local settings and exports the signing secret; none are
+      # configured as plaintext Compose environment values.
       - /opt/secrets/exa.key:/run/secrets/exa.key:ro
       - /opt/secrets/research-search.token:/run/secrets/research-search.token:ro
       - /opt/secrets/searxng.secret:/run/secrets/searxng.secret:ro

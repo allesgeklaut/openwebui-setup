@@ -4,9 +4,13 @@ Open WebUI's native ComfyUI engine only speaks real-ComfyUI protocol
 (WebSocket + `/prompt` + `/history` + `/view`), while the RunPod serverless
 endpoint (`worker-comfyui`) exposes `/runsync` + `/status` and returns base64
 images. This tiny aiohttp bridge translates between the two, so Open WebUI can
-use the RunPod endpoint as if it were a local ComfyUI server — **generation
-only** (the local ComfyUI on `<your-LAN-IP>:8188` stays configured for image
-*editing*).
+use a RunPod endpoint as if it were a local ComfyUI server. It is optional:
+the default stack uses local ComfyUI for both generation and editing.
+
+Enable with `docker compose --profile runpod up -d runpod-bridge`, then select
+`http://runpod-bridge:8190` in Open WebUI's image settings. An optional
+`RUNPOD_ENDPOINT_ID_EDIT` routes edits to a separate endpoint; otherwise both
+use `RUNPOD_ENDPOINT_ID`.
 
 ## How it works
 
@@ -77,6 +81,5 @@ PY
 - RunPod outputs expire after ~30 min; the bridge caches base64 in memory
   (`MAX_STORED_PROMPTS`) but there is no persistence — old generations are
   gone after a bridge restart.
-- Open WebUI reads `image_generation.*` from its config DB live on every
-  request; env vars only seed keys that don't exist yet. Changing the backend
-  via SQL or admin UI needs no container restart.
+- Persisted Open WebUI image settings override environment defaults. Change
+  them through the administration UI/API, not direct database writes.
