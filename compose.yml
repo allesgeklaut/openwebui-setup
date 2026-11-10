@@ -237,6 +237,12 @@ services:
     environment:
       - SEARXNG_BASE_URL=http://${LAN_IP}:8081/
       - SEARXNG_VALKEY_URL=valkey://searxng-valkey:6379/0
+      # Real signing secret from .env (gitignored); generated 2026-11-10.
+      # Before this the instance ran with the literal "${SEARXNG_SECRET}"
+      # placeholder string as its key (the env var was never defined).
+      # SearXNG's schema overrides server.secret_key from this env var
+      # (settings_defaults.py: environ_name='SEARXNG_SECRET').
+      - SEARXNG_SECRET=${SEARXNG_SECRET}
       - UWSGI_WORKERS=2
       - UWSGI_THREADS=4
     volumes:

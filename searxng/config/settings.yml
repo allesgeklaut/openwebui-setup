@@ -2146,20 +2146,6 @@ engines:
     shortcut: tm
     disabled: true
 
-  # Requires Tor
-  - name: torch
-    engine: xpath
-    paging: true
-    search_url:
-      http://xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd.onion/cgi-bin/omega/omega?P={query}&DEFAULTOP=and
-    results_xpath: //table//tr
-    url_xpath: ./td[2]/a
-    title_xpath: ./td[2]/b
-    content_xpath: ./td[2]/small
-    categories: onions
-    enable_http: true
-    shortcut: tch
-
   # TubeArchivist is a self-hosted Youtube archivist software.
   # https://docs.searxng.org/dev/engines/online/tubearchivist.html
   #
