@@ -65,6 +65,8 @@ def request(query: str, params: "OnlineParams") -> None:
 def response(resp: SXNG_Response) -> EngineResults:
     res = EngineResults()
     for item in resp.json() or []:
+        if not isinstance(item, dict):
+            continue
         url = item.get("link")
         if not url:
             continue

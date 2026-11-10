@@ -13,8 +13,13 @@
 # generated copy instead of the placeholder template.
 set -eu
 
-K="$(cat /run/secrets/exa.key)"
-S="$(cat /run/secrets/research-search.token)"
+# Escape sed metacharacters in the secrets (& is the replacement text in sed,
+# | is our delimiter) so a secret containing them cannot corrupt the
+# generated settings file.
+escape() { printf '%s' "$1" | sed 's/[&|\\]/\\&/g'; }
+
+K="$(escape "$(cat /run/secrets/exa.key)")"
+S="$(escape "$(cat /run/secrets/research-search.token)")"
 sed -e "s|__EXA_API_KEY__|$K|" -e "s|__SCOUT_TOKEN__|$S|" \
   /etc/searxng/settings.yml > /tmp/searxng-settings.yml
 export SEARXNG_SETTINGS_PATH=/tmp/searxng-settings.yml

@@ -110,10 +110,11 @@ starts/recreates the stack. Do not edit the generated secret config directly.
 
 Privacy-respecting metasearch engine. Configuration is in [`searxng/config/settings.yml`](searxng/config/settings.yml).
 
-The fan-out is layered: a ban-proof **API backbone** plus **best-effort
-scraping engines** that contribute whenever they are healthy.
+The fan-out is layered: a ban-proof **API backbone** that is always on,
+**opt-in engines** you select per query, and **best-effort scraping engines**
+that contribute whenever they are healthy.
 
-API backbone (always-on; plain API calls, no captchas, no IP bans, clean
+API backbone (always on; plain API calls, no captchas, no IP bans, clean
 HTTP-status failures):
 
 - `exaapi` — the keyed Exa API (key from `/opt/secrets/exa.key`), the primary
@@ -122,24 +123,27 @@ HTTP-status failures):
   OpenCode v2's WebSearch uses.
 - `tinyfish keyless` / `tinyfish news` — TinyFish's MCP endpoint
   (`agent.tinyfish.ai/mcp`), web and news indexes.
-- `tavily keyless` — Tavily's `X-Tavily-Access-Mode: keyless` REST mode. It
-  ships **disabled**: its keyless quota is a small shared courtesy cap that
-  light testing exhausted within a few calls (HTTP 429, ~15–20 min cooldown).
-  Select it with `!tvl`, or flip `disabled: false` to add it to the fan-out.
+
+Opt-in engines (registered but off the default fan-out; select with their
+shortcut, e.g. `!scout`, or flip `disabled: false` to make them default):
+
 - `web scout` (`!scout`) — the stack's own Mistral-agent-backed search (the
   `research-search` service): one Web Scout agent conversation per search.
   It consolidates every backend into SearXNG, but each search is billed
-  (Mistral API) and slow (an agent round-trip), so it also ships **disabled**;
-  select it with `!scout` when Mistral-sourced results are wanted. Its
-  bearer token comes from `/opt/secrets/research-search.token` via the
-  `__SCOUT_TOKEN__` placeholder (same injection pattern as the Exa key).
+  (Mistral API) and slow (an agent round-trip). Its bearer token comes from
+  `/opt/secrets/research-search.token` via the `__SCOUT_TOKEN__` placeholder
+  (same injection pattern as the Exa key).
+- `tavily keyless` (`!tvl`) — Tavily's `X-Tavily-Access-Mode: keyless` REST
+  mode. Its keyless quota is a small shared courtesy cap that light testing
+  exhausted within a few calls (HTTP 429, ~15–20 min cooldown).
 
 Best-effort scrapers (duckduckgo, startpage, brave, mojeek): independent or
 Google-backed indexes that rate-limit and captcha under machine-paced traffic.
-SearXNG auto-suspends them when they do (captcha → 7 days, 429 → minutes,
-in-memory), so they contribute whenever they are healthy and get out of the
-way when banned — the API backbone keeps results flowing regardless. Bing and
-google stay off entirely.
+SearXNG auto-suspends them when they do (captcha or access-denied → 1 day,
+429 → 1 minute, in-memory — see `suspended_times` in the settings), so they
+contribute whenever they are healthy and get out of the way when banned —
+the API backbone keeps results flowing regardless. Bing and google stay off
+entirely.
 
 `searxng/engines/` holds the four small SearXNG engine modules; compose mounts
 them individually into the image's `searx/engines/` directory (SearXNG loads an
