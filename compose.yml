@@ -241,6 +241,12 @@ services:
       - UWSGI_THREADS=4
     volumes:
       - /opt/stacks/webui/searxng/config:/etc/searxng
+      # Keyless-API engine modules (Exa/Tavily/TinyFish). SearXNG loads an
+      # engine module by file name from its package engines/ directory, so
+      # the repo files are mounted individually, read-only.
+      - /opt/stacks/webui/searxng/engines/exa_keyless.py:/usr/local/searxng/searx/engines/exa_keyless.py:ro
+      - /opt/stacks/webui/searxng/engines/tavily_keyless.py:/usr/local/searxng/searx/engines/tavily_keyless.py:ro
+      - /opt/stacks/webui/searxng/engines/tinyfish_keyless.py:/usr/local/searxng/searx/engines/tinyfish_keyless.py:ro
       # Single source of truth for the Exa key — read-only, consumed by
       # the entrypoint wrapper, never written anywhere.
       - /opt/secrets/exa.key:/run/secrets/exa.key:ro

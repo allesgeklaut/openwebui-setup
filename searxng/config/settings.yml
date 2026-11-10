@@ -324,6 +324,55 @@ engines:
     content_max_characters: 500
     inactive: false
     categories: [general, news]
+
+  # --- Keyless web-search APIs (added 2026-11-10) -----------------------
+  # The same keyless backends OpenCode v2's WebSearch service uses. They
+  # need no API key and no signup; each is a courtesy quota on shared
+  # infrastructure, so a 429 is possible and SearXNG suspends the engine
+  # temporarily. Unlike the scraping engines (bing, duckduckgo, google,
+  # brave, startpage, mojeek, ...) they never serve captchas and cannot
+  # get this host's IP banned.
+  #
+  # exa keyless: MCP endpoint mcp.exa.ai (no key). The keyed `exaapi`
+  # engine above stays the primary Exa backend; this one is the no-key
+  # fallback and duplicate URLs are deduplicated by SearXNG.
+  - name: exa keyless
+    engine: exa_keyless
+    shortcut: exak
+    categories: [general]
+    results_per_page: 10
+    timeout: 15.0
+
+  # tavily keyless: REST API with X-Tavily-Access-Mode: keyless. Its keyless
+  # mode is a small shared courtesy cap — light testing exhausted it within
+  # a few calls (HTTP 429 daily_cap_reached, ~15-20 min retry-after), after
+  # which it 429s for a while. Kept off the default fan-out so searches do
+  # not burn the cap and surface a permanent "unresponsive_engines" entry;
+  # select it explicitly with !tvl, or flip disabled to false to add it to
+  # the fan-out (a real Tavily API key in the module would remove the cap).
+  - name: tavily keyless
+    engine: tavily_keyless
+    shortcut: tvl
+    categories: [general, news]
+    disabled: true
+    timeout: 15.0
+
+  # tinyfish keyless: MCP endpoint agent.tinyfish.ai/mcp. Two instances:
+  # the web index for general, the news index for the news tab.
+  - name: tinyfish keyless
+    engine: tinyfish_keyless
+    shortcut: tfk
+    categories: [general]
+    tinyfish_categ: web
+    timeout: 15.0
+
+  - name: tinyfish news
+    engine: tinyfish_keyless
+    shortcut: tfn
+    categories: [news]
+    tinyfish_categ: news
+    timeout: 15.0
+
   - name: 360search
     engine: 360search
     shortcut: 360so
@@ -1484,6 +1533,9 @@ engines:
     engine: mwmbl
     # api_url: https://api.mwmbl.org
     shortcut: mwm
+    # Keyless JSON API, no captchas, but the index is small and noisy
+    # (75 mostly-irrelevant hits for a normal query), so it stays out of
+    # the default fan-out. Select it explicitly with !mwm when wanted.
     disabled: true
 
   - name: niconico

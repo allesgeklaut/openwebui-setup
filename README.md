@@ -108,7 +108,33 @@ starts/recreates the stack. Do not edit the generated secret config directly.
 
 ### SearXNG (`searxng/`)
 
-Privacy-respecting metasearch engine. Configuration is in [`searxng/config/settings.yml`](searxng/config/settings.yml ).
+Privacy-respecting metasearch engine. Configuration is in [`searxng/config/settings.yml`](searxng/config/settings.yml).
+
+The general/news fan-out is API-only: the keyed `exaapi` engine (Exa key from
+`/opt/secrets/exa.key`) is the primary source, and keyless backends add breadth
+without keys, signup, captchas or IP bans:
+
+- `exa keyless` — Exa's MCP endpoint (`mcp.exa.ai`), the same keyless mode
+  OpenCode v2's WebSearch uses.
+- `tinyfish keyless` / `tinyfish news` — TinyFish's MCP endpoint
+  (`agent.tinyfish.ai/mcp`), web and news indexes.
+- `tavily keyless` — Tavily's `X-Tavily-Access-Mode: keyless` REST mode. It
+  ships **disabled**: its keyless quota is a small shared courtesy cap that
+  light testing exhausted within a few calls (HTTP 429, ~15–20 min cooldown).
+  Select it with `!tvl`, or flip `disabled: false` to add it to the fan-out.
+
+The scraping engines (bing, duckduckgo, google, brave, startpage, mojeek, …)
+stay disabled/inactive: under machine-paced traffic they serve captchas and ban
+the host IP. The keyless engines are plain API calls, so they fail as clean HTTP
+status codes instead.
+
+`searxng/engines/` holds the three small SearXNG engine modules; compose mounts
+them individually into the image's `searx/engines/` directory (SearXNG loads an
+engine by file name, and mounting a directory would shadow the bundled engines).
+Note: SearXNG exits at startup if an engine module fails to *import*, so after a
+`searxng/searxng:latest` image upgrade, check the modules still load (a quick
+`/search?q=test&format=json` smoke test) — a missing host file only skips the
+engine, but a broken import is fatal.
 
 The service is attached to the external `stacks-shared` network so other
 stacks reach the engine directly at `http://searxng:8080` — the shared
@@ -334,8 +360,12 @@ Other services run internally and are not exposed.
 │   ├── trainlocks/           # Training log MCP server
 │   └── trilium/              # Trilium MCP integration
 ├── searxng/
-│   └── config/
-│       └── settings.yml      # SearXNG configuration
+│   ├── config/
+│   │   └── settings.yml      # SearXNG configuration
+│   └── engines/              # Keyless-API engine modules (mounted individually)
+│       ├── exa_keyless.py
+│       ├── tavily_keyless.py
+│       └── tinyfish_keyless.py
 ├── research-search/         # Web search + URL fetch via the Mistral "Web Scout" agent
 │   ├── app.py               # stdlib HTTP adapter (search + fetch contracts)
 │   ├── test_app.py          # unit tests for the parsing helpers
