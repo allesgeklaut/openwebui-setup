@@ -237,12 +237,6 @@ services:
     environment:
       - SEARXNG_BASE_URL=http://${LAN_IP}:8081/
       - SEARXNG_VALKEY_URL=valkey://searxng-valkey:6379/0
-      # Real signing secret from .env (gitignored); generated 2026-11-10.
-      # Before this the instance ran with the literal "${SEARXNG_SECRET}"
-      # placeholder string as its key (the env var was never defined).
-      # SearXNG's schema overrides server.secret_key from this env var
-      # (settings_defaults.py: environ_name='SEARXNG_SECRET').
-      - SEARXNG_SECRET=${SEARXNG_SECRET}
       - UWSGI_WORKERS=2
       - UWSGI_THREADS=4
     volumes:
@@ -255,11 +249,13 @@ services:
       - /opt/stacks/webui/searxng/engines/tavily_keyless.py:/usr/local/searxng/searx/engines/tavily_keyless.py:ro
       - /opt/stacks/webui/searxng/engines/tinyfish_keyless.py:/usr/local/searxng/searx/engines/tinyfish_keyless.py:ro
       - /opt/stacks/webui/searxng/engines/webscout.py:/usr/local/searxng/searx/engines/webscout.py:ro
-      # Single source of truth for the Exa key and the research-search
-      # bearer token — read-only, consumed by the entrypoint wrapper,
-      # never written anywhere.
+      # Single source of truth for the Exa key, the research-search bearer
+      # token and the SearXNG signing secret — read-only, consumed by the
+      # entrypoint wrapper, never written anywhere (so the secret also
+      # never appears in `docker inspect` container env).
       - /opt/secrets/exa.key:/run/secrets/exa.key:ro
       - /opt/secrets/research-search.token:/run/secrets/research-search.token:ro
+      - /opt/secrets/searxng.secret:/run/secrets/searxng.secret:ro
       # Named (not the image's anonymous volume) so the one-time chown
       # survives container recreates; chowned to 1000 via a one-off root
       # container after creation.
