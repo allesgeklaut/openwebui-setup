@@ -15,14 +15,27 @@
 # pointing at a file (searx/settings_loader.py), so the app reads the
 # generated copy instead of the placeholder template.
 set -eu
+umask 077
 
 # Escape sed metacharacters in the secrets (& is the replacement text in sed,
 # | is our delimiter) so a secret containing them cannot corrupt the
 # generated settings file.
 escape() { printf '%s' "$1" | sed 's/[&|\\]/\\&/g'; }
 
-K="$(escape "$(cat /run/secrets/exa.key)")"
-S="$(escape "$(cat /run/secrets/research-search.token)")"
+# Keep reads separate from export/escape: those commands can mask a failed
+# cat even with set -e, allowing startup with an empty secret.
+K="$(cat /run/secrets/exa.key)"
+S="$(cat /run/secrets/research-search.token)"
+SEARXNG_SECRET="$(cat /run/secrets/searxng.secret)"
+test -n "$K"
+test -n "$S"
+test -n "$SEARXNG_SECRET"
+K="$(escape "$K")"
+S="$(escape "$S")"
+# Also tighten a file left by an earlier start with a permissive umask.
+if test -e /tmp/searxng-settings.yml; then
+  chmod 600 /tmp/searxng-settings.yml
+fi
 sed -e "s|__EXA_API_KEY__|$K|" -e "s|__SCOUT_TOKEN__|$S|" \
   /etc/searxng/settings.yml > /tmp/searxng-settings.yml
 export SEARXNG_SETTINGS_PATH=/tmp/searxng-settings.yml
@@ -30,6 +43,6 @@ export SEARXNG_SETTINGS_PATH=/tmp/searxng-settings.yml
 # Signing secret: exported from the mounted file so it lives only in
 # /opt/secrets and the process environment — never in compose env
 # (docker inspect) or the repo.
-export SEARXNG_SECRET="$(cat /run/secrets/searxng.secret)"
+export SEARXNG_SECRET
 
 exec /usr/local/searxng/entrypoint.sh
