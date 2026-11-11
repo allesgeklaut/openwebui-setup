@@ -140,29 +140,23 @@ Open WebUI resolves stored image URLs before inlet filters. Therefore this
 extension reduces the **provider payload**, not necessarily Open WebUI's own
 historical image-loading cost. It never fetches arbitrary URLs itself.
 
-## Installation (explicit, scoped rollout)
+## Installation and updates
 
-1. Run the tests below. Review the code before installing it.
-2. Apply the Compose read-only mount (requires recreating `open-webui`):
-   ```sh
-   docker compose up -d --no-deps open-webui
-   ```
-   The whole `openwebui-extensions/` directory is mounted read-only at
-   `/app/backend/extensions`, which is on `PYTHONPATH`. Runtime packages live
-   directly under that root; `chat_image_retrieval` is shared by both entries.
-   Do not install third-party requirements: Pillow is already in this image.
-3. As an administrator, create a **Filter Function** using the contents of
+The whole extension directory is mounted read-only at `/app/backend/extensions`
+on `PYTHONPATH`; Pillow is already installed. Recreate `open-webui` only when
+applying mount/environment changes.
+
+1. Run the tests below.
+2. As an administrator, create a **Filter Function** using the contents of
    `filter.py`, and a **Workspace Tool** using `tool.py`. Keep both private.
    Suggested IDs: `chat_image_retrieval_filter`, `chat_image_retrieval`.
-4. Enable the filter, **not globally**. Attach/select it and the tool together on
+3. Enable the filter, **not globally**. Attach/select it and the tool together on
    one private test model/chat. Use a vision-capable model and **native function
    calling**. Keep the model's Vision capability enabled.
-5. Perform the acceptance checks below before enabling it elsewhere. Disable the
+4. Check the behaviour in a private chat before broader use. Disable the
    filter and deselect the tool together to revert to ordinary image handling.
 
-The two small entry files contain frontmatter and a plain import of the shared
-package. They are native registration adapters, not standalone implementations.
-There is no hot reload, module-cache manipulation, or upstream Open WebUI patch.
+The entries import the shared package; they are not standalone implementations.
 
 - **Package-only updates:** update the repo and run
   `docker compose restart open-webui` to start a fresh Python process.
@@ -174,10 +168,8 @@ There is no hot reload, module-cache manipulation, or upstream Open WebUI patch.
   actually change (imports, registration metadata or the native interface), not
   for every package update.
 
-Registration stays explicit; mounting a package does not activate it. Back up
-both the repository and Open WebUI data. A database-only export omits the
-implementation. Keep the extension code present on the deployed branch; do not
-switch to a branch that lacks it while these registrations are active.
+Mounting the package does not register or activate it. Keep the package present
+while its registrations are active; a database-only export omits the code.
 
 ## Tests
 
@@ -203,36 +195,12 @@ provider calls; all chat/file adapters still use synthetic fixtures):
 python3 openwebui-extensions/chat-images/container_smoke.py --installed
 ```
 
-### Acceptance checks before wider rollout
+### Manual checks
 
-Use a **new saved private test chat**, not a sensitive existing conversation.
-
-1. Upload one clearly labelled test image, then a different one in a later turn.
-2. Ask about the latest image: confirm only the newest set is in the outbound
-   provider request. Do not log base64 payloads or credentials.
-3. Ask to inspect the earlier image: confirm the browser approval appears. Deny
-   it first; no older-image payload should be sent.
-4. Repeat and approve. Confirm a real image content part reaches the provider,
-   and that the model can identify a visual feature not supplied in text.
-5. Send a text-only follow-up: the retrieved older image must be absent again.
-6. Attempt sibling-branch, other-chat and other-user references: deny all. Test
-   revocation/deletion while the approval dialog is open.
-7. Check tool-approval resume, compaction, regeneration and the actual provider's
-   vision/tool format. A resumed server request intentionally requires fresh
-   image authorization; fail closed if the filter context is unavailable.
-8. Generate/edit an image using the normal image-generation tool: verify the UI
-   image and JSON result remain intact. If a tool returns multimodal image parts,
-   verify those reach the provider unchanged, including identical-pixel repeats.
-    Verify a later turn still omits older payloads without deleting displayed images.
-9. Upload a synthetic GIF with at least six distinct frames and varying delays:
-   verify up to four timestamped JPEG parts, first/last coverage, one sampling
-   disclosure and no original GIF file tag. Repeat with a non-Mistral model and
-   a tool-call round; labels and images must not accumulate. Four samples do not
-   prove the model has seen the complete animation.
-10. Upload several ordinary images together and follow with text only: keep the
-    full latest set unchanged. Try a source over 10 MiB, more than eight sources,
-    and GIFs exceeding the expansion/work budget: expect clear errors, not a
-    fallback that replays all originals.
-
-Unit and synthetic runtime tests do not substitute for these browser/provider
-checks. Provider checks incur normal inference costs and are not automated here.
+In a new saved private chat, verify latest-set retention across follow-ups,
+deny/approve older-image retrieval, and confirm approval does not carry to a
+later request. Check native tool-call resume, generated images, multiple uploads
+and GIF sampling with the actual vision provider. Cross-user/branch access and
+over-budget inputs must fail closed. Do not log image payloads or credentials.
+Automated tests do not replace browser/provider checks; those incur normal
+inference costs.

@@ -7,17 +7,16 @@ A self-hosted AI chat interface with extended capabilities, powered by [Open Web
 | Service | Description | Port |
 |---------|-------------|------|
 | **open-webui** | Main UI for AI conversations | 3001 |
+| **open-terminal** | Persistent terminal with repo-managed OpenCode configuration | internal |
 | **mcpo** | MCP server gateway (Trilium, filesystem, deep-research, …) | internal |
 | **searxng** | Privacy-respecting search engine | 8081 |
-| **research-search** | Web search + URL fetch via the Mistral "Web Scout" agent | internal |
+| **research-search** | Optional Mistral Web Scout search/fetch backend | internal |
 | **tika** | Document extraction & preprocessing | internal |
 | **audiobookshelf-mcp** | Audiobookshelf podcast connector (authenticated MCP for Open WebUI) | internal |
 
-Voice chat (TTS/STT) and RAG embeddings are **not** separate services: they
-route through litellm to Mistral (Voxtral TTS + transcription, Mistral Embed).
-Web search and URL fetch **are** a service (research-search), but the actual
-searching happens in a Mistral agent — see
-[Web search & page fetching](#web-search--page-fetching-research-search).
+Voice chat and RAG embeddings route through LiteLLM to Mistral. Web search uses
+SearXNG; page loading uses Open WebUI's default HTTP loader. RunPod is an optional
+Compose profile, not part of the default deployment.
 
 ## Prerequisites
 
@@ -31,10 +30,17 @@ searching happens in a Mistral agent — see
 
 ```bash
 cp .env.example .env
-# Edit .env with your actual values (API keys, URLs, etc.)
+# Set installation URLs, agent/library IDs and other non-secret values.
 ```
 
-See [`.env.example`](.env.example ) for all available options and descriptions.
+Use [`.env.example`](.env.example) for configuration fields. Keep actual
+credentials under `/opt/secrets`, not in Git. Required mounts and external
+networks are listed in `compose.yml`; this stack assumes the companion
+LiteLLM, Trilium, Audiobookshelf and shared MCP services already exist.
+
+`start.sh` reads `webui.env`, `trainlocks.env`, `mistral.env` and `trilium.token`
+from `/opt/secrets`. Other services mount their own key/token files there.
+The SearXNG signing secret is `/opt/secrets/searxng.secret` (mode `600`).
 
 ### 2. Start Services
 
@@ -43,55 +49,40 @@ See [`.env.example`](.env.example ) for all available options and descriptions.
 ```
 
 This script:
-1. Generates `mcpo/config.json` from the template with your `.env` values
-2. Starts all Docker services in detached mode
+1. Renders `mcpo/template_config.json` to `/opt/secrets/mcpo-config.json`.
+2. Starts the default Docker Compose services.
 
-### Alternative Manual Steps
-
-If you prefer manual control:
-
-```bash
-# Generate config (first time only, or after .env changes)
-./start.sh
-
-# Or just start containers without regenerating config
-docker compose up -d
-```
+Run `./start.sh` again after template/environment changes. Use
+`docker compose up -d` when the generated configuration is already current.
+Do not print or commit the generated MCPO config: it contains credentials.
 
 ## Configuration
 
-### Selective chat image retrieval (optional)
+### Native tools and filters
 
-The repo-managed [Chat Image Retrieval Filter + Tool](openwebui-extensions/chat-images/README.md)
-keeps the latest image set in context and retrieves older current-chat images
-only after explicit approval. It is **not activated automatically**. See its
-installation guide, limits, security tests, and scoped rollout checklist before
-enabling it on a model.
+The [extensions directory](openwebui-extensions/README.md) is mounted read-only
+on Python's import path. Native Open WebUI entries contain small import adapters;
+the implementation lives in Git. New installations need explicit registration.
+Package updates need an `open-webui` restart; mount changes need recreation.
 
-The whole [extensions directory](openwebui-extensions/README.md) is mounted
-read-only at `/app/backend/extensions` and added to Python's import path.
-Package updates require a backend restart; mount/environment changes require
-container recreation. Extensions still need explicit native registration.
+- [Chat Image Retrieval](openwebui-extensions/chat-images/README.md): retain the
+  latest uploaded image set; retrieve older current-chat images after approval.
+- [SearXNG Image Search](openwebui-extensions/searxng-images/README.md): inline
+  images and source links from SearXNG's image category.
 
 ### MCP Servers (`mcpo/`)
 
 The `mcpo` service connects to various Model Context Protocol servers. The configuration is generated from [`mcpo/template_config.json`](mcpo/template_config.json ) using your environment variables.
 
-MCP runtime packages have exact direct versions in [`mcpo/npm/package.json`](mcpo/npm/package.json)
-and [`mcpo/requirements.txt`](mcpo/requirements.txt). The template uses `run-npx.sh`
-and `uvx --with-requirements` so these tracked manifests are the version source of
-truth. Dependabot checks both manifests and the three selected container images
-weekly. MCPO currently publishes commit tags rather than release-version tags;
-its image updates may require manual tag selection. Review the PRs rather than
-automatically merging them. Version tags can still be replaced by their publisher.
-These pins do not
-lock all transitive dependencies or remove existing dependency advisories.
-After changing the template, `./start.sh` regenerates the secret config and
-starts/recreates the stack. Do not edit the generated secret config directly.
+Direct package versions are pinned in [`mcpo/npm/package.json`](mcpo/npm/package.json)
+and [`mcpo/requirements.txt`](mcpo/requirements.txt); transitive dependencies
+are not fully locked. Dependabot checks the manifests and selected images.
+MCPO uses a commit-tagged image, so image upgrades may need manual selection.
 
 **Available MCP servers:**
 - **filesystem**: Access to `/stacks` directory (mounted read-only)
-- **trilium**: Integration with Trilium note-taking app (requires `TRILIUM_API_KEY`)
+- **trilium**: The pinned `triliumnext-mcp` package, with its token read by
+  `start.sh` from `/opt/secrets/trilium.token`.
 - **searxng**: Web search via the shared `mcp-searxng` stack — supergateway
   serves the pinned `mcp-searxng` package over Streamable HTTP on the
   `stacks-shared` docker network; mcpo proxies it remotely
@@ -100,7 +91,7 @@ starts/recreates the stack. Do not edit the generated secret config directly.
 - **deep-research**: Deep web research tool fronting the "Deep Researcher"
   Mistral Studio agent (`web_search_premium`). One tool,
   `deep_research(question)`: runs several refined searches with page opens and
-  returns a structured, cited report (30–120 s, ~$0.10–0.30 per call).
+  returns a structured, cited report. Calls are billed and can take minutes.
   The same server is also registered in `opencode.json`, so coding agents
   can call it. Both `MISTRAL_API_KEY` and the agent id come from
   `/opt/secrets/mistral.env` (start.sh's config renderer for mcpo; the script's
@@ -108,15 +99,53 @@ starts/recreates the stack. Do not edit the generated secret config directly.
 
 ### SearXNG (`searxng/`)
 
-Privacy-respecting metasearch engine. Configuration is in [`searxng/config/settings.yml`](searxng/config/settings.yml ).
+Privacy-respecting metasearch engine. Configuration is in [`searxng/config/settings.yml`](searxng/config/settings.yml).
 
-The service is attached to the external `stacks-shared` network so other
-stacks reach the engine directly at `http://searxng:8080` — the shared
-`mcp-searxng` tool server and the trade-sentinel news pipeline use it
-instead of the published LAN port. The MCP tool server that mcpo exposes
-to Open WebUI lives in `/opt/stacks/mcp-searxng` (Streamable HTTP on
-`stacks-shared`); its `mcp-searxng` version pin supersedes the one this
-repository's mcpo npm manifest used to carry.
+Search fans out across default engines, then SearXNG merges, deduplicates and
+ranks the combined results. Open WebUI takes the top 10 overall, not 10 per
+engine. In native tool-calling mode the model chooses which pages to fetch;
+the forced search pipeline fetches pages through the configured loader.
+
+API backbone (default-enabled; subject to upstream quotas/availability):
+
+- `exaapi` — the keyed Exa API (key from `/opt/secrets/exa.key`), the primary
+  source.
+- `exa keyless` — Exa's MCP endpoint (`mcp.exa.ai`), the same keyless mode
+  OpenCode v2's WebSearch uses.
+- `tinyfish keyless` / `tinyfish news` — TinyFish's MCP endpoint
+  (`agent.tinyfish.ai/mcp`), web and news indexes.
+
+Opt-in engines (registered but off the default fan-out; select with their
+shortcut, e.g. `!scout`, or flip `disabled: false` to make them default):
+
+- `web scout` (`!scout`) — Mistral-agent search via `research-search`.
+  Each call is billed and slower than an API search. Authentication uses
+  `/opt/secrets/research-search.token`.
+- `tavily keyless` (`!tvl`) — Tavily's `X-Tavily-Access-Mode: keyless` REST
+  mode, with a small shared quota that can return HTTP 429 quickly.
+
+General searches also include Wikipedia and best-effort scrapers: DuckDuckGo,
+Startpage, Brave and Mojeek. CAPTCHA/access-denied suspension is one day; 429
+suspension is one minute (in memory, reset on restart). General Bing/Google
+engines are off; other categories have their own defaults. News defaults are
+`exaapi` and `tinyfish news`.
+
+Open WebUI uses `http://searxng:8080/search?q=<query>`, JSON format and a result
+count of 10. Its default page loader fetches directly: fetched sites see this
+server's IP, and JavaScript-only pages may yield little content. Configure
+search/loader settings through Open WebUI's administration UI, not direct SQL.
+
+`searxng/engines/` holds the four small SearXNG engine modules; compose mounts
+them individually into the image's `searx/engines/` directory (SearXNG loads an
+engine by file name, and mounting a directory would shadow the bundled engines).
+Note: SearXNG exits at startup if an engine module fails to *import*, so after a
+`searxng/searxng:latest` image upgrade, check the modules still load (a quick
+`/search?q=test&format=json` smoke test) — a missing host file only skips the
+engine, but a broken import is fatal.
+
+The shared MCP server (`/opt/stacks/mcp-searxng`) and trade-sentinel reach this
+instance at `http://searxng:8080` over `stacks-shared`. MCPO exposes that MCP
+server to Open WebUI; its package version is managed in the companion stack.
 
 ### Audiobookshelf MCP (`audiobookshelf-mcp/`)
 
@@ -141,98 +170,39 @@ make sure that is intended before deploying. Register the MCP endpoint
 (`http://audiobookshelf-mcp:8000/mcp`) as a private tool-server connection in
 Open WebUI, restricted to the intended account.
 
-### Web search & page fetching (`research-search/`)
+### Optional Web Scout backend (`research-search/`)
 
-All web access goes through **Mistral** (EU) — Exa was dropped for privacy,
-and there is no direct HTTPS fetching anywhere in this stack. The
-`research-search` service serves both of Open WebUI's `external` web
-contracts from one process, backed by the "Web Scout" Mistral Studio agent
-(`web_search`):
-
-- **Search** (`web.search.engine=external`): the scout runs the query (up to
-  3 refined searches), this service harvests the raw results —
-  `[{link, title, snippet}]`, SERP-style only. The agent never answers the
-  question: synthesis stays with whichever chat model is in use, so the
-  research quality composes with every model. When a result matters, the
-  chat model requests the full page via the fetch loader.
-- **Fetch** (`web.loader.engine=external`): every URL goes through the scout
-  agent, which opens the page — target sites see Mistral's fetchers, never
-  this stack, and there is no outbound-fetch/SSRF surface here. Pages capped
-  at 32K chars by Mistral's tool channel are flagged
-  (`metadata.truncated` + note in `page_content`). Only if the open never
-  happens — including refused opens, where the fetcher reports
-  `can_open=false` (robots.txt-banned sites like instagram.com) — do the
-  page's own SERP snippets serve as text; with no SERP entry either, the
-  fetch 502s rather than returning the refusal as page text.
-
-Wired via these DB keys:
-
-| Key | Value |
-|---|---|
-| `web.search.engine` | `external` |
-| `web.search.external_web_search_url` | `http://research-search:8080/search` |
-| `web.search.external_web_search_api_key` | token in `/opt/secrets/research-search.token` |
-| `web.loader.engine` | `external` |
-| `web.loader.external_web_loader_url` | `http://research-search:8080/fetch` |
-| `web.loader.external_web_loader_api_key` | token in `/opt/secrets/research-search.token` |
-
-Cost per search-enabled chat turn: ~$0.03–0.09 for the search plus ~$0.06
-per fetched page (each fetch is a scout conversation). Details, config and
-limits: [`research-search/README.md`](research-search/README.md).
-
-Pre-change backup of all `web.search.*` / `web.loader.*` rows (incl. the
-Exa key): `data/backups/config-web-backup-2026-10-20.json`. Rollback: stop
-open-webui, restore the rows, `git revert` the exa-loader removal commit,
-`docker compose up -d`.
+The [research-search service](research-search/README.md) provides Mistral-agent
+search for SearXNG's opt-in `!scout` engine and an optional external page loader.
+It is not Open WebUI's default search or loader. Each call starts a billed
+agent conversation; use it explicitly when wanted. Its bearer token lives in
+`/opt/secrets/research-search.token`.
 
 ## Audio & RAG embeddings
 
-Voice chat and document embeddings route through litellm (same gateway and
-key as chat) to Mistral's audio/embedding APIs — no local Kokoro/Whisper/
-sentence-transformers anymore:
+Voice chat and document embeddings use the same LiteLLM gateway/key as chat:
 
-- **TTS**: Voxtral TTS (`voxtral-tts` on litellm, ~$0.016/1k chars). The
-  TTS Voice field in OpenWebUI accepts readable names, thanks to the
-  `VoxtralVoiceAlias` callback in the litellm stack (`custom_callbacks.py`),
-  which rewrites them to the UUIDs Mistral actually accepts:
-  - `auto` (current default): language routing — German text is spoken by
-    **Jo** (the only native German preset), anything else by **Jane** (en-GB).
-    OpenWebUI splits replies on punctuation, so detection runs per chunk and
-    mixed-language answers use the right voice per sentence; ambiguous
-    chunks default to Jo.
-  - `jo` / `de`, `jane` / `en`, and mood variants: `jane-sarcasm`,
-    `paul-cheerful`, `oliver-curious`, `marie-happy`, … (full map in
-    `custom_callbacks.py`).
-  - Mistral Studio display names ("Jane") do **not** work — only UUIDs,
-    readable aliases (above), or OpenAI names (`alloy`, `nova`, …, which
-    litellm maps to English presets; `nova`/`shimmer` are both Jane-Sarcasm).
-- **STT**: Voxtral batch transcription (`voxtral-stt`, $0.003/min) — better
-  German accuracy than the previous local Whisper `base`.
-- **Embeddings**: Mistral Embed (`mistral-embed`, $0.10/M tokens, 1024-dim),
-  a large quality jump over the previous local all-MiniLM (384-dim).
+- **TTS:** `voxtral-tts`. Voice `auto` uses Jo for German, Jane for English,
+  with ambiguous chunks defaulting to Jo. Aliases (`jo`/`de`, `jane`/`en`,
+  mood variants) are resolved by LiteLLM's `VoxtralVoiceAlias` callback;
+  Mistral Studio display names are not voice IDs.
+- **STT:** `voxtral-stt`.
+- **Embeddings:** `mistral-embed`, 1024 dimensions.
 
-These are Open WebUI ConfigVars: the `webui.db` `config` rows win over the
-compose env on an existing install (the env matches for fresh deploys). The
-rows changed in place (backup: `data/backups/config-audio-rag-backup-20261019.json`):
+Persisted Open WebUI settings override Compose defaults on existing installs.
+Use the administration UI to change them:
 
 | Key | Value |
 |---|---|
-| `audio.tts.openai.api_base_url` / `audio.stt.openai.api_base_url` / `rag.openai.api_base_url` | `http://192.168.0.46:4000/v1` |
+| `audio.tts.openai.api_base_url` / `audio.stt.openai.api_base_url` / `rag.openai.api_base_url` | `http://<LAN_IP>:4000/v1` |
 | `audio.tts.model` / `audio.stt.model` | `voxtral-tts` / `voxtral-stt` |
 | `audio.stt.engine` / `rag.embedding_engine` | `openai` |
 | `audio.tts.voice` | `auto` (readable names/UUIDs also work — see above) |
 | `rag.embedding_model` | `mistral-embed` |
 | `*.api_key` | the litellm master key |
 
-**Important**: the embedding model changed (384→1024 dims), so existing
-documents/knowledge bases need re-embedding — Admin → Documents → **Reindex**
-(or "Re-sync" per knowledge base). Until then, retrieval over old uploads
-errors; new uploads work immediately.
-
-Rollback to the local setup: restore the backup JSON rows above (engine `""`
-for STT/RAG, `sentence-transformers/all-MiniLM-L6-v2` as embedding model,
-kokoro TTS values), `git revert` the kokoro service removal in `compose.yml`,
-and reindex again.
+After changing embedding models/dimensions, reindex existing documents and
+knowledge bases through Open WebUI before using their stored embeddings.
 
 ### Image generation & editing (`workflows/`)
 
@@ -241,13 +211,10 @@ Open WebUI's ComfyUI engine drives the local stack (`../comfyui`) on
 `http://<LAN_IP>:8189` (details in `../litellm/README.md`). The live config is
 the `config` table of the gitignored `data/webui.db`; the workflow files here
 are its reproducible mirror. Active in Open WebUI:
-`qwen_image_2_1_turbo_{t2i,edit}_api.json`. The base variants are the rollback
-path. Separate Prompt Enhancer workflows have been removed: they added latency
-and could rewrite transparency requests into white/checkerboard backgrounds.
-Open WebUI's own chat prompt handling is unchanged.
+`qwen_image_2_1_turbo_{t2i,edit}_api.json`. The base variants remain available
+as alternatives.
 
-DB keys (Admin → Settings → Images, or the `config` table directly — applies
-live, no restart, reload the browser):
+Settings (Admin → Settings → Images; stored under these configuration keys):
 
 | Key | Value |
 |---|---|
@@ -284,16 +251,11 @@ before Qwen encoding, preserving input transparency. Active Turbo editing now
 defaults to a 1536 resolution budget for finer detail, at greater latency and
 memory cost; the base rollback workflow remains at 1024.
 
-Gotchas when writing the `config` table directly (violations fail as generic
-400s; non-JSON values crash every image request):
-
-- Every `config.value` is a **JSON column**: direct SQL must store JSON — plain strings need quotes (`'"comfyui"'`, not `comfyui`); raw text crashes every image request inside `get_image_config` before any traffic reaches the proxy. (Raw integers are tolerated by the ORM's SQLite JSON dialect.)
-- `*.comfyui.workflow` is a JSON **string** (double-encoded); `*.comfyui.nodes` is a raw JSON **array**.
-- The `model` keys override the workflow's `unet_name` — update the key, not just the file.
-- The edit node map must not map `negative_prompt` or `steps` (the edit request sends neither; `None` gets written).
-- The edit `width`→`resolution` mapping needs a non-empty `images.edit.size`;
-  changing the template alone does not override this live/request size.
-- Turbo seeds via `SamplerCustom` (`noise_seed`); the base `KSampler` uses `seed` + `steps`.
+Use the administration UI/API, not direct database writes. The model setting
+overrides the workflow's `unet_name`; keep both consistent. Do not map edit
+`negative_prompt` or `steps` (the edit request sends neither). The edit
+`width`→`resolution` mapping requires a non-empty edit size. Turbo uses
+`SamplerCustom.noise_seed`; the base workflows use `KSampler.seed` and `steps`.
 
 Rollback to the base model: point the two workflow keys at
 `qwen_image_2_1_{t2i,edit}_api.json`, set both models to
@@ -305,74 +267,30 @@ the base variants (the ids/keys above are Turbo-specific): generation adds
 `image` at `["4", "10", ..., "18"]` and also seeds via `"key": "seed"`,
 keeping `prompt`→5, `model`→1 and `width`→5 (`resolution`) unchanged.
 
-**ChatGPT adapter (alternative).** The `chatgpt-images` shim
-(`../litellm/chatgpt_images/`) can serve both engines instead; run its
-`configure_webui.py` to switch. The adapter-era rows (incl. its gateway key)
-are backed up at `data/backups/config-image-gen-comfyui-backup-20261026.json`
-(gitignored; delete once obsolete).
+**Alternatives:** the `runpod` Compose profile enables the optional
+[RunPod bridge](runpod-bridge/README.md). The companion `chatgpt-images` adapter
+(`../litellm/chatgpt_images/`) can also serve both image engines; its
+`configure_webui.py` switches the Open WebUI configuration.
 
 ## Ports
 
 | Port | Service | Access |
 |------|---------|--------|
-| 3001 | Open WebUI | External (browser) |
-| 8081 | SearXNG | External (browser) |
+| 3001 | Open WebUI | Loopback; remote access through the configured proxy |
+| 8081 | SearXNG | Published on the host |
 
 Other services run internally and are not exposed.
 
-## File Structure
-
-```
-├── compose.yml          # Docker Compose configuration
-├── .env.example         # Environment variables template
-├── .env                 # Your actual environment variables (gitignored)
-├── start.sh             # Helper script to generate config & start services
-├── mcpo/
-│   ├── template_config.json  # MCP config template with ${VAR} placeholders
-│   ├── config.json           # Generated from template (gitignored, contains secrets)
-│   ├── deep-research/        # Deep Research MCP server (Mistral Studio agent + premium search)
-│   ├── trainlocks/           # Training log MCP server
-│   └── trilium/              # Trilium MCP integration
-├── searxng/
-│   └── config/
-│       └── settings.yml      # SearXNG configuration
-├── research-search/         # Web search + URL fetch via the Mistral "Web Scout" agent
-│   ├── app.py               # stdlib HTTP adapter (search + fetch contracts)
-│   ├── test_app.py          # unit tests for the parsing helpers
-│   ├── Dockerfile
-│   └── README.md
-├── audiobookshelf-mcp/      # Audiobookshelf podcast MCP connector (17 tools, writes opt-in)
-│   ├── src/audiobookshelf_mcp/
-│   ├── tests/
-│   ├── Dockerfile
-│   └── README.md
-├── workflows/               # ComfyUI API workflows for Open WebUI (Qwen-Image-2.1)
-│   ├── qwen_image_2_1_t2i_api.json
-│   ├── qwen_image_2_1_edit_api.json
-│   ├── qwen_image_2_1_turbo_t2i_api.json   # Turbo UNet, 8 steps (active)
-│   └── qwen_image_2_1_turbo_edit_api.json  # Turbo UNet, 8 steps (active)
-└── data/                    # Open WebUI data & cache (gitignored)
-```
-
 ## Troubleshooting
 
-### MCP server not connecting?
-
-Check the generated config:
 ```bash
-cat mcpo/config.json
+docker compose ps
+docker compose logs --tail 50 mcpo searxng open-webui
 ```
 
-Verify environment variables are loaded:
-```bash
-docker logs mcpo --tail 50
-```
-
-### Regenerate config after `.env` changes
-
-```bash
-./start.sh
-```
+For MCP configuration changes, rerun `./start.sh`; do not edit the generated
+secret file. For native extension updates, restart `open-webui`. Keep logs and
+private configuration out of public issue reports.
 
 ## License
 

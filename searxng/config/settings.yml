@@ -69,10 +69,17 @@ search:
   suspended_times:
     # Engine suspension time after error (in seconds; set to 0 to disable)
     # For error "Access denied" and "HTTP error [402, 403]"
-    SearxEngineAccessDenied: 60
+    # Raised 60 -> 86400 (2026-11-10): the best-effort scraping engines get
+    # captcha-walled/403-banned under machine-paced traffic; re-probing a
+    # banned engine every minute only adds ban pressure and log noise.
+    # One probe per day is enough to notice a lifted ban.
+    SearxEngineAccessDenied: 86400
     # For error "CAPTCHA"
-    SearxEngineCaptcha: 120
+    # Raised 120 -> 86400 (2026-11-10), same rationale as AccessDenied.
+    SearxEngineCaptcha: 86400
     # For error "Too many request" and "HTTP error 429"
+    # Kept at 60: 429s are transient (brave recovers within minutes and is
+    # a top contributor), so quick re-probes are worth the noise.
     SearxEngineTooManyRequests: 60
     # Cloudflare CAPTCHA
     cf_SearxEngineCaptcha: 1296000
@@ -324,6 +331,88 @@ engines:
     content_max_characters: 500
     inactive: false
     categories: [general, news]
+
+  # --- Keyless web-search APIs (added 2026-11-10) -----------------------
+  # The same keyless backends OpenCode v2's WebSearch service uses. They
+  # need no API key and no signup; each is a courtesy quota on shared
+  # infrastructure, so a 429 is possible and SearXNG suspends the engine
+  # temporarily. Together with the keyed exaapi they form the ban-proof
+  # API backbone of the fan-out: plain API calls, no captchas, no IP
+  # bans, clean HTTP-status failures.
+  #
+  # Layered on top (below in this file) are best-effort scraping engines
+  # (duckduckgo, startpage, brave, mojeek): they rate-limit/captcha under
+  # machine-paced traffic and SearXNG auto-suspends them (captcha or
+  # access-denied -> 1 day, 429 -> 1 min; see suspended_times above —
+  # in-memory, cleared by a restart), so they contribute whenever they
+  # are healthy and get out of the way when banned. Bing and google stay
+  # off entirely (never requested / worst ban profile).
+  #
+  # exa keyless: MCP endpoint mcp.exa.ai (no key). The keyed `exaapi`
+  # engine above stays the primary Exa backend; this one is the no-key
+  # fallback and duplicate URLs are deduplicated by SearXNG.
+  - name: exa keyless
+    engine: exa_keyless
+    shortcut: exak
+    categories: [general]
+    results_per_page: 10
+    timeout: 15.0
+
+  # tavily keyless: REST API with X-Tavily-Access-Mode: keyless. Its keyless
+  # mode is a small shared courtesy cap — light testing exhausted it within
+  # a few calls (HTTP 429 daily_cap_reached, ~15-20 min retry-after), after
+  # which it 429s for a while. Kept off the default fan-out so searches do
+  # not burn the cap and surface a permanent "unresponsive_engines" entry;
+  # select it explicitly with !tvl, or flip disabled to false to add it to
+  # the fan-out (a real Tavily API key in the module would remove the cap).
+  - name: tavily keyless
+    engine: tavily_keyless
+    shortcut: tvl
+    categories: [general, news]
+    disabled: true
+    timeout: 15.0
+
+  # tinyfish keyless: MCP endpoint agent.tinyfish.ai/mcp. Two instances:
+  # the web index for general, the news index for the news tab.
+  - name: tinyfish keyless
+    engine: tinyfish_keyless
+    shortcut: tfk
+    categories: [general]
+    tinyfish_categ: web
+    timeout: 15.0
+
+  - name: tinyfish news
+    engine: tinyfish_keyless
+    shortcut: tfn
+    categories: [news]
+    tinyfish_categ: news
+    timeout: 15.0
+
+  # web scout: the stack's own Mistral-agent-backed search (research-search
+  # service, POST /search). Consolidates every backend into SearXNG: each
+  # search runs one Web Scout agent conversation that harvests Mistral's
+  # web_search results. Billed per search (Mistral API) and slow (an agent
+  # round-trip, seconds) — unlike the flat/free API engines above — so it
+  # ships disabled: select it with !scout when Mistral-sourced results are
+  # wanted, or flip disabled to false to add it to the default fan-out.
+  # Token: __SCOUT_TOKEN__ placeholder, injected by entrypoint-wrapper.sh
+  # from /opt/secrets/research-search.token (same pattern as __EXA_API_KEY__).
+  # enable_http: the default network is https-only; research-search is a
+  # plain-http internal service, so this engine opts into http.
+  # timeout 25: a scout conversation normally takes ~2-10s. Past 25s SearXNG
+  # gives up, but the agent conversation keeps running to completion on the
+  # research-search side (its own upstream timeout is 120s) — a slow search
+  # is still billed even though its results are discarded here.
+  - name: web scout
+    engine: webscout
+    shortcut: scout
+    api_key: __SCOUT_TOKEN__
+    categories: [general]
+    results_per_page: 10
+    disabled: true
+    enable_http: true
+    timeout: 25.0
+
   - name: 360search
     engine: 360search
     shortcut: 360so
@@ -349,36 +438,6 @@ engines:
   - name: acfun
     engine: acfun
     shortcut: acf
-    disabled: true
-
-  - name: adobe stock
-    engine: adobe_stock
-    shortcut: asi
-    categories: ["images"]
-    # https://docs.searxng.org/dev/engines/online/adobe_stock.html
-    adobe_order: relevance
-    adobe_content_types: ["photo", "illustration", "zip_vector", "template", "3d", "image"]
-    timeout: 6
-    disabled: true
-
-  - name: adobe stock video
-    engine: adobe_stock
-    shortcut: asv
-    network: adobe stock
-    categories: ["videos"]
-    adobe_order: relevance
-    adobe_content_types: ["video"]
-    timeout: 6
-    disabled: true
-
-  - name: adobe stock audio
-    engine: adobe_stock
-    shortcut: asa
-    network: adobe stock
-    categories: ["music"]
-    adobe_order: relevance
-    adobe_content_types: ["audio"]
-    timeout: 6
     disabled: true
 
   - name: astrophysics data system
@@ -437,6 +496,9 @@ engines:
     categories: onions
     enable_http: true
     shortcut: ah
+    # inactive: the module exists but registration fails without Tor
+    # (update_attributes_for_tor marks it out) — one ERROR line per start.
+    inactive: true
 
   - name: anaconda
     engine: xpath
@@ -450,27 +512,6 @@ engines:
     categories: it
     timeout: 6.0
     shortcut: conda
-    disabled: true
-
-  - name: aol
-    engine: aol
-    search_type: search
-    categories: [general]
-    shortcut: aol
-    disabled: true
-
-  - name: aol images
-    engine: aol
-    search_type: image
-    categories: [images]
-    shortcut: aoli
-    disabled: true
-
-  - name: aol videos
-    engine: aol
-    search_type: video
-    categories: [videos]
-    shortcut: aolv
     disabled: true
 
   - name: arch linux wiki
@@ -629,11 +670,6 @@ engines:
   - name: cachy os packages
     engine: cachy_os
     shortcut: cos
-    disabled: true
-
-  - name: cara
-    engine: cara
-    shortcut: ca
     disabled: true
 
   - name: chefkoch
@@ -835,7 +871,12 @@ engines:
   - name: duckduckgo
     engine: duckduckgo
     shortcut: ddg
-    inactive: true  # CAPTCHA/crash-banned 2026-11-01 under machine-paced traffic; engines-param-proof
+    # Best-effort contributor (2026-11-10): still anomaly/captcha-banned from
+    # the 2026-11-01 machine-traffic ban, but DDG bans lift — SearXNG suspends
+    # the engine on captcha (1 day, in-memory; see suspended_times) and it
+    # contributes again whenever the ban clears. The API backbone (exaapi +
+    # keyless) keeps results flowing regardless.
+    inactive: false
 
   - name: duckduckgo images
     engine: duckduckgo_extra
@@ -1338,12 +1379,6 @@ engines:
     # https://github.com/searxng/searxng/issues/3610
     inactive: true
 
-  - name: library of congress
-    engine: loc
-    shortcut: loc
-    categories: images
-    disabled: true
-
   - name: libretranslate
     engine: libretranslate
     # https://github.com/LibreTranslate/LibreTranslate?tab=readme-ov-file#mirrors
@@ -1484,6 +1519,9 @@ engines:
     engine: mwmbl
     # api_url: https://api.mwmbl.org
     shortcut: mwm
+    # Keyless JSON API, no captchas, but the index is small and noisy
+    # (75 mostly-irrelevant hits for a normal query), so it stays out of
+    # the default fan-out. Select it explicitly with !mwm when wanted.
     disabled: true
 
   - name: niconico
@@ -1743,41 +1781,6 @@ engines:
   #    query_str: 'SELECT * from my_table WHERE my_column = %(query)s'
   #    shortcut : psql
 
-  - name: presearch
-    engine: presearch
-    search_type: search
-    categories: [general, web]
-    shortcut: ps
-    timeout: 4.0
-    disabled: true
-
-  - name: presearch images
-    engine: presearch
-    network: presearch
-    search_type: images
-    categories: [images, web]
-    timeout: 4.0
-    shortcut: psimg
-    disabled: true
-
-  - name: presearch videos
-    engine: presearch
-    network: presearch
-    search_type: videos
-    categories: [general, web]
-    timeout: 4.0
-    shortcut: psvid
-    disabled: true
-
-  - name: presearch news
-    engine: presearch
-    network: presearch
-    search_type: news
-    categories: [news, web]
-    timeout: 4.0
-    shortcut: psnews
-    disabled: true
-
   - name: pub.dev
     engine: xpath
     shortcut: pd
@@ -1881,12 +1884,6 @@ engines:
   - name: radio browser
     engine: radio_browser
     shortcut: rb
-
-  - name: reddit
-    engine: reddit
-    shortcut: re
-    page_size: 25
-    disabled: true
 
   - name: reuters
     engine: reuters
@@ -2054,7 +2051,12 @@ engines:
     shortcut: sp
     startpage_categ: web
     categories: [general, web]
-    inactive: true  # CAPTCHA-banned 2026-11-01 under machine-paced traffic; engines-param-proof
+    # Best-effort contributor (2026-11-10): probe shows the 2026-11-01
+    # captcha ban has lifted (clean 200s). Google-backed results — the
+    # highest-quality scraping engine here. Will re-ban under machine-paced
+    # bursts; SearXNG's captcha suspension (1 day, in-memory) keeps it out
+    # of the way until then.
+    inactive: false
 
   - name: startpage news
     engine: startpage
@@ -2143,20 +2145,6 @@ engines:
     content_xpath: .//div[contains(@class,"overview")]
     shortcut: tm
     disabled: true
-
-  # Requires Tor
-  - name: torch
-    engine: xpath
-    paging: true
-    search_url:
-      http://xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd.onion/cgi-bin/omega/omega?P={query}&DEFAULTOP=and
-    results_xpath: //table//tr
-    url_xpath: ./td[2]/a
-    title_xpath: ./td[2]/b
-    content_xpath: ./td[2]/small
-    categories: onions
-    enable_http: true
-    shortcut: tch
 
   # TubeArchivist is a self-hosted Youtube archivist software.
   # https://docs.searxng.org/dev/engines/online/tubearchivist.html
@@ -2457,7 +2445,12 @@ engines:
     inactive: true
 
   - name: mojeek
-    disabled: true
+    # Best-effort contributor (2026-11-10): independent index (own crawler,
+    # genuinely different results) but re-bans fast under machine-paced
+    # traffic — captcha-walled again at the moment. SearXNG's captcha
+    # suspension keeps it out of the way; it contributes in the windows
+    # where it is healthy.
+    disabled: false
     shortcut: mjk
     engine: mojeek
     categories: [general, web]
@@ -2722,7 +2715,11 @@ engines:
     paging: true
     categories: [general, web]
     brave_category: search
-    disabled: true  # 429 rate-limit-banned 2026-11-01. NOT inactive: brave.images/videos need network: brave; selected via engines param it 429s loudly.
+    # Best-effort contributor (2026-11-10): 429-banned at the moment, but
+    # brave bans are shorter-lived than DDG's; contributes between bursts.
+    # NOT inactive: brave.images/videos need network: brave; selected via
+    # engines param it 429s loudly.
+    disabled: false  # was: true, 429 rate-limit-banned 2026-11-01
     # brave_spellcheck: true
 
   - name: brave.images
