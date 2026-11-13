@@ -373,6 +373,29 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("untrusted filename", result["messages"][0]["content"])
         self.assertEqual(result["messages"][1]["content"], [part(NEW)])
 
+    async def test_filters_preserve_noncopyable_mcp_runtime_metadata(self):
+        async def stream():
+            yield None
+
+        runtime = stream()
+        try:
+            metadata = {"mcp_clients": {"audiobookshelf": {"stream": runtime}}}
+            messages = [{"role": "user", "content": [part(OLD), part(NEW)]}]
+            body = {"messages": messages, "metadata": metadata}
+            before = copy.deepcopy(messages)
+            for handler in (self.filter.inlet, self.filter.request):
+                with self.subTest(handler=handler.__name__):
+                    result = await handler(body, USER, META, self.req)
+                    self.assertIsNot(result, body)
+                    self.assertIs(result["metadata"], metadata)
+                    self.assertIs(result["metadata"]["mcp_clients"]["audiobookshelf"]["stream"], runtime)
+                    self.assertIsNot(result["messages"], messages)
+                    self.assertEqual(messages, before)
+                    self.assertNotIn(part(OLD), result["messages"][-1]["content"])
+                    self.assertIn(part(NEW), result["messages"][-1]["content"])
+        finally:
+            await runtime.aclose()
+
     async def test_manifest_preserves_existing_system_prompt(self):
         for content in ["Original safety instructions", [{"type": "text", "text": "Original safety instructions"}]]:
             body = {"messages": [{"role": "system", "content": content}]}

@@ -163,7 +163,11 @@ def prune_messages(body, approved=(), current=(), substitutions=None, unchanged=
     Only our exact generated labels are replaced; user text and tool arguments
     are never interpreted or rewritten.
     """
-    result = copy.deepcopy(body)
+    # Runtime metadata can hold live MCP clients/streams, which cannot be copied.
+    # Only messages are modified by this filter.
+    result = dict(body)
+    if "messages" in body:
+        result["messages"] = copy.deepcopy(body["messages"])
     substitutions = dict(substitutions or {})
     groups = {group["number"]: group for group in substitutions.values()}
     frame_groups = {}
