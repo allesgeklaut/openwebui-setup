@@ -362,6 +362,13 @@ newly unfinished progress record skips only that episode, while any other
 change or failure stops the batch with a partial result. delete_podcast deletes
 a whole podcast by its podcast ID. Never use one ID type for the other.
 
+update_podcast_chronologically deletes only fully finished downloads of the
+connector account and tops up to 10 with later feed episodes oldest first,
+continuing after the newest original download. It preserves partial/unplayed
+episodes even above 10, refuses an empty starting queue or active downloads,
+and reports partial failures without retry or rollback. It does not change
+schedules or retention policies.
+
 download_episodes_from uses a fixed, inclusive window: the anchor episode plus
 the next count-1 episodes in publication order, skipping episodes that are
 already downloaded or queued without backfilling the window. It reports the
@@ -906,6 +913,35 @@ def create_server(
                 podcast_id,
                 limit,
                 expected_fingerprint=_expected_fingerprint(state),
+            )
+        )
+        return _public_result(result, config.abs_server_timezone)
+
+    @mcp.tool(
+        name="update_podcast_chronologically",
+        description=(
+            "Update one allowed podcast's chronological listening queue to 10. "
+            "Permanently delete downloaded episodes marked fully finished by "
+            "the connector's API-key account, rechecking progress before each "
+            "delete; preserve partially played and unplayed episodes, even if "
+            "more than 10 remain. Queue the next current-feed episodes oldest "
+            "first after the newest original download, including finished "
+            "downloads as anchors. Requires an existing chronological starting "
+            "point, no active or queued downloads, at most 25 finished episodes, "
+            "and retention disabled or at least 10 when replenishing. Does not "
+            "change schedules or retention. Downloads are asynchronous: queued "
+            "and remaining_count_estimate are not proof of completion. Stops "
+            "on failure with partial results; no retry or rollback. Hard deletes "
+            "remove listening data; filesystem removal is not verified. This "
+            "is an explicit user action with no extra confirmation."
+        ),
+        annotations=DESTRUCTIVE_HINTS,
+    )
+    async def update_podcast_chronologically(podcast_id: PodcastId) -> dict[str, Any]:
+        state = await _call(client.get_podcast_state(podcast_id))
+        result = await _call(
+            client.update_podcast_chronologically(
+                podcast_id, expected_fingerprint=_expected_fingerprint(state)
             )
         )
         return _public_result(result, config.abs_server_timezone)

@@ -4934,6 +4934,176 @@ async def test_new_podcast_mutations_require_writes_enabled(
     assert requests == []
 
 
+# --- Chronological replenishment -----------------------------------------
+
+
+def _chronological_routes(
+    item: dict[str, Any], records: list[dict[str, Any]], **kwargs: Any
+) -> Routes:
+    routes = _finished_delete_routes(item, records, **kwargs)
+    routes[("POST", "/api/podcasts/feed")] = _feed(*[
+        _feed_episode(f"guid-ep{i}", f"https://cdn.example/ep{i}.mp3", i * 1000)
+        for i in reversed(range(1, 21))
+    ])
+    routes[("POST", "/api/podcasts/pod1/download-episodes")] = httpx.Response(200)
+    return routes
+
+
+async def test_chronological_update_preserves_partial_and_unplayed(podcast_factory: Any) -> None:
+    item = _podcast(episodes=[_episode(f"ep{i}", i * 1000) for i in range(1, 5)])
+    records = [_progress("ep1", is_finished=True), _progress("ep2", current_time=100)]
+    transport, requests = _make_transport(_chronological_routes(item, records))
+    client = podcast_factory(transport)
+    result = await client.update_podcast_chronologically(
+        "pod1", expected_fingerprint=(await client.get_podcast_state("pod1"))["fingerprint"]
+    )
+    assert result["status"] == "queued"
+    assert result["deleted_episode_ids"] == ["ep1"]
+    assert result["queued_count"] == 7
+    assert result["remaining_count_estimate"] == 10
+    assert [ep["id"] for ep in item["media"]["episodes"]] == ["ep2", "ep3", "ep4"]
+    body = next(json.loads(r.content) for r in requests if r.url.path.endswith("download-episodes"))
+    assert [ep["guid"] for ep in body] == [f"guid-ep{i}" for i in range(5, 12)]
+    assert body[0]["pubDate"]
+
+
+@pytest.mark.parametrize("count", [1, 10, 12])
+async def test_chronological_update_all_finished_or_surplus(podcast_factory: Any, count: int) -> None:
+    item = _podcast(episodes=[_episode(f"ep{i}", i * 1000) for i in range(1, count + 1)])
+    records = [_progress("ep1", is_finished=True)] if count == 1 else []
+    transport, requests = _make_transport(_chronological_routes(item, records))
+    client = podcast_factory(transport)
+    result = await client.update_podcast_chronologically(
+        "pod1", expected_fingerprint=(await client.get_podcast_state("pod1"))["fingerprint"]
+    )
+    assert result["queued_count"] == (10 if count == 1 else 0)
+    assert result["remaining_count_estimate"] == max(10, count)
+    if count == 1:
+        body = next(json.loads(r.content) for r in requests if r.url.path.endswith("download-episodes"))
+        assert body[0]["guid"] == "guid-ep2"
+    else:
+        assert not _episode_deletes(requests)
+
+
+async def test_chronological_update_feed_exhausted(podcast_factory: Any) -> None:
+    item = _podcast(episodes=[_episode("ep19", 19000)])
+    transport, _ = _make_transport(_chronological_routes(item, []))
+    client = podcast_factory(transport)
+    result = await client.update_podcast_chronologically(
+        "pod1", expected_fingerprint=(await client.get_podcast_state("pod1"))["fingerprint"]
+    )
+    assert result["queued_count"] == 1
+    assert result["remaining_count_estimate"] == 2
+    assert "too few" in result["note"]
+
+
+async def test_chronological_update_cleared_finished_flag_reduces_topup(podcast_factory: Any) -> None:
+    item = _podcast(episodes=[_episode("ep1", 1000)])
+    routes = _chronological_routes(
+        item, [_progress("ep1", is_finished=True)],
+        per_episode=lambda _: httpx.Response(200, json=_progress("ep1", current_time=100)),
+    )
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    result = await client.update_podcast_chronologically(
+        "pod1", expected_fingerprint=(await client.get_podcast_state("pod1"))["fingerprint"]
+    )
+    assert result["deleted_count"] == 0
+    assert result["skipped"] == [{"id": "ep1", "reason": "finished_flag_cleared"}]
+    assert result["queued_count"] == 9
+    assert not _episode_deletes(requests)
+
+
+@pytest.mark.parametrize("failure", ["delete", "download"])
+async def test_chronological_update_reports_partial(podcast_factory: Any, failure: str) -> None:
+    item = _podcast(episodes=[_episode("ep1", 1000)])
+    routes = _chronological_routes(item, [_progress("ep1", is_finished=True)])
+    if failure == "delete":
+        routes[("DELETE", "/api/podcasts/pod1/episode/ep1")] = httpx.Response(500, text=BACKEND_SECRET)
+    else:
+        routes[("POST", "/api/podcasts/pod1/download-episodes")] = httpx.Response(500, text=BACKEND_SECRET)
+    transport, requests = _make_transport(routes)
+    client = podcast_factory(transport)
+    result = await client.update_podcast_chronologically(
+        "pod1", expected_fingerprint=(await client.get_podcast_state("pod1"))["fingerprint"]
+    )
+    assert result["status"] == "partial"
+    assert result["deleted_count"] == (0 if failure == "delete" else 1)
+    assert result["queued_count"] == 0
+    assert BACKEND_SECRET not in json.dumps(result)
+    if failure == "delete":
+        assert not any(r.url.path.endswith("download-episodes") for r in requests)
+
+
+@pytest.mark.parametrize("case", ["empty", "undated", "queue", "retention", "too_many", "duplicate", "stale", "readonly"])
+async def test_chronological_update_refuses_unsafe_plan(podcast_factory: Any, case: str) -> None:
+    item = _podcast(episodes=[_episode("ep1", 1000)])
+    records = [_progress("ep1", is_finished=True)]
+    if case == "empty":
+        item["media"]["episodes"] = []
+    elif case == "undated":
+        item["media"]["episodes"] = [_episode("unknown", None)]
+    elif case == "queue":
+        item["episodeDownloadsQueued"] = [_queue_entry("g", "https://cdn.example/g.mp3")]
+    elif case == "retention":
+        item["media"]["maxEpisodesToKeep"] = 3
+    elif case == "too_many":
+        item["media"]["episodes"] = [_episode(f"ep{i}", i * 1000) for i in range(1, 27)]
+        records = [_progress(f"ep{i}", is_finished=True) for i in range(1, 27)]
+    elif case == "duplicate":
+        item["media"]["episodes"] *= 2
+    transport, requests = _make_transport(_chronological_routes(item, records))
+    client = podcast_factory(transport, writes=case != "readonly")
+    fingerprint = (await client.get_podcast_state("pod1"))["fingerprint"]
+    with pytest.raises(ABSClientError):
+        await client.update_podcast_chronologically(
+            "pod1", expected_fingerprint="0" * 64 if case == "stale" else fingerprint
+        )
+    assert not _episode_deletes(requests)
+    assert not any(r.url.path.endswith("download-episodes") for r in requests)
+
+
+@pytest.mark.parametrize("change", ["queue", "retained_identity", "feed", "policy"])
+async def test_chronological_update_refuses_drift_after_delete(podcast_factory: Any, change: str) -> None:
+    item = _podcast(episodes=[_episode("ep1", 1000), _episode("ep2", 2000)])
+    def after(_: str) -> None:
+        if change == "queue":
+            item["episodeDownloadsQueued"] = [_queue_entry("g", "https://cdn.example/g.mp3")]
+        elif change == "retained_identity":
+            item["media"]["episodes"][0]["publishedAt"] = 19000
+        elif change == "feed":
+            item["media"]["metadata"]["feedUrl"] = "https://feeds.example/other.xml"
+        else:
+            item["media"]["maxEpisodesToKeep"] = 1
+    transport, requests = _make_transport(_chronological_routes(
+        item, [_progress("ep1", is_finished=True)], after=after,
+    ))
+    client = podcast_factory(transport)
+    result = await client.update_podcast_chronologically(
+        "pod1", expected_fingerprint=(await client.get_podcast_state("pod1"))["fingerprint"]
+    )
+    assert result["status"] == "partial"
+    assert result["deleted_count"] == 1
+    assert result["queued_count"] == 0
+    assert not any(r.url.path.endswith("download-episodes") for r in requests)
+
+
+async def test_chronological_update_preflights_before_delete(podcast_factory: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    item = _podcast(episodes=[_episode("ep1", 1000)])
+    transport, requests = _make_transport(_chronological_routes(item, [_progress("ep1", is_finished=True)]))
+    client = podcast_factory(transport)
+    async def refuse(url: str) -> str:
+        if url.endswith(".mp3"):
+            raise ABSInvalidRequest("Unsafe enclosure.")
+        return url
+    monkeypatch.setattr(podcasts, "ensure_public_url", refuse)
+    with pytest.raises(ABSInvalidRequest):
+        await client.update_podcast_chronologically(
+            "pod1", expected_fingerprint=(await client.get_podcast_state("pod1"))["fingerprint"]
+        )
+    assert not _episode_deletes(requests)
+
+
 # --- Finished-only episode deletion ---------------------------------------
 
 

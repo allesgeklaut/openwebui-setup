@@ -641,6 +641,132 @@ class PodcastClient(ABSClient):
                 podcast_id, len(window), queued, skipped
             )
 
+    async def update_podcast_chronologically(
+        self, podcast_id: str, *, expected_fingerprint: str
+    ) -> dict[str, Any]:
+        """Remove finished downloads and replenish the chronological queue to ten.
+
+        Plan and preflight before deleting. Continue after the newest original
+        download, including finished ones, so an all-finished queue still has an
+        anchor. Never guess a starting point for an empty or undated queue.
+        Native downloads are asynchronous; counts are snapshot estimates, not
+        a completion guarantee. A failed write is not retried or rolled back.
+        """
+        self._require_writes_enabled()
+        expected = _require_fingerprint(expected_fingerprint)
+        async with _MUTATION_LOCK:
+            item = await self._load_podcast(podcast_id)
+            _require_unchanged(self._state(item), expected)
+            if self._queue_entries(item):
+                raise ABSResponseError(_DOWNLOADS_ACTIVE)
+            downloaded = self._downloaded_episodes(item)
+            if not downloaded:
+                raise ABSInvalidRequest(
+                    "No downloaded episodes to continue from; use "
+                    "download_episodes_from to choose a starting episode first."
+                )
+            if any(n > 1 for n in _episode_row_counts(downloaded).values()):
+                raise ABSResponseError(_AMBIGUOUS_EPISODE_ROWS)
+            progress = await self._fetch_account_progress(podcast_id)
+            targets = [
+                ep["id"] for ep in _order_episodes_oldest(downloaded)
+                if _is_finished(progress.get(ep["id"]))
+            ]
+            if len(targets) > MAX_SELECTED_EPISODES:
+                raise ABSInvalidRequest(
+                    "More than 25 finished episodes; use "
+                    "delete_finished_podcast_episodes first."
+                )
+            catalogue = _order_catalogue(
+                _feed_catalogue(podcast_id, await self._fetch_stored_feed(item)),
+                "oldest",
+            )
+            anchors: list[tuple[int, str]] = []
+            for episode in downloaded:
+                keys = _episode_keys(episode.get("guid"), _episode_enclosure_url(episode))
+                matches = [
+                    entry for entry in catalogue
+                    if keys & _episode_keys(entry["guid"], entry["url"])
+                ]
+                if matches:
+                    anchors.append(max((ep["published"], ep["id"]) for ep in matches))
+                else:
+                    published = _epoch_ms(episode.get("publishedAt"))
+                    if published is None:
+                        raise ABSInvalidRequest(
+                            "Cannot determine chronological position of a downloaded episode."
+                        )
+                    # No matching feed identity: conservatively skip date ties.
+                    anchors.append((published, "~"))
+            anchor = max(anchors)
+            blocked = self._blocked_episode_keys(item)
+            selected = [
+                entry for entry in catalogue
+                if (entry["published"], entry["id"]) > anchor
+                and not (_episode_keys(entry["guid"], entry["url"]) & blocked)
+            ][:max(0, 10 - (len(downloaded) - len(targets)))]
+            if selected and 0 < self._state(item)["keep_episodes"] < 10:
+                raise ABSInvalidRequest(
+                    "Native retention is below 10; raise it to at least 10 "
+                    "or disable retention before chronological replenishment."
+                )
+            # Validate every URL before any destructive action, even if a later
+            # progress recheck means fewer downloads will be needed.
+            typed = await self._typed_candidates(selected)
+            deleted: list[str] = []
+            skipped: list[dict[str, str]] = []
+            failed: str | None = None
+            error: str | None = None
+            if targets:
+                snapshots, item_snapshot = await self._prevalidate_delete_targets(item, targets)
+                deleted, skipped, failed, error = await self._delete_finished_episode_batch(
+                    podcast_id, targets, item, snapshots, item_snapshot
+                )
+            result: dict[str, Any] = {
+                "podcast_id": podcast_id,
+                "status": "partial" if error else "completed",
+                "target_count": 10,
+                "deleted_count": len(deleted),
+                "deleted_episode_ids": deleted,
+                "skipped": skipped,
+                "queued_count": 0,
+                "episodes": [],
+                "remaining_count_estimate": len(downloaded) - len(deleted),
+                "filesystem_removal": "not_verified",
+            }
+            if error:
+                result.update(error=error, failed_episode_id=failed)
+                return result
+            try:
+                probe = await self._load_podcast(podcast_id)
+                self._require_download_identity(probe, item)
+                if self._state(probe) != self._state_without_episodes(item, set(deleted)):
+                    raise ABSResponseError(_CHANGED_DURING_DELETE)
+                remaining = self._downloaded_episodes(probe)
+                # The fingerprint covers IDs, not changes to retained episodes'
+                # dates or enclosure identity. Those also affect our anchor.
+                originals = {ep["id"]: _episode_identity(ep) for ep in downloaded}
+                if any(_episode_identity(ep) != originals[ep["id"]] for ep in remaining):
+                    raise ABSResponseError(_CHANGED_DURING_DELETE)
+                needed = max(0, 10 - len(remaining))
+                selected, typed = selected[:needed], typed[:needed]
+                await self._post_downloads(podcast_id, typed)
+            except ABSClientError as exc:
+                result.update(status="partial", error=str(exc))
+                return result
+            result.update(
+                status="queued" if selected else "completed",
+                queued_count=len(selected),
+                episodes=[{
+                    "id": ep["id"], "title": ep["title"],
+                    "published_at": _iso_timestamp(ep["published"]),
+                } for ep in selected],
+                remaining_count_estimate=len(remaining) + len(selected),
+            )
+            if len(remaining) + len(selected) < 10:
+                result["note"] = "The current feed has too few later episodes to reach 10."
+            return result
+
     async def set_podcast_schedule(
         self,
         podcast_id: str,

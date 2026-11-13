@@ -581,6 +581,7 @@ WRITE_TOOL_NAMES = {
     "delete_podcast_episode",
     "delete_podcast_episodes",
     "delete_finished_podcast_episodes",
+    "update_podcast_chronologically",
     "delete_podcast",
 }
 BACKEND_LEAK = "private-backend-body"
@@ -968,7 +969,7 @@ async def test_write_mode_registers_exactly_read_and_podcast_tools(
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
 
     assert set(tools) == READ_TOOL_NAMES | WRITE_TOOL_NAMES
-    assert len(tools) == 17
+    assert len(tools) == 18
     for name, tool in tools.items():
         assert tool.inputSchema["additionalProperties"] is False, name
         properties = tool.inputSchema["properties"]
@@ -1034,6 +1035,7 @@ async def test_write_mode_registers_exactly_read_and_podcast_tools(
         "delete_podcast_episode",
         "delete_podcast_episodes",
         "delete_finished_podcast_episodes",
+        "update_podcast_chronologically",
         "set_podcast_retention",
         "set_podcast_schedule",
     ):
@@ -2085,6 +2087,33 @@ async def test_delete_podcast_episodes_uses_internal_state_fence(
     assert not any(
         request.method == "DELETE" for request in backend.requests
     )
+
+
+async def test_chronological_update_tool_routes_with_internal_fence(
+    config_factory: Callable[..., Config],
+) -> None:
+    backend = _PodcastBackend()
+    backend.media_progress = [
+        _finished_progress("ep1"),
+        _finished_progress("ep2", is_finished=False, current_time=60),
+    ]
+    async with _mcp_session(
+        config_factory(podcast_writes_enabled=True), backend
+    ) as session:
+        result = await session.call_tool(
+            "update_podcast_chronologically", {"podcast_id": "pod1"}
+        )
+    assert result.isError is not True
+    payload = _tool_payload(result)
+    assert payload["deleted_episode_ids"] == ["ep1"]
+    assert payload["queued_count"] == 3
+    assert payload["remaining_count_estimate"] == 5
+    assert payload["status"] == "queued"
+    assert "fingerprint" not in json.dumps(payload)
+    assert "connector-user" not in json.dumps(payload)
+    assert "http" not in json.dumps(payload)
+    downloads = [json.loads(r.content) for r in backend.requests if r.url.path.endswith("download-episodes")]
+    assert [ep["guid"] for ep in downloads[0]] == ["feed-1", "feed-2", "feed-3"]
 
 
 async def test_delete_finished_podcast_episodes_deletes_account_finished(
@@ -3394,7 +3423,7 @@ async def test_unknown_arguments_are_rejected_for_every_registered_tool(
         config_factory(podcast_writes_enabled=True), backend
     ) as session:
         tools = (await session.list_tools()).tools
-        assert len(tools) == 17
+        assert len(tools) == 18
         for tool in tools:
             assert tool.inputSchema["additionalProperties"] is False, tool.name
             result = await session.call_tool(

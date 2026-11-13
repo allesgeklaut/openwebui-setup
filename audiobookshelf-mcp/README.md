@@ -6,7 +6,7 @@ in both modes.
 
 - **Read-only (default):** exactly three tools, with no podcast mutation.
 - **Podcast writes (opt-in):** setting `ABS_ENABLE_PODCAST_WRITES=true` adds
-  fourteen podcast tools (seventeen total). The server remains stateless; there
+  fifteen podcast tools (eighteen total). The server remains stateless; there
   is no session store, approval flow, or confirmation token.
 
 Writes stay off unless explicitly enabled. A default deployment registers
@@ -35,6 +35,7 @@ subscription, download, schedule, retention, or delete tool.
 | `download_latest_episodes` | `podcast_id`, `count` (optional, 1–25, default 10) | Queue recent episodes that are not already downloaded, queued, or active. Before the single download request, it applies the same final scope, feed-identity, and blocked-state recomputation as the feed-selection tools after URL preflight. Returns `queued` or `nothing_new`, never `completed`. `queued_count` counts requests submitted to the native queue, not verified item-by-item acceptance or completion. |
 | `download_podcast_episodes` | `podcast_id`, `episode_ids` (1–25 unique feed IDs) | Queue individually selected episodes from the current feed. Feed IDs are resolved against the requested podcast's current feed; enclosure URLs pass the URL preflight before one download request; already downloaded or queued entries are skipped and listed in `skipped_episodes` with `reason`. Returns `queued` or `nothing_new` with submitted-request counts, never `completed`. |
 | `download_episodes_from` | `podcast_id`, `start_episode_id` (feed ID), `count` (optional, 1–25, default 10) | Queue a fixed chronological window: the anchor plus the next `count - 1` newer episodes, oldest to newest. Already downloaded or queued entries inside the window are skipped without backfilling outside it and are listed in `skipped_episodes` with `reason`. Returns submitted-request counts, not completion. |
+| `update_podcast_chronologically` | `podcast_id` | Delete fully finished downloads and replenish to 10 with later episodes oldest first. Preserve partial/unplayed downloads, including surplus above 10. See safeguards below. |
 | `set_podcast_schedule` | `podcast_id`, `enabled`, `schedule` (optional), `max_new_episodes` (optional) | Enable with a validated five-field cron and 1–25 new episodes. Omitted values reuse current settings, except that an empty cron becomes hourly and an unlimited `0` limit becomes 3. Disabling requires both omitted, preserves old cron/limit, and does not clear the queue or delete files. |
 | `set_podcast_retention` | `podcast_id`, `keep`, `trim_existing` (optional, default `false`) | Set retention to 0–1000 episodes (0 = unlimited). Only an explicit `trim_existing=true` deletes surplus episodes now, capped at 100. |
 | `delete_podcast_episode` | `podcast_id`, `episode_id` (native ID) | Hard-delete one downloaded episode; removes its database record. Physical file wipe is not verified. |
@@ -51,10 +52,12 @@ found or not permitted. Tool results contain only a compact projection;
 backend paths, folder IDs, `fullPath` values, image/feed/enclosure URLs,
 descriptions, GUIDs, and raw API payloads are never returned.
 
-`delete_finished_podcast_episodes` is the only tool that selects targets from
-saved listening state, and it is an explicit per-call operation, not a
+`delete_finished_podcast_episodes` and `update_podcast_chronologically` select
+deletion targets from saved listening state. Both are explicit per-call
+operations, not a
 retention policy: `set_podcast_retention` and Audiobookshelf's native automatic
-retention still ignore listened state. It returns `status` (`completed` or
+retention still ignore listened state. `delete_finished_podcast_episodes`
+returns `status` (`completed` or
 `partial`), `requested_count`, `deleted_count`, `deleted_episode_ids`,
 `skipped_episode_ids`, `skipped` (each `id` plus `reason`),
 `finished_episode_count`, `remaining_finished_count`, `limit`,
@@ -196,6 +199,40 @@ Each available episode is reported with `id`, `title`, `published_at`,
 neither proves that an asynchronous download has finished. When exactly one
 downloaded episode matches, `downloaded_episode_id` is included as a convenience
 for the native-ID delete tools; otherwise it is omitted.
+
+### Chronological queue update
+
+`update_podcast_chronologically(podcast_id)` is a one-shot destructive update,
+not a recurring scheduler. It uses the connector API-key account's finished
+flags (not the caller's identity), rechecks progress before each hard delete,
+and preserves unplayed or partially played episodes. It queues enough later
+episodes to bring the remaining downloads plus acknowledged submissions to 10.
+If more than 10 remain, nothing unplayed is deleted. It continues after the
+newest **original** download, including finished downloads, ordered by feed
+publication date and opaque selector for ties. For an original download absent
+from the current feed, it uses its publication date and skips that date's ties.
+It does not backfill gaps before that anchor or change schedules/retention.
+
+The operation refuses queued/active downloads, duplicate native IDs, an empty
+download set, or an episode without a usable feed match or publication date.
+Use `download_episodes_from` to establish an explicit starting queue if needed.
+It refuses more than 25 finished targets before deleting anything; use the
+existing bounded finished-delete tool first. When replenishing, native retention
+must be disabled (`0`) or at least `10`, to avoid native eviction of unplayed
+episodes. Feed fetch and selected enclosure validation precede all deletions.
+The usual scope/path guards, mutation lock and internal fingerprint fences
+apply; state and retained episode identities are checked again before queuing.
+
+Results report `deleted_episode_ids`, `deleted_count`, progress recheck `skipped`
+entries, `queued_count`, safe queued `episodes`, `target_count` (10), and
+`remaining_count_estimate`. `status` is `queued`, `completed` (no download
+submission needed/available), or `partial` on a hard failure after processing
+starts. A short current feed may leave fewer than 10 and is reported in `note`.
+Downloads remain asynchronous: acknowledged submission is not completion, and a
+failed request may have been applied by the backend. Counts are estimates;
+external writers and progress can race final reads. No retries, rollback, or
+filesystem-removal verification are performed. Never automatically retry a
+partial update without checking current state.
 
 ### Selected downloads and chronological windows
 
@@ -563,7 +600,7 @@ All credentials are file-backed; there are intentionally no direct
 | `ABS_URL` | yes | — | Fixed backend base URL (`http`/`https`, no userinfo, query, or fragment). Use the Audiobookshelf origin, normally without `/api`. |
 | `ABS_ALLOWED_LIBRARY_IDS` | yes | — | Non-empty comma-separated library ID allowlist. These IDs are also enforced against backend search results, item `libraryId` values, and every podcast operation. |
 | `ABS_API_KEY_FILE` | yes | — | File containing the Audiobookshelf API key. Read-only mode uses a restricted key; write mode requires an admin-owned key (see below). |
-| `ABS_ENABLE_PODCAST_WRITES` | no | `false` | `true` registers the fourteen podcast tools (seventeen total, including three read-only). Only case-insensitive `true`/`false` is accepted; any other value fails startup. |
+| `ABS_ENABLE_PODCAST_WRITES` | no | `false` | `true` registers the fifteen podcast tools (eighteen total, including three read-only). Only case-insensitive `true`/`false` is accepted; any other value fails startup. |
 | `ABS_SERVER_TIMEZONE` | no | unset/unknown | Optional IANA zone name (for example `Europe/Vienna`) asserted by the operator for `get_podcast_settings.server_timezone`. It is reporting metadata only, not Audiobookshelf autodiscovery and not the connector container's local zone. Unset or blank means `null`/unknown. An invalid or non-IANA value fails startup. |
 | `MCP_AUTH_TOKEN_FILE` | yes | — | File containing the MCP bearer token; at least 32 characters. |
 | `MCP_HOST` | no | `0.0.0.0` | Bind address. |
@@ -740,10 +777,10 @@ ordering with undated episodes last, the 1–25 limit bounds, a zero-finished
 result that sends no DELETE, per-target recheck request ordering, both skip
 reasons continuing the batch, hard-failure partial accounting, queue-active and
 stale-fingerprint refusals before any progress read, writes-disabled refusal,
-17/3 tool registration, closed schemas, and unknown-argument rejection with
+18/3 tool registration, closed schemas, and unknown-argument rejection with
 zero backend requests.
 
-The suite holds 763 tests at the time of writing. These are synthetic
+These are synthetic
 unit/protocol tests: native queue FIFO and dedupe behavior is source-verified,
 not exercised against a live queue. No model-in-the-loop evaluation, frontend
 mutation test, or real Audiobookshelf download/delete/policy/subscription call
