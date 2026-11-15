@@ -297,7 +297,7 @@ would not render correctly.
 The same container serves opencode over the tailnet at
 `https://<tailnet-host>:8444/mcp` (Tailscale Serve, tailnet-only).
 The container publishes only `127.0.0.1:8011:8000` on the host and mounts only
-the ComfyUI code, embeddings, input, and output directories. See
+the ComfyUI code, workflows, embeddings, input, and output directories. See
 `../comfyui-mcp/README.md` for tools, timings, and the narrow mount list.
 
 Tools: `image_status`, `generate_image`, `edit_image`, `generate_video`,

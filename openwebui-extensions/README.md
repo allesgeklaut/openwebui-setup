@@ -11,7 +11,7 @@ Only trusted, administrator-reviewed Python code belongs here.
 - `searxng_image_search/` — runtime implementation of the image-search tool.
 - `searxng-images/` — its registration entry, tests and
   [installation documentation](searxng-images/README.md).
-- `comfyui_media/` — automatic native MP4 attachment/runtime player integration.
+- `comfyui_media/` — automatic native MP4 attachment and display guidance.
 - `comfyui-media/` — registration, tests and
   [installation documentation](comfyui-media/README.md).
 

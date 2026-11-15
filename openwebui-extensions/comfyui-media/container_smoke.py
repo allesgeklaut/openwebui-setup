@@ -103,16 +103,20 @@ async def main():
             repeated = await function.request(body, owner, metadata, fresh, emitter)
             assert repeated == result
         message.update(output=tool_output, files=attachments)
-        outlet = await function.outlet({"messages": [message]}, owner, metadata, request, emitter)
+        outlet_body = {"messages": [message]}
+        # v0.1.3: presentation is the native display tool's alone. The outlet
+        # persists late uploads but never appends player markup.
+        outlet = await function.outlet(outlet_body, owner, metadata, request, emitter)
+        assert outlet is outlet_body, "Outlet must not rewrite the response"
         rendered = outlet["messages"][0]
-        token = "<video>\n" + attachment["url"] + "\n</video>"
-        assert token in rendered["content"]
-        assert any(part.get("text") == token for item in rendered["output"]
-                   for part in item.get("content", []))
-        assert await function.outlet(outlet, owner, metadata, request, emitter) == outlet
+        assert "<video>" not in rendered["content"]
+        assert not any("<video>" in str(part.get("text", ""))
+                       for item in rendered.get("output") or []
+                       for part in item.get("content", []) if isinstance(part, dict))
+        assert await function.outlet(outlet, owner, metadata, request, emitter) is outlet
         await Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, rendered)
     persisted = await Chats.get_chat_by_id_and_user_id(chat_id, user.id)
-    assert token in persisted.chat["history"]["messages"][message_id]["content"]
+    assert "<video>" not in persisted.chat["history"]["messages"][message_id]["content"]
     # Exercise the registered native pipeline, including injected hook arguments.
     from open_webui.models.functions import Functions
     from open_webui.utils.filter import process_filter_functions
@@ -128,7 +132,8 @@ async def main():
     assert pipeline_outlet == outlet
     print(json.dumps({"status": "pass", "provider_calls": 0, "native_upload": "pass",
                       "ownership": "pass", "live_stream_provenance": "pass",
-                      "persistence_events_resume_idempotence": "pass", "player_output": "pass",
+                      "persistence_events_resume_idempotence": "pass",
+                      "outlet_no_player_markup": "pass",
                       "registered_pipeline": "pass", "chat_id": chat_id, "file_id": file.id}))
 
 
