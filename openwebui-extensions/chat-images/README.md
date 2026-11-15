@@ -1,6 +1,6 @@
 # Selective chat image retrieval
 
-Repo-managed native Open WebUI **Filter + Tool**, targeting v0.13.0. No extra
+Repo-managed native Open WebUI **Filter + Tool**, verified on v0.13.3. No extra
 service, credentials, outbound HTTP client, or database writes. Installing Python
 extensions grants server-side code execution: only administrators should manage
 these files and their registration.
@@ -52,9 +52,11 @@ these files and their registration.
   serialize concurrent calls, and recheck ownership/branch after confirmation.
 - The `request` hook runs again during tool loops: the latest image set, approved
   retrievals, and **new current-response tool images** survive. New tool output
-  is verified against the owned response's server-persisted results/attachments;
-  a synthetic `user` role alone does not grant an exception. Previously saved
-  results on a resumed response are history, not newly generated images.
+   is verified against the owned response's saved results/attachments and active
+   response buffer (Open WebUI saves streaming tool results to chat only at the
+   end). A synthetic `user` role alone does not grant an exception. Resuming the
+   same response preserves its images; starting a new response makes those old
+   tool images history again.
 - Current image-generation outputs are passed through **unchanged**: no resizing,
   JPEG conversion, deduplication, or retrieval-specific 10 MiB source limit.
   Generation JSON, current image-file metadata and UI events remain intact.

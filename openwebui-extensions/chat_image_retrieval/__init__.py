@@ -513,9 +513,9 @@ async def load_source(url, user_id):
 async def response_images(user, metadata):
     """Image provenance from the owned response record, not model arguments.
 
-    OWUI persists native tool results before calling request filters. Snapshot
-    completed outputs on entry; only newly completed/changed results are current.
-    Generated UI attachments are separate from multimodal tool-result parts.
+    Saved results cover resumed responses. Active streaming results are merged
+    separately by current_response_images. UI attachments are separate from
+    multimodal tool-result parts.
     """
     from open_webui.models.chats import Chats
 
@@ -526,6 +526,29 @@ async def response_images(user, metadata):
     if not isinstance(message, dict):
         raise ValueError("A saved current response is required.")
     return await asyncio.to_thread(response_image_snapshot, message)
+
+
+async def current_response_images(user, metadata, request):
+    """Include active tool results, which OWUI only writes to chat on completion.
+
+    Check owned persisted context first. Never authorize images from the incoming
+    payload or another response's stream, even when tasks share a chat/request.
+    """
+    results = await response_images(user, metadata)
+    app_state = getattr(getattr(request, "app", None), "state", None)
+    if app_state is None:
+        return results
+    from open_webui.tasks import get_response_streams_by_chat_id
+
+    streams = await get_response_streams_by_chat_id(
+        getattr(app_state, "redis", None), metadata["chat_id"])
+    for stream in streams:
+        if (stream.get("chat_id") == metadata["chat_id"]
+                and stream.get("message_id") == metadata["message_id"]):
+            results.update(await asyncio.to_thread(response_image_snapshot, stream))
+    if sum(map(len, results.values())) > MAX_RESPONSE_IMAGE_SOURCES:
+        raise ValueError("Current response exceeds the 64 image-source processing limit.")
+    return results
 
 
 def response_image_snapshot(message):
@@ -677,11 +700,16 @@ class Filter:
             raise ValueError(f"Latest images expand to {expanded_count} frames/images; "
                              f"the configured limit is {max_expanded}. Attach fewer GIFs "
                              "or reduce gif_max_frames.")
-        baseline = await response_images(__user__, __metadata__)
+        baseline = await current_response_images(__user__, __metadata__, __request__)
+        # A resumed tool call has already persisted its result before inlet
+        # runs. Treat the current response's images as current here as well,
+        # otherwise inlet prunes the image the model is about to be asked
+        # about and the request hook can no longer restore it.
+        current = await response_source_keys(baseline, __user__["id"])
         state = {
             "approved": allowed, "attempts": 0, "lock": asyncio.Lock(),
             "processed": dict(baseline),
-            "current": set(), "filter_lock": asyncio.Lock(),
+            "current": current, "filter_lock": asyncio.Lock(),
             "substitutions": substitutions,
             "unchanged": unchanged,
         }
@@ -691,7 +719,7 @@ class Filter:
             states = {}
             setattr(__request__.state, STATE_KEY, states)
         states[context_binding(__user__, __metadata__)] = state
-        result = await asyncio.to_thread(prune_messages, body, allowed, (), substitutions, unchanged)
+        result = await asyncio.to_thread(prune_messages, body, allowed, current, substitutions, unchanged)
         if catalog:
             manifest = (
                 "Saved images in this conversation branch (reference IDs are opaque):\n"
@@ -715,7 +743,7 @@ class Filter:
                       __request__=None) -> dict:
         state = request_state(__request__, __user__, __metadata__)
         async with state["filter_lock"]:
-            response = await response_images(__user__, __metadata__)
+            response = await current_response_images(__user__, __metadata__, __request__)
             changed = {key: urls for key, urls in response.items()
                        if state["processed"].get(key) != urls}
             if changed:

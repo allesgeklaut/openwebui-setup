@@ -255,6 +255,62 @@ try:
                     assert kept == generated_body, 'Current image generation output was dropped'
                     assert emitter.await_args.args[0]['data']['files'] == generated_files
 
+                # v0.13.3 emits active tool results to response_streams, NOT the
+                # chat DB. Exercise that real path, with owned local upload URL
+                # resolution, synthetic chat records, and zero provider calls.
+                from open_webui import tasks
+                stream_req = fixtures.request()
+                stream_req.app = SimpleNamespace(state=SimpleNamespace(redis=None))
+                stream_meta = {**fixtures.META, 'chat_id': 'synthetic-stream-chat'}
+                stream_chat = SimpleNamespace(chat={'history': {'messages': {
+                    'answer': {'id': 'answer', 'role': 'assistant', 'output': []},
+                    'next-answer': {'id': 'next-answer', 'role': 'assistant', 'output': []},
+                }}})
+                stream_body = {'messages': [
+                    {'role': 'user', 'content': [fixtures.part(fixtures.OLD)]},
+                    *middleware.process_messages_with_output([
+                        {'role': 'assistant', 'output': output}])]}
+                stream_tasks = {'synthetic-stream-chat': ['own-task', 'other-task']}
+                with patch.object(tasks, 'item_tasks', stream_tasks), \
+                     patch.object(tasks, 'response_streams', {}), \
+                     patch.object(Chats, 'get_chat_by_id_and_user_id', AsyncMock(return_value=stream_chat)), \
+                     patch.object(extension, 'owned_context', AsyncMock(return_value=({}, []))), \
+                     patch.object(config, 'UPLOAD_DIR', folder), \
+                     patch.object(Files, 'get_file_by_id', AsyncMock(return_value=record)), \
+                     patch.object(Files, 'get_file_by_id_and_user_id', AsyncMock(return_value=record)):
+                    resolved = await middleware.convert_url_images_to_base64(
+                        stream_body, user=user)
+                    await function.inlet({'messages': []}, fixtures.USER, stream_meta, stream_req)
+                    await tasks.save_response_stream(
+                        None, 'own-task', stream_meta['chat_id'], 'answer', output)
+                    # Another response's images may never grant an exception.
+                    await tasks.save_response_stream(
+                        None, 'other-task', stream_meta['chat_id'], 'other-answer', [
+                            {'type': 'function_call_output', 'call_id': 'other', 'output': [
+                                {'type': 'input_image', 'image_url': fixtures.OLD}]}])
+                    kept = await function.request(resolved, fixtures.USER, stream_meta, stream_req)
+                    assert image in json.dumps(kept), 'Live MCP image was pruned'
+                    assert fixtures.OLD not in json.dumps(kept), 'Other response/history image leaked'
+                    from open_webui.routers.openai import convert_to_responses_payload
+                    provider_payload = convert_to_responses_payload(
+                        {'model': 'synthetic-vision-model', 'messages': kept['messages']})
+                    assert image in json.dumps(provider_payload), 'Image lost in Responses serialization'
+                    assert fixtures.OLD not in json.dumps(provider_payload), 'History leaked to provider'
+                    resumed = await function.inlet(
+                        resolved, fixtures.USER, stream_meta, stream_req)
+                    assert image in json.dumps(resumed), 'Resumed current image was pruned'
+                    later = await function.inlet(resolved, fixtures.USER,
+                        {**stream_meta, 'message_id': 'next-answer'}, stream_req)
+                    assert image not in json.dumps(later), 'Previous response image leaked'
+                    with patch.object(Chats, 'get_chat_by_id_and_user_id', AsyncMock(return_value=None)):
+                        try:
+                            await extension.current_response_images(
+                                fixtures.USER, stream_meta, stream_req)
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError('Stream lookup bypassed owned-chat check')
+
             asyncio.run(smoke())
             result = {'unit_tests': tests.testsRun, 'native_loaders': 'pass',
                       'ownership_adapters': 'pass', 'tool_image_roundtrip': 'pass',
@@ -263,7 +319,8 @@ try:
                       'native_gif_upload_roundtrip': 'pass',
                       'native_bare_file_id': 'pass',
                       'native_gif_disclosure_and_file_context': 'pass',
-                      'native_four_frame_sampling_all_models': 'pass',
+                       'native_four_frame_sampling_all_models': 'pass',
+                       'live_mcp_stream_and_resume': 'pass',
                       'installed_entries': 'pass' if installed else 'not_checked',
                       'registered_extensions': 0}
     original_stdout.write(json.dumps(result) + '\n')

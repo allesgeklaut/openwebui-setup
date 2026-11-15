@@ -11,6 +11,9 @@ services:
       - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL}
       - WEBUI_NAME=Johannes AI
       - WEBUI_AUTH=true
+      # Browser/API and Socket.IO origins: only the public OWUI frontend.
+      # Value lives in the gitignored .env; do not commit real hostnames.
+      - CORS_ALLOW_ORIGIN=${CORS_ALLOW_ORIGIN}
       - ENABLE_SIGNUP=false
       - TZ=Europe/Vienna
       # Open Terminal auto-connect (full value incl. api_key loaded from env_file)
@@ -67,6 +70,8 @@ services:
       - /opt/stacks/webui/data:/app/backend/data
       # Mount trusted extensions read-only; registration/activation stays explicit.
       - ./openwebui-extensions:/app/backend/extensions:ro
+      # ComfyUI delivery adapter can import only production MP4 outputs.
+      - /opt/stacks/comfyui/output/mcp-video:/app/backend/comfyui-media:ro
       # Single source of truth for the LiteLLM API key — /opt/secrets/litellm.key.
       # Injected as OPENAI_API_KEY by the shared entrypoint wrapper, so the key
       # is not duplicated into any env file.
@@ -191,6 +196,37 @@ services:
       - default
       - stacks-shared
       - trilium
+
+  # Native streamable-MCP endpoint for the ComfyUI tools. Open WebUI connects
+  # to it directly (type: mcp) instead of going through mcpo's OpenAPI bridge,
+  # which would flatten MCP image content. The code is mounted read-only; the
+  # three narrow rw mounts are the only paths the server writes.
+  comfyui-mcp:
+    build: ../comfyui-mcp
+    image: comfyui-mcp:local
+    container_name: comfyui-mcp
+    restart: unless-stopped
+    user: "1000:1000"
+    volumes:
+      - /opt/stacks/comfyui-mcp:/app:ro
+      - /opt/stacks/webui/workflows:/comfyui/workflows:ro
+      - /opt/stacks/comfyui/models/embeddings:/comfyui/embeddings:rw
+      - /opt/stacks/comfyui/input:/comfyui/input:rw
+      - /opt/stacks/comfyui/output:/comfyui/output:rw
+    environment:
+      - COMFYUI_URL=http://${LAN_IP}:8189
+      - COMFYUI_OUTPUT_DIR=/comfyui/output
+      - COMFYUI_OUTPUT_HOST_DIR=/opt/stacks/comfyui/output
+      - COMFYUI_WORKFLOWS_DIR=/comfyui/workflows
+      - COMFYUI_EMBEDDINGS_DIR=/comfyui/embeddings
+      - COMFYUI_INPUT_DIR=/comfyui/input
+      - COMFYUI_MCP_TRANSPORT=streamable-http
+      - COMFYUI_MCP_PORT=8000
+    ports:
+      # Loopback only, for debugging and host-side MCP clients.
+      - "127.0.0.1:8011:8000"
+    networks:
+      - default
 
   searxng:
     image: searxng/searxng:latest

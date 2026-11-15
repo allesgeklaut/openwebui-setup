@@ -499,15 +499,22 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
              patch.object(extension, "render_image", side_effect=AssertionError("Generation was resized")):
             self.assertEqual(await self.filter.request(body, USER, META, self.req), body)
 
-    async def test_old_tool_result_is_not_current_on_resume(self):
-        self.response_mock.return_value = {"call:old-generation": (OLD,)}
-        await self.filter.inlet({"messages": []}, USER, META, self.req)
-        body = {"messages": [{"role": "user", "content": [part(OLD)]}]}
-        result = await self.filter.request(body, USER, META, self.req)
-        self.assertIsInstance(result["messages"][0]["content"], str)
-        self.response_mock.return_value = {"call:old-generation": (OLD,), "call:new-generation": (OLD,)}
-        result = await self.filter.request(body, USER, META, self.req)
-        self.assertEqual(result["messages"][0]["content"], [part(OLD)])
+    async def test_current_response_images_survive_inlet_on_resume(self):
+        generated = uri(png("green"))
+        self.response_mock.return_value = {"call:generate": (generated,)}
+        body = {"messages": [
+            {"role": "user", "content": [part(OLD)]},
+            {"role": "user", "content": [part(generated)]}]}
+        result = await self.filter.inlet(body, USER, META, self.req)
+        self.assertIsInstance(result["messages"][-2]["content"], str)
+        self.assertEqual(result["messages"][-1]["content"], [part(generated)])
+        self.assertEqual(await self.filter.request(result, USER, META, self.req), result)
+        # A new assistant response has no current tool results. Prior output is
+        # history again, even though it remains visible in the saved chat.
+        self.response_mock.return_value = {}
+        next_meta = {**META, "message_id": "next-answer"}
+        next_turn = await self.filter.inlet(body, USER, next_meta, request())
+        self.assertIsInstance(next_turn["messages"][-1]["content"], str)
 
     async def test_generated_sources_resolved_once_across_tool_rounds(self):
         generated = uri(png("green"))

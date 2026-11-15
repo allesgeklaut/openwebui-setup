@@ -42,6 +42,13 @@ LiteLLM, Trilium, Audiobookshelf and shared MCP services already exist.
 from `/opt/secrets`. Other services mount their own key/token files there.
 The SearXNG signing secret is `/opt/secrets/searxng.secret` (mode `600`).
 
+Browser origins are restricted via `CORS_ALLOW_ORIGIN`, set in the gitignored
+`.env` (Compose interpolates it) for both HTTP CORS and Socket.IO — keep the
+actual frontend origin out of the tracked files. Login/Cloudflare
+authentication is unchanged. If adding another browser-facing OWUI address,
+add its exact origin (scheme, host, port; no path) separated by `;` and
+recreate `open-webui`; do not restore `*`.
+
 ### 2. Start Services
 
 ```bash
@@ -96,6 +103,11 @@ MCPO uses a commit-tagged image, so image upgrades may need manual selection.
   can call it. Both `MISTRAL_API_KEY` and the agent id come from
   `/opt/secrets/mistral.env` (start.sh's config renderer for mcpo; the script's
   file fallback for opencode).
+- **comfyui**: Native Streamable-HTTP MCP in the `comfyui-mcp` service,
+  registered directly in Open WebUI as `http://comfyui-mcp:8000/mcp`
+  (`type: mcp`). It is deliberately not routed through mcpo: the OpenAPI bridge
+  would flatten image/GIF content. Tools cover image generation/editing,
+  LTX-2.5 video, first-frame I2V, and GIF. See `../comfyui-mcp/README.md`.
 
 ### SearXNG (`searxng/`)
 
@@ -272,11 +284,33 @@ keeping `prompt`→5, `model`→1 and `width`→5 (`resolution`) unchanged.
 (`../litellm/chatgpt_images/`) can also serve both image engines; its
 `configure_webui.py` switches the Open WebUI configuration.
 
+### ComfyUI MCP (`comfyui-mcp`)
+
+The `comfyui-mcp` service is a shared Streamable-HTTP MCP server for the local
+ComfyUI stack. Open WebUI connects directly to
+`http://comfyui-mcp:8000/mcp` with connection type `mcp`; the connection is
+stored in `tool_server.connections` in `data/webui.db`. The old
+`http://mcpo:8000/comfyui` OpenAPI entry and the corresponding mcpo server were
+removed: mcpo's OpenAPI bridge flattens MCP image content, so GIF/video results
+would not render correctly.
+
+The same container serves opencode over the tailnet at
+`https://<tailnet-host>:8444/mcp` (Tailscale Serve, tailnet-only).
+The container publishes only `127.0.0.1:8011:8000` on the host and mounts only
+the ComfyUI code, embeddings, input, and output directories. See
+`../comfyui-mcp/README.md` for tools, timings, and the narrow mount list.
+
+Tools: `image_status`, `generate_image`, `edit_image`, `generate_video`,
+`generate_video_from_image`, `generate_gif`. Video needs the proxy's
+`/recycle` handoff between the text encoder and the video DiT; the MCP does
+that automatically.
+
 ## Ports
 
 | Port | Service | Access |
 |------|---------|--------|
 | 3001 | Open WebUI | Loopback; remote access through the configured proxy |
+| 8011 | comfyui-mcp | Loopback; tailnet through Tailscale Serve on 8444 |
 | 8081 | SearXNG | Published on the host |
 
 Other services run internally and are not exposed.
