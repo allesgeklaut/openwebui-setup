@@ -14,6 +14,10 @@ Only trusted, administrator-reviewed Python code belongs here.
 - `comfyui_media/` — automatic native MP4 attachment and display guidance.
 - `comfyui-media/` — registration, tests and
   [installation documentation](comfyui-media/README.md).
+- `comfyui_stage/` — runtime implementation that stages chat images in
+  ComfyUI's input directory.
+- `comfyui-stage/` — registration script/entry, tests and
+  [installation documentation](comfyui-stage/README.md).
 
 Mounting code does **not** register or activate extensions. Native Function/Tool
 entries are stored by Open WebUI in its database and import the runtime package.
