@@ -366,7 +366,9 @@ def render_image(raw):
     with warnings.catch_warnings():
         warnings.simplefilter("error", Image.DecompressionBombWarning)
         with Image.open(io.BytesIO(raw)) as image:
-            if image.format not in {"PNG", "JPEG", "WEBP", "GIF"}:
+            # MPO is a JPEG codestream with multi-picture metadata (common for
+            # iPhone photos); it is rendered like any other JPEG first frame.
+            if image.format not in {"PNG", "JPEG", "MPO", "WEBP", "GIF"}:
                 raise ValueError("Only PNG, JPEG, WebP and GIF images are supported.")
             if image.width * image.height > MAX_PIXELS:
                 raise ValueError("Image exceeds the pixel limit.")

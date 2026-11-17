@@ -22,6 +22,15 @@ def png(color="red", size=(8, 8)):
     return output.getvalue()
 
 
+def mpo(size=(8, 8)):
+    """iPhone-style photo: JPEG codestream flagged as MPO by Pillow."""
+    output = io.BytesIO()
+    Image.new("RGB", size, "red").save(
+        output, "MPO", save_all=True,
+        append_images=[Image.new("RGB", size, "blue")])
+    return output.getvalue()
+
+
 def gif(frames=2, size=(8, 8), duration=None):
     colors = ("red", "blue", "green", "yellow", "purple", "orange", "cyan", "white")
     images = [Image.new("RGB", size, colors[index % len(colors)]) for index in range(frames)]
@@ -291,6 +300,21 @@ class PolicyTests(unittest.TestCase):
             red, green, blue = image.getpixel((0, 0))
             self.assertGreater(red, 200)
             self.assertLess(max(green, blue), 40)
+
+    def test_render_iphone_mpo_first_frame(self):
+        raw = mpo()
+        with Image.open(io.BytesIO(raw)) as image:
+            self.assertEqual(image.format, "MPO")
+        rendered = extension.render_image(raw)
+        with Image.open(io.BytesIO(extension.decode_image_url(rendered))) as image:
+            self.assertEqual(image.format, "JPEG")
+            self.assertEqual(image.size, (8, 8))
+            red, green, blue = image.getpixel((0, 0))
+            self.assertGreater(red, 200)
+            self.assertLess(max(green, blue), 40)
+        # MPO is not animated, so GIF sampling must decline it.
+        self.assertIsNone(extension.sample_gif(raw))
+
 
     def test_entry_files_are_static_imports_of_the_shared_package(self):
         for name, exported in [("filter.py", "Filter"), ("tool.py", "Tools")]:
