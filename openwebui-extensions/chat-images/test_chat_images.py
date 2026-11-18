@@ -941,6 +941,39 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(ANIMATED_GIF, json.dumps(result))
         self.assertNotIn("image/gif", json.dumps(result))
 
+    async def test_current_tool_corrupt_gif_is_pruned_not_forwarded(self):
+        # Pillow raises more than ValueError for damaged GIFs
+        # (UnidentifiedImageError, IndexError, OSError); the request must
+        # still proceed with the GIF pruned.
+        await self.filter.inlet({"messages": []}, USER, META, self.req)
+        raw_gif = gif()
+        payloads = [b"GIF89a" + b"\x00" * 30, raw_gif[:20], raw_gif[: len(raw_gif) // 2]]
+        for payload in payloads:
+            with self.subTest(payload=payload[:8]):
+                corrupt = "data:image/gif;base64," + base64.b64encode(payload).decode()
+                self.response_mock.return_value = {"call:generate_gif": (corrupt,)}
+                body = {"messages": [{"role": "tool", "content": [part(corrupt)]}]}
+                result = await self.filter.request(body, USER, META, self.req)
+                self.assertNotIn(corrupt, json.dumps(result))
+                self.assertNotIn("image/gif", json.dumps(result))
+        # Same for a corrupt owned file upload behind a file URL.
+        self.response_mock.return_value = {"call:generate_gif": (FILE_URL,)}
+        body = {"messages": [{"role": "tool", "content": [part(FILE_URL)]}]}
+        with patch.object(extension, "owned_file_bytes",
+                          AsyncMock(return_value=b"GIF89a" + b"\x00" * 30)):
+            result = await self.filter.request(body, USER, META, self.req)
+        self.assertNotIn(FILE_URL, json.dumps(result))
+        self.assertFalse(extension.message_images(result["messages"][0]))
+
+    async def test_current_tool_nonstandard_gif_data_header_is_pruned(self):
+        await self.filter.inlet({"messages": []}, USER, META, self.req)
+        weird = "data:image/gif;charset=utf-8;base64," + base64.b64encode(gif()).decode()
+        self.response_mock.return_value = {"call:generate_gif": (weird,)}
+        body = {"messages": [{"role": "tool", "content": [part(weird)]}]}
+        result = await self.filter.request(body, USER, META, self.req)
+        self.assertNotIn("image/gif", json.dumps(result))
+        self.assertFalse(extension.message_images(result["messages"][0]))
+
     async def test_gif_disclosure_and_metadata_are_request_only_and_idempotent(self):
         self.context_mock.return_value = ({}, [FILE_ID])
         attachment = {"type": "file", "content_type": "image/gif", "url": FILE_ID,

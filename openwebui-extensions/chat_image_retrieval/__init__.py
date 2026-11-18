@@ -646,22 +646,28 @@ async def sampled_response_sources(results, user_id, max_frames, start_number,
                 raise ValueError("Response images exceed the processing budget.")
             key = await asyncio.to_thread(fingerprint, url)
             raw = None
+            # Classify by MIME prefix and GIF magic bytes, not exact headers:
+            # any failure to decode a GIF-flavored source prunes it (continue),
+            # so a damaged animation is never forwarded or able to abort the
+            # request with an uncontrolled Pillow error.
+            gif_source = url[:14].lower() == "data:image/gif"
             if url.startswith("data:"):
                 try:
                     raw = await asyncio.to_thread(decode_image_url, url)
-                except ValueError:
-                    if url.startswith("data:image/gif;base64,"):
+                except Exception:
+                    if gif_source:
                         continue
             else:
                 raw = await owned_file_bytes(url, user_id, remaining)
                 if raw is not None:
                     remaining -= len(raw)
+                    gif_source = raw[:6] in (b"GIF87a", b"GIF89a")
             frames = None
             if raw:
                 try:
                     frames = await asyncio.to_thread(sample_gif, raw, max_frames)
-                except ValueError:
-                    if raw[:6] in (b"GIF87a", b"GIF89a"):
+                except Exception:
+                    if gif_source or raw[:6] in (b"GIF87a", b"GIF89a"):
                         continue
             if frames:
                 raw_key = await asyncio.to_thread(raw_fingerprint, raw)
