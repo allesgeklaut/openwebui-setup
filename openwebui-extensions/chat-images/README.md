@@ -39,8 +39,13 @@ these files and their registration.
   produces a clear error suggesting fewer GIFs or fewer samples.
 - Single-frame GIFs remain unchanged. Retrieval of an **older GIF** still returns
   one resized first-frame JPEG after approval; the retrieval tool does not expose
-  the original animation. **New current-response tool images remain unchanged**
-  and are not subject to latest-upload expansion or its image-count cap.
+  the original animation. **Animated GIFs in the current tool results** (for
+  example a ComfyUI `comfyui_generate_gif` result, persisted as an owned upload)
+  are sampled with the same rules and substituted in the request body, so no
+  animation is ever forwarded upstream; **other current-response tool images
+  remain unchanged** and neither group is subject to the latest-upload
+  image-count cap. Undecodable or over-budget tool-result GIFs fail safe by
+  being pruned.
 - Include a bounded manifest (last 100 references) with message/image positions.
   Untrusted filenames, captions and URLs are not copied into the system manifest.
 - `retrieve_chat_image(image_ref)` requires explicit browser confirmation before

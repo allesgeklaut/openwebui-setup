@@ -570,6 +570,27 @@ def response_image_snapshot(message):
     return results
 
 
+async def owned_file_bytes(url, user_id, max_bytes):
+    """Read an owned local upload; return None for non-upload URLs.
+
+    Never resolves external URLs or arbitrary filesystem paths.
+    """
+    file_id = source_file_id(url)
+    if file_id is None:
+        return None
+    from open_webui.config import UPLOAD_DIR
+    from open_webui.models.files import Files
+
+    record = await Files.get_file_by_id_and_user_id(file_id, user_id)
+    if record is None or not record.path:
+        raise ValueError("Owned response image is unavailable.")
+    path = Path(record.path)
+    root = Path(UPLOAD_DIR).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError("Response image is outside supported image directories.")
+    return await asyncio.to_thread(read_local_file, path, root, max_bytes)
+
+
 async def response_source_keys(results, user_id):
     """Resolve only owned local result files, never arbitrary tool-returned URLs.
 
@@ -590,23 +611,75 @@ async def response_source_keys(results, user_id):
             key = await asyncio.to_thread(fingerprint, url)
             if key is not None:
                 keys.add(key)
-            file_id = source_file_id(url)
-            if file_id is None:
+            raw = await owned_file_bytes(url, user_id, remaining)
+            if raw is None:
                 continue
-            from open_webui.config import UPLOAD_DIR
-            from open_webui.models.files import Files
-
-            record = await Files.get_file_by_id_and_user_id(file_id, user_id)
-            if record is None or not record.path:
-                raise ValueError("Owned response image is unavailable.")
-            path = Path(record.path)
-            root = Path(UPLOAD_DIR).resolve()
-            if not path.is_relative_to(root):
-                raise ValueError("Response image is outside supported image directories.")
-            raw = await asyncio.to_thread(read_local_file, path, root, remaining)
             remaining -= len(raw)
             keys.add(await asyncio.to_thread(raw_fingerprint, raw))
     return keys
+
+
+async def sampled_response_sources(results, user_id, max_frames, start_number,
+                                   substitutions=None):
+    """Resolve current response images, sampling animated GIFs into frame groups.
+
+    Returns (current keys, merged substitutions, next group number). An animated
+    GIF's own URL/byte identity is deliberately absent from the returned keys, so
+    prune_messages substitutes its labeled JPEG frames instead of forwarding the
+    animation upstream; its frames take the GIF's place as current images. Stills
+    keep both identities, exactly like response_source_keys. Undecodable or
+    over-budget animations fail safe by being pruned, never forwarded.
+    """
+    keys = set()
+    substitutions = dict(substitutions or {})
+    remaining = MAX_HISTORY_IMAGE_CHARS
+    seen = set()
+    number = start_number
+    for urls in results.values():
+        for url in urls:
+            if not isinstance(url, str) or id(url) in seen:
+                continue
+            seen.add(id(url))
+            # Do not hash a potentially large URI on the event-loop thread.
+            remaining -= len(url)
+            if remaining < 0:
+                raise ValueError("Response images exceed the processing budget.")
+            key = await asyncio.to_thread(fingerprint, url)
+            raw = None
+            if url.startswith("data:"):
+                try:
+                    raw = await asyncio.to_thread(decode_image_url, url)
+                except ValueError:
+                    if url.startswith("data:image/gif;base64,"):
+                        continue
+            else:
+                raw = await owned_file_bytes(url, user_id, remaining)
+                if raw is not None:
+                    remaining -= len(raw)
+            frames = None
+            if raw:
+                try:
+                    frames = await asyncio.to_thread(sample_gif, raw, max_frames)
+                except ValueError:
+                    if raw[:6] in (b"GIF87a", b"GIF89a"):
+                        continue
+            if frames:
+                raw_key = await asyncio.to_thread(raw_fingerprint, raw)
+                group = substitutions.get(url) or substitutions.get(raw_key)
+                if group is None:
+                    group = {"number": number, "frames": frames}
+                    number += 1
+                    substitutions[url] = group
+                    substitutions[raw_key] = group
+                for frame in group["frames"]:
+                    keys.add(await asyncio.to_thread(fingerprint, frame["url"]))
+                # The animation itself is not a current key: it is substituted.
+            else:
+                if key is not None:
+                    keys.add(key)
+                if raw:
+                    keys.add(await asyncio.to_thread(raw_fingerprint, raw))
+    return keys, substitutions, number
 
 
 def context_binding(user, metadata):
@@ -706,14 +779,19 @@ class Filter:
         # A resumed tool call has already persisted its result before inlet
         # runs. Treat the current response's images as current here as well,
         # otherwise inlet prunes the image the model is about to be asked
-        # about and the request hook can no longer restore it.
-        current = await response_source_keys(baseline, __user__["id"])
+        # about and the request hook can no longer restore it. Animated GIFs
+        # in that set (e.g. a ComfyUI generate_gif tool result) are sampled
+        # into labeled frames instead of being forwarded as animations.
+        current, substitutions, next_gif_number = await sampled_response_sources(
+            baseline, __user__["id"], max_frames, len(latest) + 1, substitutions)
         state = {
             "approved": allowed, "attempts": 0, "lock": asyncio.Lock(),
             "processed": dict(baseline),
             "current": current, "filter_lock": asyncio.Lock(),
             "substitutions": substitutions,
             "unchanged": unchanged,
+            "max_frames": max_frames,
+            "next_gif_number": next_gif_number,
         }
         # Multi-model responses share an HTTP Request; isolate each response ID.
         states = getattr(__request__.state, STATE_KEY, None)
@@ -749,7 +827,14 @@ class Filter:
             changed = {key: urls for key, urls in response.items()
                        if state["processed"].get(key) != urls}
             if changed:
-                state["current"].update(await response_source_keys(changed, __user__["id"]))
+                # New tool results can carry animated GIFs too (e.g. ComfyUI
+                # generate_gif); sample them instead of forwarding animations.
+                current, substitutions, next_gif_number = await sampled_response_sources(
+                    changed, __user__["id"], state.get("max_frames", 4),
+                    state.get("next_gif_number", 1), state.get("substitutions"))
+                state["current"].update(current)
+                state["substitutions"] = substitutions
+                state["next_gif_number"] = next_gif_number
                 state["processed"].update(changed)
             return await asyncio.to_thread(prune_messages, body, set(state["approved"]),
                                             set(state["current"]),

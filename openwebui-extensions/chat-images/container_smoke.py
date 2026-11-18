@@ -172,6 +172,55 @@ try:
                         keys = await extension.response_source_keys({'call:generate': (gif_url,)}, 'owner')
                         assert extension.raw_fingerprint(gif_bytes) in keys
 
+                # A ComfyUI-style tool result carrying the GIF (as OWUI persists
+                # the inline MCP image as an owned upload) is sampled on the
+                # tool-loop request, never forwarded as an animation.
+                tool_gif_url = f'/api/v1/files/{fixtures.FILE_ID}/content'
+                with patch.object(config, 'UPLOAD_DIR', folder), \
+                     patch.object(Files, 'get_file_by_id_and_user_id', AsyncMock(return_value=gif_record)), \
+                     patch.object(extension, 'owned_context', AsyncMock(return_value=({}, []))), \
+                     patch.object(extension, 'response_images',
+                                  AsyncMock(return_value={'call:generate_gif': (tool_gif_url,)})):
+                    tool_req = fixtures.request()
+                    await function.inlet({'messages': []}, fixtures.USER, fixtures.META, tool_req)
+                    tool_body = {'model': 'synthetic-mistral', 'messages': [
+                        {'role': 'assistant', 'output': [
+                            {'type': 'function_call', 'call_id': 'gif-call',
+                             'name': 'comfyui_generate_gif', 'status': 'completed'},
+                            {'type': 'function_call_output', 'call_id': 'gif-call',
+                             'status': 'completed', 'output': [
+                                 {'type': 'input_text', 'text': '- gif: /opt/stacks/comfyui/output/x.gif'},
+                                 fixtures.part(tool_gif_url)]}]}]}
+                    framed = await function.request(tool_body, fixtures.USER, fixtures.META, tool_req)
+                    serialized = json.dumps(framed)
+                    assert 'image/gif' not in serialized, 'Original GIF MIME exposed'
+                    assert fixtures.FILE_ID not in serialized, 'Original GIF id exposed'
+                    assert '- gif: /opt/stacks/comfyui/output/x.gif' in serialized
+                    output = framed['messages'][0]['output'][1]['output']
+                    image_parts = [item for item in output if item.get('type') in ('image_url', 'input_image')]
+                    assert len(image_parts) == 4, 'Tool-result GIF did not expand to four frames'
+                    assert all(item['image_url']['url'].startswith('data:image/jpeg;base64,')
+                               for item in image_parts)
+                    assert serialized.count(extension.GIF_SAMPLING_NOTICE) == 1
+                    assert await function.request(framed, fixtures.USER, fixtures.META, tool_req) == framed
+                    # A still tool result in the same response stays untouched.
+                    still_url = '/api/v1/files/still-test/content'
+                    still_path = folder / 'still.png'
+                    still_path.write_bytes(fixtures.png('green'))
+                    still_record = SimpleNamespace(id='still-test', user_id='owner',
+                                                   path=str(still_path), meta={})
+                    with patch.object(Files, 'get_file_by_id_and_user_id',
+                                      AsyncMock(side_effect=lambda fid, uid: {
+                                          fixtures.FILE_ID: gif_record, 'still-test': still_record}[fid])):
+                        self_response = {'call:generate_gif': (tool_gif_url,), 'call:shot': (still_url,)}
+                        with patch.object(extension, 'response_images', AsyncMock(return_value=self_response)):
+                            mixed = {'messages': [
+                                {'role': 'assistant', 'output': [
+                                    {'type': 'function_call_output', 'call_id': 'shot', 'status': 'completed',
+                                     'output': [fixtures.part(still_url)]}]}]}
+                            mixed_result = await function.request(mixed, fixtures.USER, fixtures.META, tool_req)
+                            assert fixtures.part(still_url) in mixed_result['messages'][0]['output'][0]['output']
+
                 req = fixtures.request()
                 meta = {**fixtures.META, 'chat_id': '00000000-0000-4000-8000-000000000001'}
                 response_snapshot = AsyncMock(return_value={})

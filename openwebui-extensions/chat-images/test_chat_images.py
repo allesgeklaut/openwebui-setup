@@ -544,7 +544,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         generated = uri(png("green"))
         self.response_mock.return_value = {"call:generate": (generated,)}
         body = {"messages": [{"role": "user", "content": [part(generated)]}]}
-        with patch.object(extension, "response_source_keys", wraps=extension.response_source_keys) as sources:
+        with patch.object(extension, "sampled_response_sources", wraps=extension.sampled_response_sources) as sources:
             await self.filter.request(body, USER, META, self.req)
             await self.filter.request(body, USER, META, self.req)
         self.assertEqual(sources.call_count, 1)
@@ -869,13 +869,77 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["messages"][0]["files"][0]["url"], frame)
         self.assertEqual(await self.filter.request(body, USER, META, self.req), result)
 
-    async def test_current_tool_gif_is_unchanged_even_if_it_matches_upload(self):
+    async def test_current_tool_gif_is_sampled_even_if_it_matches_upload(self):
+        # A current tool result carrying an animated GIF must never be
+        # forwarded upstream, even when the same bytes were also uploaded.
         self.context_mock.return_value = ({}, [ANIMATED_GIF])
         await self.filter.inlet({"model": "mistral-large-4", "messages": []}, USER, META, self.req)
         self.response_mock.return_value = {"call:generate": (ANIMATED_GIF,)}
         body = {"messages": [{"role": "user", "content": [part(ANIMATED_GIF)],
                               "files": [{"type": "image", "url": ANIMATED_GIF}]}]}
+        result = await self.filter.request(body, USER, META, self.req)
+        self.assertNotIn(ANIMATED_GIF, json.dumps(result))
+        self.assertNotIn("image/gif", json.dumps(result))
+        content = result["messages"][0]["content"]
+        frames = [item for item in content if item.get("type") == "image_url"]
+        self.assertEqual(len(frames), 2)
+        self.assertTrue(all(item["image_url"]["url"].startswith("data:image/jpeg;base64,")
+                            for item in frames))
+        self.assertEqual(len(result["messages"][0]["files"]), 2)
+        self.assertEqual(await self.filter.request(result, USER, META, self.req), result)
+
+    async def test_current_tool_animated_gif_result_is_sampled_not_forwarded(self):
+        await self.filter.inlet({"messages": []}, USER, META, self.req)
+        still = uri(png("green"))
+        self.response_mock.return_value = {"call:generate_gif": (ANIMATED_GIF,),
+                                           "call:shot": (still,)}
+        body = {"messages": [
+            {"role": "assistant", "output": [
+                {"type": "function_call_output", "call_id": "generate_gif", "status": "completed",
+                 "output": [{"type": "input_text", "text": "- gif: /opt/x.gif"}, part(ANIMATED_GIF)]}]},
+            {"role": "tool", "tool_call_id": "shot", "content": [part(still)]}]}
+        result = await self.filter.request(body, USER, META, self.req)
+        serialized = json.dumps(result)
+        self.assertNotIn(ANIMATED_GIF, serialized)
+        self.assertNotIn("image/gif", serialized)
+        self.assertIn("- gif: /opt/x.gif", serialized)
+        output = result["messages"][0]["output"][0]["output"]
+        frames = [item for item in output if item.get("type") == "image_url"]
+        self.assertEqual(len(frames), 2)
+        self.assertTrue(all(item["image_url"]["url"].startswith("data:image/jpeg;base64,")
+                            for item in frames))
+        self.assertIn(extension.GIF_SAMPLING_NOTICE, serialized)
+        # Other current tool images stay untouched.
+        self.assertEqual(result["messages"][1]["content"], [part(still)])
+        self.assertEqual(await self.filter.request(result, USER, META, self.req), result)
+
+    async def test_current_tool_gif_file_upload_is_sampled(self):
+        await self.filter.inlet({"messages": []}, USER, META, self.req)
+        self.response_mock.return_value = {"call:generate_gif": (FILE_URL,)}
+        body = {"messages": [{"role": "tool", "tool_call_id": "c", "content": [part(FILE_URL)]}]}
+        with patch.object(extension, "owned_file_bytes", AsyncMock(return_value=gif())):
+            result = await self.filter.request(body, USER, META, self.req)
+        self.assertNotIn(FILE_URL, json.dumps(result))
+        frames = [item for item in result["messages"][0]["content"] if item.get("type") == "image_url"]
+        self.assertEqual(len(frames), 2)
+        self.assertTrue(all(item["image_url"]["url"].startswith("data:image/jpeg;base64,")
+                            for item in frames))
+        self.assertEqual(await self.filter.request(result, USER, META, self.req), result)
+
+    async def test_current_tool_static_gif_is_unchanged(self):
+        await self.filter.inlet({"messages": []}, USER, META, self.req)
+        self.response_mock.return_value = {"call:generate_gif": (STATIC_GIF,)}
+        body = {"messages": [{"role": "tool", "content": [part(STATIC_GIF)]}]}
         self.assertEqual(await self.filter.request(body, USER, META, self.req), body)
+
+    async def test_current_tool_oversized_gif_is_pruned_not_forwarded(self):
+        await self.filter.inlet({"messages": []}, USER, META, self.req)
+        self.response_mock.return_value = {"call:generate_gif": (ANIMATED_GIF,)}
+        body = {"messages": [{"role": "tool", "content": [part(ANIMATED_GIF)]}]}
+        with patch.object(extension, "MAX_GIF_SOURCE_FRAMES", 1):
+            result = await self.filter.request(body, USER, META, self.req)
+        self.assertNotIn(ANIMATED_GIF, json.dumps(result))
+        self.assertNotIn("image/gif", json.dumps(result))
 
     async def test_gif_disclosure_and_metadata_are_request_only_and_idempotent(self):
         self.context_mock.return_value = ({}, [FILE_ID])
