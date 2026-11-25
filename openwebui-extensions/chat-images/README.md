@@ -1,6 +1,6 @@
 # Selective chat image retrieval
 
-Repo-managed native Open WebUI **Filter + Tool**, verified on v0.13.3. No extra
+Repo-managed native Open WebUI **Filter + Tool**, verified on v0.13.5. No extra
 service, credentials, outbound HTTP client, or database writes. Installing Python
 extensions grants server-side code execution: only administrators should manage
 these files and their registration.

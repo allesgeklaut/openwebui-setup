@@ -1,6 +1,6 @@
 # Automatic ComfyUI video delivery
 
-Native global OWUI filter, verified on v0.13.3. It leaves the MCP poster and
+Native global OWUI filter, verified on v0.13.5. It leaves the MCP poster and
 download URLs intact, but automatically imports the MP4 into owned chat storage
 when the response finishes. The model receives a notice that the video is saved
 as an attachment and is told to show it with OWUI's native `display_file` tool
