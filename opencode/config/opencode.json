@@ -7,14 +7,14 @@
   },
   "policies": [
     { "action": "provider.use", "resource": "*", "effect": "deny" },
-    { "action": "provider.use", "resource": "mistral", "effect": "allow" }
+    { "action": "provider.use", "resource": "opencode-go", "effect": "allow" }
   ],
   "plugins": [
     {
       "package": "/opt/opencode/session-model-plugin",
       "options": {
-        "agents": ["alloy"],
-        "models": ["mistral/*"]
+        "agents": ["build", "plan"],
+        "models": ["opencode-go/*"]
       }
     }
   ],
@@ -24,42 +24,26 @@
         "claude-haiku-5-5": { "limit": { "input": 106496 } },
         "gpt-5.6-luna": { "limit": { "input": 255616 } },
         "gpt-6-luna": { "limit": { "input": 255616 } },
-        "deepseek-v4.1-flash": { "limit": { "input": 262144 } },
+        "qwen3.8-flash": { "limit": { "input": 262144 } },
         "glm-5.3-flash": { "limit": { "input": 262144 } },
-        "qwen3.8-flash": { "limit": { "input": 262144 } }
-      }
-    },
-    "openai": {
-      "models": {
-        "gpt-6.1-sol": { "limit": { "input": 278528 } },
-        "gpt-6-luna": { "limit": { "input": 278528 } }
-      }
-    },
-    "mistral": {
-      "models": {
-        "deepseek-v4-1-flash-1017": {
-          "capabilities": { "input": ["text", "image"] },
-          "limit": { "input": 307200 },
-          "settings": { "reasoningEffort": "max" }
+        "deepseek-v4.1-flash": {
+          "modalities": { "input": ["text", "image"], "output": ["text"] },
+          "limit": { "input": 307200 }
         },
-        "mistral-large-4": {
-          "capabilities": { "input": ["text", "image"] },
-          "limit": { "input": 307200 },
-          "settings": { "reasoningEffort": "high" }
+        "hy4": {
+          "name": "Tencent Hy4",
+          "limit": { "context": 1048576, "input": 307200, "output": 65536 },
+          "modalities": { "input": ["text", "image"], "output": ["text"] },
+          "variants": [
+            { "id": "none", "settings": { "reasoningEffort": "none" } },
+            { "id": "high", "settings": { "reasoningEffort": "high" } }
+          ]
         },
-        "zai-glm-5-3": {
-          "limit": { "input": 307200 },
-          "settings": { "reasoningEffort": "max" }
-        },
-        "zai-glm-5-3-longctx": {
-          "modelID": "zai-glm-5-3",
-          "name": "Z.ai GLM 5.3 (long ctx)",
-          "limit": { "input": 607200 },
-          "settings": { "reasoningEffort": "max" }
-        },
-        "zai-glm-5-3-flash": {
-          "limit": { "input": 307200 },
-          "settings": { "reasoningEffort": "max" }
+        "glm-5.3": { "limit": { "input": 307200 } },
+        "glm-5.3-longctx": {
+          "modelID": "glm-5.3",
+          "name": "GLM 5.3 (long ctx)",
+          "limit": { "input": 607200 }
         }
       }
     }

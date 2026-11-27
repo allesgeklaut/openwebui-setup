@@ -19,11 +19,12 @@ install host-control tools, modify the OpenCode installation, or read/export
 authentication state. Ask before deleting files, pushing commits, publishing,
 or changing system configuration.
 
-No host MCP servers are configured. Only Alloy, tier-1 through tier-4, and
-Alloy's session-model plugin are explicitly shared read-only. Do not assume
+No host MCP servers are configured. Only tier-1 through tier-4 and the
+session-model plugin are explicitly shared read-only. Do not assume
 other host paths, Docker access, agents, skills, plugins, credentials, or
-persistent memory are available. Selecting Alloy opts into its tier-worker
-workflow; other primary agents work directly unless the user requests delegation.
+persistent memory are available. The primary agents work directly unless
+the user requests delegation; tier-1 through tier-4 are available as
+subagents.
 Preserve existing user work. Run relevant checks and report what was actually
 verified. Keep answers concise.
 
@@ -34,6 +35,6 @@ Do not assume a free cloud model is local or appropriate for private code.
 The managed opencode.json, AGENTS.md, agents directory, and shared plugin are
 read-only. The enclosing configuration directory is writable for OpenCode's
 own runtime metadata such as service.json, isolated in the terminal home.
-Human-run setup can use `opencode auth login mistral` normally; `--standalone`
-is optional. Authentication is a human task; never read/export credentials or
-attempt interactive sign-in autonomously.
+Human-run setup can use `opencode auth login` (choose OpenCode Go) normally;
+`--standalone` is optional. Authentication is a human task; never read/export
+credentials or attempt interactive sign-in autonomously.
