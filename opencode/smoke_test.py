@@ -1,7 +1,7 @@
-"""Run with docker exec -i -e OPENCODE_SMOKE_MODEL=mistral/mistral-small-latest
+"""Run with docker exec -i -e OPENCODE_SMOKE_MODEL=opencode-go/glm-5.3
 open-terminal python - < opencode/smoke_test.py (on one shell line).
 
-Uses an explicitly chosen authenticated Mistral model (API usage applies) and
+Uses an explicitly chosen authenticated OpenCode Go model (allowance applies) and
 synthetic text only. Creates/removes its own temporary
 folder. Any tool permission request is rejected, never silently approved.
 This is a manual, network-dependent direct-ACP integration test, not a WebUI
@@ -22,8 +22,8 @@ CLEANUP_TIMEOUT = 10
 
 async def main():
     selected_model = os.environ.get("OPENCODE_SMOKE_MODEL", "")
-    if not selected_model.startswith("mistral/") or selected_model == "mistral/":
-        raise RuntimeError("Set OPENCODE_SMOKE_MODEL to a Mistral model; API usage applies")
+    if not selected_model.startswith("opencode-go/") or selected_model == "opencode-go/":
+        raise RuntimeError("Set OPENCODE_SMOKE_MODEL to an OpenCode Go model; allowance applies")
     with tempfile.TemporaryDirectory(prefix=".opencode-smoke-", dir="/home/user") as work:
         process = await asyncio.create_subprocess_exec(
             "/home/user/.local/bin/opencode", "acp",
