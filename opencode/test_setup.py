@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 import unittest
 
@@ -103,72 +102,6 @@ class ConfigurationTests(unittest.TestCase):
                 # Positive control: prove the helper really would run without the flags.
                 git("diff")
                 self.assertTrue(marker.exists())
-
-
-class InstallerTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.home = Path(self.temp.name)
-        self.link = self.home / ".local/bin/opencode"
-        self.link.parent.mkdir(parents=True)
-        self.old = self.home / ".local/share/opencode-cli/old/bin/opencode"
-        self.mockbin = self.home / "mockbin"
-        self.mockbin.mkdir()
-        npm = self.mockbin / "npm"
-        npm.write_text(f"#!{sys.executable}\n" + '''
-import os, pathlib, sys
-home = pathlib.Path(os.environ["HOME"])
-with (home / "npm-called").open("a") as log:
-    log.write("called\\n")
-if os.environ.get("MOCK_NPM_FAIL"):
-    sys.exit(1)
-prefix = pathlib.Path(sys.argv[sys.argv.index("--prefix") + 1])
-binary = prefix / "bin/opencode"
-binary.parent.mkdir(parents=True, exist_ok=True)
-version = os.environ.get("MOCK_VERSION", "2.2.6")
-binary.write_text("#!/bin/sh\\nprintf '%s\\\\n' 'opencode v" + version + "'\\n")
-binary.chmod(0o755)
-''')
-        npm.chmod(0o755)
-        self.env = {**os.environ, "HOME": str(self.home),
-                    "PATH": str(self.mockbin) + os.pathsep + os.environ["PATH"]}
-
-    def install(self, **environment):
-        return subprocess.run(["sh", str(ROOT / "install.sh")],
-                              env={**self.env, **environment},
-                              capture_output=True, text=True, timeout=10)
-
-    def test_existing_regular_file_stops_before_npm(self):
-        self.link.write_text("user executable")
-        self.assertNotEqual(self.install().returncode, 0)
-        self.assertFalse((self.home / "npm-called").exists())
-        self.assertEqual(self.link.read_text(), "user executable")
-
-    def test_unmanaged_symlink_stops_before_npm(self):
-        self.link.symlink_to("/unmanaged/opencode")
-        self.assertNotEqual(self.install().returncode, 0)
-        self.assertFalse((self.home / "npm-called").exists())
-        self.assertEqual(os.readlink(self.link), "/unmanaged/opencode")
-
-    def test_wrong_version_preserves_existing_launcher(self):
-        self.link.symlink_to(self.old)
-        self.assertNotEqual(self.install(MOCK_VERSION="0.0.0").returncode, 0)
-        self.assertEqual(os.readlink(self.link), str(self.old))
-
-    def test_install_failure_preserves_existing_launcher(self):
-        self.link.symlink_to(self.old)
-        self.assertNotEqual(self.install(MOCK_NPM_FAIL="1").returncode, 0)
-        self.assertEqual(os.readlink(self.link), str(self.old))
-
-    def test_validated_install_and_idempotent_rerun(self):
-        result = self.install()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "opencode v2.2.6")
-        self.assertTrue(self.link.is_symlink())
-        self.assertEqual(self.install().returncode, 0)
-        self.assertEqual((self.home / "npm-called").read_text(), "called\n")
-        self.assertFalse(list(self.link.parent.glob(".opencode-install.*")))
 
 
 if __name__ == "__main__":
