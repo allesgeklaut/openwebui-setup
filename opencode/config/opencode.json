@@ -40,6 +40,7 @@
           ]
         },
         "glm-5.3": { "limit": { "input": 307200 } },
+        "kimi-k3.1-pro": { "limit": { "input": 307200 } },
         "glm-5.3-longctx": {
           "modelID": "glm-5.3",
           "name": "GLM 5.3 (long ctx)",
