@@ -58,7 +58,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotIn("{file:", json.dumps(CONFIG))
 
     def test_only_selected_agents_and_model_plugin_are_shared(self):
-        names = {"alloy", "tier-1", "tier-2", "tier-3", "tier-4"}
+        names = {"tier-1", "tier-2", "tier-3", "tier-4"}
         agents = ROOT / "config/agents"
         self.assertEqual({p.stem for p in agents.iterdir()}, names)
         for name in names:
@@ -66,13 +66,13 @@ class ConfigurationTests(unittest.TestCase):
                              "/opt/opencode/agents/" + name + ".md")
         self.assertEqual(CONFIG["plugins"], [{
             "package": "/opt/opencode/session-model-plugin",
-            "options": {"agents": ["alloy"], "models": ["mistral/*"]},
+            "options": {"agents": ["build", "plan"], "models": ["opencode-go/*"]},
         }])
 
-    def test_only_mistral_provider_is_available(self):
+    def test_only_opencode_go_provider_is_available(self):
         self.assertEqual(CONFIG["policies"], [
             {"action": "provider.use", "resource": "*", "effect": "deny"},
-            {"action": "provider.use", "resource": "mistral", "effect": "allow"},
+            {"action": "provider.use", "resource": "opencode-go", "effect": "allow"},
         ])
 
     def test_safe_diff_disables_repository_helpers(self):
